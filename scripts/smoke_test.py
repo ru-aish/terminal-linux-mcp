@@ -5,16 +5,24 @@ import argparse
 import asyncio
 import os
 
+import httpx
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
 
-async def inspect_server(url: str, token: str | None) -> None:
-    headers = {"Authorization": f"Bearer {token}"} if token else None
-    async with streamable_http_client(url, headers=headers) as (read, write, _):
+async def _list_tools(url: str, http_client: httpx.AsyncClient | None = None):
+    async with streamable_http_client(url, http_client=http_client) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            response = await session.list_tools()
+            return await session.list_tools()
+
+
+async def inspect_server(url: str, token: str | None) -> None:
+    if token:
+        async with httpx.AsyncClient(headers={"Authorization": f"Bearer {token}"}) as client:
+            response = await _list_tools(url, client)
+    else:
+        response = await _list_tools(url)
 
     names = [tool.name for tool in response.tools]
     print(f"Connected to {url}")
