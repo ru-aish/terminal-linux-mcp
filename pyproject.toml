@@ -1,0 +1,17 @@
+[project]
+name = "terminal-linux-mcp"
+version = "0.1.0"
+description = "A native Linux terminal MCP server with process, file, project-context, skill, and local-MCP tools."
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.27.1,<2",
+  "uvicorn[standard]>=0.48,<1",
+  "starlette>=1.2,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
