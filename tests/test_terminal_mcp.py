@@ -32,6 +32,32 @@ def test_exact_public_tool_list():
     assert [tool.name for tool in tools] == EXPECTED_TOOLS
 
 
+def test_bearer_auth_middleware():
+    async def invoke(authorization=None):
+        messages = []
+
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        headers = []
+        if authorization is not None:
+            headers.append((b"authorization", authorization.encode("latin-1")))
+        middleware = terminal_mcp.BearerAuthMiddleware(app, "correct-token")
+        await middleware({"type": "http", "headers": headers}, receive, send)
+        return messages
+
+    assert run(invoke())[0]["status"] == 401
+    assert run(invoke("Bearer wrong"))[0]["status"] == 401
+    assert run(invoke("Bearer correct-token"))[0]["status"] == 204
+
+
 def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
     isolated_home(tmp_path, monkeypatch)
     project = tmp_path / "project"

@@ -19,10 +19,12 @@ MCP_RUNTIME_DIR="${MCP_RUNTIME_DIR:-$ROOT_DIR/.run}"
 MCP_LOG_DIR="${MCP_LOG_DIR:-$MCP_RUNTIME_DIR/logs}"
 MCP_START_TIMEOUT="${MCP_START_TIMEOUT:-30}"
 MCP_SKIP_NGROK="${MCP_SKIP_NGROK:-0}"
+MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:-}"
+MCP_ALLOW_UNAUTHENTICATED_PUBLIC="${MCP_ALLOW_UNAUTHENTICATED_PUBLIC:-0}"
 NGROK_BIN="${NGROK_BIN:-ngrok}"
 NGROK_UPSTREAM="${NGROK_UPSTREAM:-http://127.0.0.1:$MCP_PORT}"
 
-export MCP_WORKSPACE MCP_LOG_DIR
+export MCP_WORKSPACE MCP_LOG_DIR MCP_BEARER_TOKEN
 mkdir -p "$MCP_RUNTIME_DIR" "$MCP_LOG_DIR"
 
 if [[ -n "${MCP_PYTHON:-}" ]]; then
@@ -45,6 +47,18 @@ fi
 
 if [[ "$MCP_SKIP_NGROK" != "1" ]] && ! command -v "$NGROK_BIN" >/dev/null 2>&1; then
   echo "ngrok was not found. Install it, set NGROK_BIN, or use MCP_SKIP_NGROK=1." >&2
+  exit 1
+fi
+
+if [[ "$MCP_SKIP_NGROK" != "1" \
+      && -z "$MCP_BEARER_TOKEN" \
+      && -z "${NGROK_TRAFFIC_POLICY_FILE:-}" \
+      && "$MCP_ALLOW_UNAUTHENTICATED_PUBLIC" != "1" ]]; then
+  cat >&2 <<'EOF'
+Refusing to expose a full terminal MCP without authentication.
+Set MCP_BEARER_TOKEN, configure NGROK_TRAFFIC_POLICY_FILE, or explicitly set
+MCP_ALLOW_UNAUTHENTICATED_PUBLIC=1 after accepting the risk.
+EOF
   exit 1
 fi
 
@@ -220,6 +234,13 @@ if [[ -z "$public_url" ]]; then
 fi
 
 printf '\nPublic MCP endpoint: %s%s\n' "$public_url" "$MCP_PATH"
+if [[ -n "$MCP_BEARER_TOKEN" ]]; then
+  echo "Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>"
+elif [[ -n "${NGROK_TRAFFIC_POLICY_FILE:-}" ]]; then
+  echo "Authentication: delegated to ngrok Traffic Policy"
+else
+  echo "WARNING: public endpoint is unauthenticated by explicit override" >&2
+fi
 echo "ngrok log: $NGROK_LOG"
 echo "Press Ctrl+C to stop both processes."
 

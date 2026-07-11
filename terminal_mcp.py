@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -113,6 +114,39 @@ mcp_connections_lock = asyncio.Lock()
 
 class McpResourceBusyError(RuntimeError):
     pass
+
+
+class BearerAuthMiddleware:
+    def __init__(self, app: Any, token: str):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        supplied = headers.get("authorization", "")
+        expected = f"Bearer {self.token}"
+        if secrets.compare_digest(supplied, expected):
+            await self.app(scope, receive, send)
+            return
+
+        body = b'{"error":"unauthorized"}'
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"www-authenticate", b"Bearer"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
 
 
 def _hidden_tool() -> Any:
@@ -2165,6 +2199,14 @@ def main() -> None:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
+        bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
+        if bearer_token:
+            app.add_middleware(BearerAuthMiddleware, token=bearer_token)
+        elif args.host not in {"127.0.0.1", "::1", "localhost"}:
+            print(
+                "WARNING: Terminal MCP is listening beyond loopback without MCP_BEARER_TOKEN.",
+                file=sys.stderr,
+            )
         cors_origins = os.environ.get("MCP_CORS_ORIGINS", "*")
         allow_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
         app.add_middleware(CORSMiddleware, allow_origins=allow_origins or ["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
