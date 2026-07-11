@@ -34,6 +34,16 @@ DEFAULT_MAX_OUTPUT_CHARS = int(os.environ.get("MCP_MAX_OUTPUT_CHARS", "24000"))
 PROCESS_BUFFER_LINES = int(os.environ.get("MCP_PROCESS_BUFFER_LINES", "1000"))
 AGENT_DIR_NAME = os.environ.get("MCP_AGENT_DIR_NAME", ".agent")
 AGENT_CONTEXT_MAX_CHARS = int(os.environ.get("MCP_AGENT_CONTEXT_MAX_CHARS", "12000"))
+MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
+
+
+@contextlib.asynccontextmanager
+async def _terminal_lifespan(_: Any):
+    try:
+        yield {}
+    finally:
+        await _close_all_mcp_connections()
+
 
 mcp = FastMCP(
     "Terminal",
@@ -46,6 +56,7 @@ mcp = FastMCP(
         "Use local_mcp for MCP servers already configured on this machine; inspect a server's tools before calling it.\n"
         "Use run_command for Git, HTTP, databases, networking, services, containers, and package management."
     ),
+    lifespan=_terminal_lifespan,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=(os.environ.get("MCP_DNS_REBINDING_PROTECTION", "0") == "1")
     ),
@@ -75,10 +86,33 @@ class ProcessState:
     stdout_closed: bool = False
     stderr_closed: bool = False
 
+
+@dataclass
+class PersistentMcpConnection:
+    key: tuple[str, str]
+    config_fingerprint: str
+    stack: contextlib.AsyncExitStack
+    client: Any
+    exclusive_resource: str | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    created_at: float = field(default_factory=time.time)
+    last_used: float = field(default_factory=time.time)
+    active_calls: int = 0
+    closed: bool = False
+
+
 sessions: dict[str, SessionState] = {"default": SessionState("default", WORKSPACE_DIR)}
 processes: dict[str, ProcessState] = {}
 state_lock = asyncio.Lock()
 agent_state_lock = asyncio.Lock()
+mcp_connections: dict[tuple[str, str], PersistentMcpConnection] = {}
+mcp_connection_key_locks: dict[tuple[str, str], asyncio.Lock] = {}
+mcp_resource_owners: dict[str, tuple[str, str]] = {}
+mcp_connections_lock = asyncio.Lock()
+
+
+class McpResourceBusyError(RuntimeError):
+    pass
 
 
 def _hidden_tool() -> Any:
@@ -807,31 +841,277 @@ def _public_mcp_summary(name: str, config: dict[str, Any]) -> dict[str, str]:
     }
 
 
-async def _with_mcp_session(config: dict[str, Any], operation: str, tool_name: str = "", arguments: dict[str, Any] | None = None) -> Any:
+def _mcp_config_fingerprint(config: dict[str, Any]) -> str:
+    runtime = _runtime_mcp_config(config)
+    payload = json.dumps(runtime, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _mcp_exclusive_resource(config: dict[str, Any]) -> str | None:
+    runtime = _runtime_mcp_config(config)
+    env = {str(key).upper(): str(value) for key, value in runtime.get("env", {}).items()}
+    exact_keys = (
+        "SAB_USER_DATA_DIR",
+        "USER_DATA_DIR",
+        "BROWSER_USER_DATA_DIR",
+        "BROWSER_PROFILE",
+        "BROWSER_PROFILE_DIR",
+        "PROFILE_PATH",
+        "PROFILE_DIR",
+    )
+    value = next((env[key] for key in exact_keys if env.get(key)), "")
+    if not value:
+        for key, candidate in env.items():
+            if candidate and ("USER_DATA_DIR" in key or "PROFILE_DIR" in key or "PROFILE_PATH" in key):
+                value = candidate
+                break
+    if not value:
+        return None
+    normalized = str(Path(value).expanduser().resolve())
+    return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+
+
+async def _open_mcp_connection(
+    session_id: str,
+    server_name: str,
+    config: dict[str, Any],
+) -> PersistentMcpConnection:
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
     from mcp.client.streamable_http import streamablehttp_client
 
     runtime = _runtime_mcp_config(config)
+    stack = contextlib.AsyncExitStack()
+    try:
+        if runtime.get("url"):
+            if runtime["transport"] == "sse":
+                streams = await stack.enter_async_context(
+                    sse_client(runtime["url"], headers=runtime["headers"])
+                )
+            else:
+                streams = await stack.enter_async_context(
+                    streamablehttp_client(runtime["url"], headers=runtime["headers"])
+                )
+        else:
+            env = os.environ.copy()
+            env.update(runtime["env"])
+            params = StdioServerParameters(
+                command=runtime["command"],
+                args=runtime["args"],
+                env=env,
+                cwd=runtime["cwd"],
+            )
+            streams = await stack.enter_async_context(stdio_client(params))
 
-    async def execute(read: Any, write: Any) -> Any:
-        async with ClientSession(read, write) as client:
-            await client.initialize()
-            return await (client.list_tools() if operation == "tools" else client.call_tool(tool_name, arguments or {}))
+        client = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+        await client.initialize()
+        return PersistentMcpConnection(
+            key=(session_id, server_name),
+            config_fingerprint=_mcp_config_fingerprint(config),
+            stack=stack,
+            client=client,
+            exclusive_resource=_mcp_exclusive_resource(config),
+        )
+    except BaseException:
+        await stack.aclose()
+        raise
 
-    if runtime.get("url"):
-        if runtime["transport"] == "sse":
-            async with sse_client(runtime["url"], headers=runtime["headers"]) as streams:
-                return await execute(*streams)
-        async with streamablehttp_client(runtime["url"], headers=runtime["headers"]) as streams:
-            return await execute(streams[0], streams[1])
 
-    env = os.environ.copy()
-    env.update(runtime["env"])
-    params = StdioServerParameters(command=runtime["command"], args=runtime["args"], env=env, cwd=runtime["cwd"])
-    async with stdio_client(params) as streams:
-        return await execute(*streams)
+async def _close_mcp_connection(connection: PersistentMcpConnection) -> None:
+    if connection.closed:
+        return
+    connection.closed = True
+    with contextlib.suppress(Exception):
+        await connection.stack.aclose()
+
+
+def _unregister_mcp_connection_locked(
+    connection: PersistentMcpConnection,
+    *,
+    release_resource: bool = True,
+) -> None:
+    if mcp_connections.get(connection.key) is connection:
+        mcp_connections.pop(connection.key, None)
+    resource = connection.exclusive_resource
+    if release_resource and resource and mcp_resource_owners.get(resource) == connection.key:
+        mcp_resource_owners.pop(resource, None)
+
+
+async def _release_mcp_resource(connection: PersistentMcpConnection) -> None:
+    resource = connection.exclusive_resource
+    if not resource:
+        return
+    async with mcp_connections_lock:
+        current = mcp_connections.get(connection.key)
+        replacement_uses_resource = (
+            current is not None
+            and current is not connection
+            and current.exclusive_resource == resource
+            and not current.closed
+        )
+        if not replacement_uses_resource and mcp_resource_owners.get(resource) == connection.key:
+            mcp_resource_owners.pop(resource, None)
+
+
+async def _mcp_key_lock(key: tuple[str, str]) -> asyncio.Lock:
+    async with mcp_connections_lock:
+        lock = mcp_connection_key_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            mcp_connection_key_locks[key] = lock
+        return lock
+
+
+async def _close_idle_mcp_connections() -> None:
+    if MCP_PROXY_IDLE_TIMEOUT <= 0:
+        return
+    cutoff = time.time() - MCP_PROXY_IDLE_TIMEOUT
+    stale: list[PersistentMcpConnection] = []
+    async with mcp_connections_lock:
+        for _, connection in list(mcp_connections.items()):
+            if connection.active_calls == 0 and connection.last_used <= cutoff:
+                _unregister_mcp_connection_locked(connection, release_resource=False)
+                stale.append(connection)
+    for connection in stale:
+        await _close_mcp_connection(connection)
+        await _release_mcp_resource(connection)
+
+
+async def _acquire_mcp_connection(
+    session_id: str,
+    server_name: str,
+    config: dict[str, Any],
+) -> PersistentMcpConnection:
+    await _close_idle_mcp_connections()
+    key = (session_id, server_name)
+    fingerprint = _mcp_config_fingerprint(config)
+    exclusive_resource = _mcp_exclusive_resource(config)
+    key_lock = await _mcp_key_lock(key)
+
+    async with key_lock:
+        replaced: PersistentMcpConnection | None = None
+        reserved_resource = False
+        async with mcp_connections_lock:
+            connection = mcp_connections.get(key)
+            if connection is not None and (
+                connection.closed or connection.config_fingerprint != fingerprint
+            ):
+                _unregister_mcp_connection_locked(connection)
+                replaced = connection
+                connection = None
+
+            if connection is None and exclusive_resource:
+                owner = mcp_resource_owners.get(exclusive_resource)
+                if owner is not None and owner != key:
+                    raise McpResourceBusyError(
+                        f"exclusive MCP profile/resource is already owned by session {owner[0]!r} "
+                        f"through server {owner[1]!r}"
+                    )
+                mcp_resource_owners[exclusive_resource] = key
+                reserved_resource = True
+
+        if replaced is not None:
+            async with replaced.lock:
+                await _close_mcp_connection(replaced)
+
+        if connection is None:
+            try:
+                connection = await _open_mcp_connection(session_id, server_name, config)
+            except BaseException:
+                if reserved_resource and exclusive_resource:
+                    async with mcp_connections_lock:
+                        if mcp_resource_owners.get(exclusive_resource) == key:
+                            mcp_resource_owners.pop(exclusive_resource, None)
+                raise
+            async with mcp_connections_lock:
+                mcp_connections[key] = connection
+                if connection.exclusive_resource:
+                    mcp_resource_owners[connection.exclusive_resource] = key
+
+        async with mcp_connections_lock:
+            connection.active_calls += 1
+            connection.last_used = time.time()
+        return connection
+
+
+async def _release_mcp_connection(connection: PersistentMcpConnection) -> None:
+    async with mcp_connections_lock:
+        connection.active_calls = max(0, connection.active_calls - 1)
+        connection.last_used = time.time()
+
+
+async def _discard_mcp_connection(connection: PersistentMcpConnection) -> None:
+    async with mcp_connections_lock:
+        _unregister_mcp_connection_locked(connection, release_resource=False)
+    await _close_mcp_connection(connection)
+    await _release_mcp_resource(connection)
+
+
+async def _reset_mcp_connections(session_id: str, server_name: str | None = None) -> int:
+    selected: list[PersistentMcpConnection] = []
+    async with mcp_connections_lock:
+        for key, connection in list(mcp_connections.items()):
+            if key[0] != session_id:
+                continue
+            if server_name is not None and key[1] != server_name:
+                continue
+            _unregister_mcp_connection_locked(connection, release_resource=False)
+            selected.append(connection)
+    for connection in selected:
+        async with connection.lock:
+            await _close_mcp_connection(connection)
+        await _release_mcp_resource(connection)
+    return len(selected)
+
+
+async def _close_all_mcp_connections() -> None:
+    async with mcp_connections_lock:
+        selected = list(mcp_connections.values())
+        mcp_connections.clear()
+        mcp_resource_owners.clear()
+    for connection in selected:
+        async with connection.lock:
+            await _close_mcp_connection(connection)
+
+
+async def _with_mcp_session(
+    session_id: str,
+    server_name: str,
+    config: dict[str, Any],
+    operation: str,
+    tool_name: str = "",
+    arguments: dict[str, Any] | None = None,
+) -> Any:
+    last_error: BaseException | None = None
+    for attempt in range(2):
+        connection = await _acquire_mcp_connection(session_id, server_name, config)
+        try:
+            async with connection.lock:
+                if connection.closed:
+                    continue
+                try:
+                    result = await (
+                        connection.client.list_tools()
+                        if operation == "tools"
+                        else connection.client.call_tool(tool_name, arguments or {})
+                    )
+                except asyncio.CancelledError:
+                    await _discard_mcp_connection(connection)
+                    raise
+                except BaseException as exc:
+                    last_error = exc
+                    await _discard_mcp_connection(connection)
+                    if attempt == 0:
+                        continue
+                    raise
+                connection.last_used = time.time()
+                return result
+        finally:
+            await _release_mcp_connection(connection)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("MCP connection closed before the request could run")
 
 
 def _mcp_result_json(result: Any, max_chars: int) -> str:
@@ -851,29 +1131,68 @@ async def local_mcp(
     timeout: int = 60,
     max_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
 ) -> Any:
-    """Dynamically list configured MCPs, inspect their tool schemas, or call one."""
+    """List, inspect, call, or reset configured MCP servers through persistent downstream connections."""
     session = await _get_session(session_id)
     run_cwd = _operation_cwd(session, cwd)
     root = _find_project_root(run_cwd)
     servers = _discover_mcp_servers(root)
-    action = action.strip().lower()
+    action = action.strip().lower().replace("_", "-")
+    await _close_idle_mcp_connections()
+
     if action == "list":
-        rows = [_public_mcp_summary(name, config) for name, config in sorted(servers.items())]
-        return _limit_text(json.dumps({"project_root": str(root), "servers": rows}, indent=2), max_chars, "MCP list")
+        async with mcp_connections_lock:
+            connected = {
+                key[1]
+                for key, connection in mcp_connections.items()
+                if key[0] == session.session_id and not connection.closed
+            }
+        rows = []
+        for name, config in sorted(servers.items()):
+            row = _public_mcp_summary(name, config)
+            if name in connected and row["status"] == "configured":
+                row["status"] = "connected"
+            rows.append(row)
+        return _limit_text(
+            json.dumps({"project_root": str(root), "session_id": session.session_id, "servers": rows}, indent=2),
+            max_chars,
+            "MCP list",
+        )
+
     gate = _require_project_context(session, run_cwd)
     if gate:
         return gate
+
+    if action in {"reset", "close"}:
+        if not server:
+            return "Error: server is required for action=reset."
+        closed = await _reset_mcp_connections(session.session_id, server)
+        return f"Reset MCP connection for {server}: closed {closed} connection(s)."
+    if action in {"reset-all", "close-all"}:
+        closed = await _reset_mcp_connections(session.session_id)
+        return f"Reset all MCP connections for session {session.session_id}: closed {closed} connection(s)."
+
     config = servers.get(server)
     if config is None:
         return f"Error: unknown configured MCP server: {server}"
     if _is_recursive_terminal_server(server, config):
         return "Error: recursive terminal MCP proxying is blocked."
     if action not in {"tools", "call"}:
-        return "Error: action must be list, tools, or call."
+        return "Error: action must be list, tools, call, reset, or reset-all."
     if action == "call" and not tool:
         return "Error: tool is required for action=call."
+
     try:
-        result = await asyncio.wait_for(_with_mcp_session(config, action, tool, arguments), timeout=max(1, timeout))
+        result = await asyncio.wait_for(
+            _with_mcp_session(
+                session.session_id,
+                server,
+                config,
+                action,
+                tool,
+                arguments,
+            ),
+            timeout=max(1, timeout),
+        )
         # Preserve multimodal content from downstream MCP tools. Returning the
         # CallToolResult directly lets FastMCP emit ImageContent, AudioContent,
         # embedded resources, and resource links as native MCP blocks instead
@@ -882,7 +1201,9 @@ async def local_mcp(
             return result
         return _mcp_result_json(result, max_chars)
     except asyncio.TimeoutError:
-        return f"Error: MCP {action} timed out for {server}."
+        return f"Error: MCP {action} timed out for {server}; the cached connection was discarded."
+    except McpResourceBusyError as exc:
+        return f"Error: cannot start {server}: {exc}. Use the owning session_id or reset that connection first."
     except Exception as exc:
         return f"Error: MCP {action} failed for {server}: {type(exc).__name__}"
 
