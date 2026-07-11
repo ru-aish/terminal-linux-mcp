@@ -148,19 +148,24 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
         session = "mcp-test"
         await terminal_mcp.project_context(session_id=session, cwd=str(tmp_path))
 
-        listing = json.loads(await terminal_mcp.local_mcp(cwd=str(tmp_path), session_id=session))
+        async def request(*args, **kwargs):
+            # Each proxy call runs in a fresh task, matching separate HTTP tool
+            # requests while the actor-owned downstream transport stays alive.
+            return await asyncio.create_task(terminal_mcp.local_mcp(*args, **kwargs))
+
+        listing = json.loads(await request(cwd=str(tmp_path), session_id=session))
         assert listing["servers"][0]["status"] == "configured"
         assert "must-not-leak" not in json.dumps(listing)
 
-        tools = await terminal_mcp.local_mcp(
+        tools = await request(
             "tools", server="stateful", session_id=session, cwd=str(tmp_path)
         )
         assert '"counter"' in tools
 
-        first = text(await terminal_mcp.local_mcp(
+        first = text(await request(
             "call", server="stateful", tool="counter", session_id=session, cwd=str(tmp_path)
         ))
-        second = text(await terminal_mcp.local_mcp(
+        second = text(await request(
             "call", server="stateful", tool="counter", session_id=session, cwd=str(tmp_path)
         ))
         first_pid, first_count = first.split(":")
@@ -168,11 +173,11 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
         assert first_pid == second_pid
         assert (first_count, second_count) == ("1", "2")
 
-        connected = json.loads(await terminal_mcp.local_mcp(cwd=str(tmp_path), session_id=session))
+        connected = json.loads(await request(cwd=str(tmp_path), session_id=session))
         assert connected["servers"][0]["status"] == "connected"
 
         await terminal_mcp.project_context(session_id="other-owner", cwd=str(tmp_path))
-        busy = await terminal_mcp.local_mcp(
+        busy = await request(
             "call",
             server="stateful",
             tool="counter",
@@ -182,7 +187,7 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
         assert "already owned by session" in busy
 
         marker = tmp_path / "crash.marker"
-        recovered = text(await terminal_mcp.local_mcp(
+        recovered = text(await request(
             "call",
             server="stateful",
             tool="crash_once",
@@ -192,20 +197,20 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
         ))
         assert recovered == "recovered"
 
-        reset = await terminal_mcp.local_mcp(
+        reset = await request(
             "reset", server="stateful", session_id=session, cwd=str(tmp_path)
         )
         assert "closed 1 connection" in reset
 
-        after_reset = text(await terminal_mcp.local_mcp(
+        after_reset = text(await request(
             "call", server="stateful", tool="counter", session_id=session, cwd=str(tmp_path)
         ))
         reset_pid, reset_count = after_reset.split(":")
         assert reset_pid != second_pid
         assert reset_count == "1"
 
-        await terminal_mcp.local_mcp("reset-all", session_id=session, cwd=str(tmp_path))
-        await terminal_mcp.local_mcp("reset-all", session_id="other-owner", cwd=str(tmp_path))
+        await request("reset-all", session_id=session, cwd=str(tmp_path))
+        await request("reset-all", session_id="other-owner", cwd=str(tmp_path))
 
     run(lifecycle())
 

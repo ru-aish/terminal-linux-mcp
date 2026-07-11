@@ -38,14 +38,6 @@ AGENT_CONTEXT_MAX_CHARS = int(os.environ.get("MCP_AGENT_CONTEXT_MAX_CHARS", "120
 MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
 
 
-@contextlib.asynccontextmanager
-async def _terminal_lifespan(_: Any):
-    try:
-        yield {}
-    finally:
-        await _close_all_mcp_connections()
-
-
 mcp = FastMCP(
     "Terminal",
     instructions=(
@@ -57,7 +49,6 @@ mcp = FastMCP(
         "Use local_mcp for MCP servers already configured on this machine; inspect a server's tools before calling it.\n"
         "Use run_command for Git, HTTP, databases, networking, services, containers, and package management."
     ),
-    lifespan=_terminal_lifespan,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=(os.environ.get("MCP_DNS_REBINDING_PROTECTION", "0") == "1")
     ),
@@ -89,17 +80,26 @@ class ProcessState:
 
 
 @dataclass
+class McpActorRequest:
+    operation: str
+    tool_name: str
+    arguments: dict[str, Any] | None
+    future: asyncio.Future[Any]
+
+
+@dataclass
 class PersistentMcpConnection:
     key: tuple[str, str]
     config_fingerprint: str
-    stack: contextlib.AsyncExitStack
-    client: Any
+    queue: asyncio.Queue[McpActorRequest | None]
+    ready: asyncio.Future[None]
+    task: asyncio.Task[None] | None = None
     exclusive_resource: str | None = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
     active_calls: int = 0
     closed: bool = False
+    failure: BaseException | None = None
 
 
 sessions: dict[str, SessionState] = {"default": SessionState("default", WORKSPACE_DIR)}
@@ -905,18 +905,18 @@ def _mcp_exclusive_resource(config: dict[str, Any]) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
-async def _open_mcp_connection(
-    session_id: str,
-    server_name: str,
+async def _mcp_connection_actor(
+    connection: PersistentMcpConnection,
     config: dict[str, Any],
-) -> PersistentMcpConnection:
+) -> None:
     from mcp import ClientSession
     from mcp.client.sse import sse_client
     from mcp.client.stdio import StdioServerParameters, stdio_client
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client
 
     runtime = _runtime_mcp_config(config)
     stack = contextlib.AsyncExitStack()
+    client: Any = None
     try:
         if runtime.get("url"):
             if runtime["transport"] == "sse":
@@ -924,8 +924,14 @@ async def _open_mcp_connection(
                     sse_client(runtime["url"], headers=runtime["headers"])
                 )
             else:
+                http_client = None
+                if runtime["headers"]:
+                    import httpx
+                    http_client = await stack.enter_async_context(
+                        httpx.AsyncClient(headers=runtime["headers"])
+                    )
                 streams = await stack.enter_async_context(
-                    streamablehttp_client(runtime["url"], headers=runtime["headers"])
+                    streamable_http_client(runtime["url"], http_client=http_client)
                 )
         else:
             env = os.environ.copy()
@@ -940,24 +946,102 @@ async def _open_mcp_connection(
 
         client = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
         await client.initialize()
-        return PersistentMcpConnection(
-            key=(session_id, server_name),
-            config_fingerprint=_mcp_config_fingerprint(config),
-            stack=stack,
-            client=client,
-            exclusive_resource=_mcp_exclusive_resource(config),
-        )
-    except BaseException:
-        await stack.aclose()
+        if not connection.ready.done():
+            connection.ready.set_result(None)
+
+        while True:
+            request = await connection.queue.get()
+            if request is None:
+                break
+            connection.last_used = time.time()
+            try:
+                result = await (
+                    client.list_tools()
+                    if request.operation == "tools"
+                    else client.call_tool(request.tool_name, request.arguments or {})
+                )
+            except asyncio.CancelledError:
+                if not request.future.done():
+                    request.future.cancel()
+                raise
+            except BaseException as exc:
+                connection.failure = exc
+                if not request.future.done():
+                    request.future.set_exception(exc)
+                break
+            else:
+                if not request.future.done():
+                    request.future.set_result(result)
+                connection.last_used = time.time()
+    except asyncio.CancelledError:
+        if not connection.ready.done():
+            connection.ready.cancel()
         raise
+    except BaseException as exc:
+        connection.failure = exc
+        if not connection.ready.done():
+            connection.ready.set_exception(exc)
+    finally:
+        connection.closed = True
+        failure = connection.failure or RuntimeError("MCP connection closed")
+        while True:
+            try:
+                pending = connection.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if pending is not None and not pending.future.done():
+                pending.future.set_exception(failure)
+        with contextlib.suppress(BaseException):
+            await stack.aclose()
+
+
+async def _open_mcp_connection(
+    session_id: str,
+    server_name: str,
+    config: dict[str, Any],
+) -> PersistentMcpConnection:
+    loop = asyncio.get_running_loop()
+    connection = PersistentMcpConnection(
+        key=(session_id, server_name),
+        config_fingerprint=_mcp_config_fingerprint(config),
+        queue=asyncio.Queue(),
+        ready=loop.create_future(),
+        exclusive_resource=_mcp_exclusive_resource(config),
+    )
+    connection.task = loop.create_task(
+        _mcp_connection_actor(connection, config),
+        name=f"mcp-proxy:{session_id}:{server_name}",
+    )
+    try:
+        await connection.ready
+    except BaseException:
+        await _close_mcp_connection(connection)
+        raise
+    return connection
 
 
 async def _close_mcp_connection(connection: PersistentMcpConnection) -> None:
-    if connection.closed:
+    task = connection.task
+    if task is None:
+        connection.closed = True
         return
+    if task.done():
+        connection.closed = True
+        with contextlib.suppress(BaseException):
+            task.result()
+        return
+
     connection.closed = True
-    with contextlib.suppress(Exception):
-        await connection.stack.aclose()
+    await connection.queue.put(None)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    except asyncio.TimeoutError:
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+    except BaseException:
+        with contextlib.suppress(BaseException):
+            await task
 
 
 def _unregister_mcp_connection_locked(
@@ -1003,8 +1087,9 @@ async def _close_idle_mcp_connections() -> None:
     cutoff = time.time() - MCP_PROXY_IDLE_TIMEOUT
     stale: list[PersistentMcpConnection] = []
     async with mcp_connections_lock:
-        for _, connection in list(mcp_connections.items()):
-            if connection.active_calls == 0 and connection.last_used <= cutoff:
+        for connection in list(mcp_connections.values()):
+            task_done = connection.task is not None and connection.task.done()
+            if task_done or (connection.active_calls == 0 and connection.last_used <= cutoff):
                 _unregister_mcp_connection_locked(connection, release_resource=False)
                 stale.append(connection)
     for connection in stale:
@@ -1028,8 +1113,9 @@ async def _acquire_mcp_connection(
         reserved_resource = False
         async with mcp_connections_lock:
             connection = mcp_connections.get(key)
+            task_done = connection is not None and connection.task is not None and connection.task.done()
             if connection is not None and (
-                connection.closed or connection.config_fingerprint != fingerprint
+                connection.closed or task_done or connection.config_fingerprint != fingerprint
             ):
                 _unregister_mcp_connection_locked(connection)
                 replaced = connection
@@ -1046,8 +1132,7 @@ async def _acquire_mcp_connection(
                 reserved_resource = True
 
         if replaced is not None:
-            async with replaced.lock:
-                await _close_mcp_connection(replaced)
+            await _close_mcp_connection(replaced)
 
         if connection is None:
             try:
@@ -1093,8 +1178,7 @@ async def _reset_mcp_connections(session_id: str, server_name: str | None = None
             _unregister_mcp_connection_locked(connection, release_resource=False)
             selected.append(connection)
     for connection in selected:
-        async with connection.lock:
-            await _close_mcp_connection(connection)
+        await _close_mcp_connection(connection)
         await _release_mcp_resource(connection)
     return len(selected)
 
@@ -1105,8 +1189,7 @@ async def _close_all_mcp_connections() -> None:
         mcp_connections.clear()
         mcp_resource_owners.clear()
     for connection in selected:
-        async with connection.lock:
-            await _close_mcp_connection(connection)
+        await _close_mcp_connection(connection)
 
 
 async def _with_mcp_session(
@@ -1120,27 +1203,27 @@ async def _with_mcp_session(
     last_error: BaseException | None = None
     for attempt in range(2):
         connection = await _acquire_mcp_connection(session_id, server_name, config)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        request = McpActorRequest(operation, tool_name, arguments, future)
         try:
-            async with connection.lock:
-                if connection.closed:
-                    continue
-                try:
-                    result = await (
-                        connection.client.list_tools()
-                        if operation == "tools"
-                        else connection.client.call_tool(tool_name, arguments or {})
-                    )
-                except asyncio.CancelledError:
-                    await _discard_mcp_connection(connection)
-                    raise
-                except BaseException as exc:
-                    last_error = exc
-                    await _discard_mcp_connection(connection)
-                    if attempt == 0:
-                        continue
-                    raise
-                connection.last_used = time.time()
-                return result
+            task_done = connection.task is not None and connection.task.done()
+            if connection.closed or task_done:
+                raise RuntimeError("MCP connection closed before the request could run")
+            await connection.queue.put(request)
+            result = await future
+            connection.last_used = time.time()
+            return result
+        except asyncio.CancelledError:
+            future.cancel()
+            await _discard_mcp_connection(connection)
+            raise
+        except BaseException as exc:
+            last_error = exc
+            await _discard_mcp_connection(connection)
+            if attempt == 0:
+                continue
+            raise
         finally:
             await _release_mcp_connection(connection)
     if last_error is not None:

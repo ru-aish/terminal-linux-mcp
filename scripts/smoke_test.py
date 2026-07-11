@@ -6,12 +6,12 @@ import asyncio
 import os
 
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 async def inspect_server(url: str, token: str | None) -> None:
     headers = {"Authorization": f"Bearer {token}"} if token else None
-    async with streamablehttp_client(url, headers=headers) as (read, write, _):
+    async with streamable_http_client(url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             response = await session.list_tools()
