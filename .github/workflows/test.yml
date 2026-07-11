@@ -25,16 +25,30 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
+      - name: Check bootstrap interfaces
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          bash -n start.sh setup.sh store.sh install.sh
+          ./start.sh --help
+          ./setup.sh --help
+          ./store.sh --help
+          ./install.sh --help
 
-      - name: Check shell scripts
-        run: bash -n start.sh setup.sh
+      - name: Install through project setup
+        env:
+          PYTHON_BIN: python
+        run: |
+          ./setup.sh --dev
+          .venv/bin/pytest --version
+          ./store.sh --check
+          ./start.sh --check --local-only
 
       - name: Compile Python files
-        run: python -m py_compile terminal_mcp.py scripts/smoke_test.py tests/test_terminal_mcp.py
+        run: |
+          .venv/bin/python -m py_compile \
+            terminal_mcp.py \
+            scripts/smoke_test.py \
+            tests/test_terminal_mcp.py \
+            tests/test_http_persistence.py
 
       - name: Run tests
-        run: pytest -q
+        run: .venv/bin/pytest -q

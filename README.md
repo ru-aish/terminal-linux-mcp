@@ -24,17 +24,51 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 ## Requirements
 
 - Linux
-- Python 3.11 or newer
-- `ngrok` for a public tunnel
-- Optional agent CLIs used by the delegated tools: Codex and/or Antigravity
+- Optional agent CLIs used by delegated tools: Codex and/or Antigravity
+
+`store.sh` installs the remaining prerequisites. It supports Debian/Ubuntu,
+Fedora/RHEL, Arch, openSUSE, and Alpine package managers. When the operating
+system does not provide Python 3.11 or newer, it installs `uv` in user space and
+uses a managed Python instead.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/ru-aish/terminal-linux-mcp.git
 cd terminal-linux-mcp
-./setup.sh
+./store.sh --with-ngrok
 cp .env.example .env
+```
+
+`install.sh` is a conventional alias for the same installer:
+
+```bash
+./install.sh --with-ngrok
+```
+
+Useful installer modes:
+
+```bash
+./store.sh                         # runtime dependencies only
+./store.sh --dev --test            # development dependencies and test suite
+./store.sh --skip-system-packages  # user-space setup without sudo/doas
+./store.sh --check                 # readiness report without modifications
+```
+
+For a local-only server, ngrok is not required:
+
+```bash
+./store.sh
+./start.sh --local-only
+```
+
+`setup.sh` is the lower-level, idempotent Python environment installer. It can
+repair an existing `.venv`, or rebuild it with backup-and-rollback protection:
+
+```bash
+./setup.sh
+./setup.sh --recreate
+./setup.sh --dev --test
 ```
 
 Generate a strong bearer token:
@@ -74,7 +108,8 @@ Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>
 ### Local-only mode
 
 ```bash
-MCP_SKIP_NGROK=1 ./start.sh
+./start.sh --local-only
+# Equivalent: MCP_SKIP_NGROK=1 ./start.sh
 ```
 
 ### Verify the endpoint
@@ -241,6 +276,9 @@ Copy `.env.example` to `.env`. Important values:
 | `MCP_BEARER_TOKEN` | empty | Required bearer token for HTTP requests |
 | `MCP_PROXY_IDLE_TIMEOUT` | `1800` | Downstream MCP idle timeout in seconds |
 | `MCP_SKIP_NGROK` | `0` | Set `1` for local-only mode |
+| `MCP_AUTO_SETUP` | `1` | Run `setup.sh` automatically when the Python runtime is missing or incomplete |
+| `MCP_AUTO_INSTALL_NGROK` | `0` | Let `start.sh` invoke `store.sh --with-ngrok` when ngrok is missing |
+| `MCP_VENV_DIR` | `.venv` | Override the virtual-environment directory |
 | `NGROK_URL` | random URL | Reserved ngrok URL/domain |
 | `NGROK_TRAFFIC_POLICY_FILE` | empty | Optional ngrok Traffic Policy |
 | `MCP_ALLOW_UNAUTHENTICATED_PUBLIC` | `0` | Dangerous public-tunnel override |
@@ -265,14 +303,15 @@ Bearer authentication protects the endpoint from anonymous requests, but it does
 Install development dependencies:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
+./store.sh --dev
+# Or, when Linux prerequisites are already installed:
+./setup.sh --dev
 ```
 
 Run checks:
 
 ```bash
-bash -n start.sh setup.sh
+bash -n start.sh setup.sh store.sh install.sh
 .venv/bin/python -m py_compile terminal_mcp.py scripts/smoke_test.py
 .venv/bin/pytest
 ```
@@ -290,6 +329,31 @@ The regression suite verifies:
 - bearer authentication
 
 ## Troubleshooting
+
+### Fresh Linux machine or missing `venv`/`pip`
+
+Run the full bootstrap installer:
+
+```bash
+./store.sh
+```
+
+If sudo access is unavailable, use the user-space path:
+
+```bash
+./store.sh --skip-system-packages
+```
+
+The installer downloads `uv` only when no usable Python 3.11+ interpreter is
+available. Downloads use HTTPS, retry transient failures, and support optional
+`UV_INSTALLER_SHA256` and `NGROK_SHA256` verification overrides.
+
+### Repair a broken environment
+
+```bash
+./setup.sh --recreate
+./start.sh --check --local-only
+```
 
 ### `Port ... is already in use`
 

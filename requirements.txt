@@ -1,3 +1,4 @@
 mcp>=1.27.1,<2
 uvicorn[standard]>=0.48,<1
 starlette>=1.2,<2
+httpx>=0.28,<1
