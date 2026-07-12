@@ -9,12 +9,13 @@ import terminal_mcp
 
 
 EXPECTED_TOOLS = [
-    "project_context", "local_skills", "local_mcp", "run_command", "start_process",
-    "poll_process", "stop_process", "set_session_env", "read_file", "write_file",
-    "replace_in_file", "apply_patch", "list_dir", "stat_path", "make_dir", "copy_path",
-    "move_path", "run_codex_yolo", "start_codex_yolo", "run_agy_yolo", "start_agy_yolo",
+    "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
+    "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
+    "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
+    "read_file", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
+    "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
+    "run_agy_yolo", "start_agy_yolo",
 ]
-
 
 def run(coro):
     return asyncio.run(coro)
@@ -59,25 +60,67 @@ def test_bearer_auth_middleware():
 
 
 def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
-    isolated_home(tmp_path, monkeypatch)
+    home = isolated_home(tmp_path, monkeypatch)
+    (home / ".codex").mkdir()
+    (home / ".codex" / "AGENTS.md").write_text("codex-rule-must-not-load", encoding="utf-8")
+    (home / ".GPT").mkdir()
+    (home / ".GPT" / "AGENTS.md").write_text("global-gpt-rule", encoding="utf-8")
+
     project = tmp_path / "project"
     project.mkdir()
     (project / ".git").mkdir()
-    agents = project / "AGENTS.md"
+    instruction_dir = project / ".GPT"
+    instruction_dir.mkdir()
+    agents = instruction_dir / "AGENTS.md"
     agents.write_text("rule-one\n" + "a" * 500, encoding="utf-8")
 
-    truncated = run(terminal_mcp.project_context(session_id="context-test", cwd=str(project), max_chars=280))
+    blocked_default = run(terminal_mcp.write_file(
+        "default-blocked.txt", "nope", cwd=str(project)
+    ))
+    assert "session_id='default' is intentionally rejected" in blocked_default
+
+    blocked_new_thread = run(terminal_mcp.write_file(
+        "blocked-before-bootstrap.txt", "nope", session_id="context-test", cwd=str(project)
+    ))
+    assert "GPT thread context has not been loaded" in blocked_new_thread
+
+    truncated = run(terminal_mcp.project_context(
+        session_id="context-test", cwd=str(project), max_chars=280
+    ))
     assert "Context truncated" in truncated
     assert "Context Gate: satisfied" not in truncated
 
-    loaded = run(terminal_mcp.project_context(session_id="context-test", cwd=str(project), max_chars=2000))
+    loaded = run(terminal_mcp.project_context(
+        session_id="context-test", cwd=str(project), max_chars=100000
+    ))
+    assert "global-gpt-rule" in loaded
     assert "rule-one" in loaded
+    assert "codex-rule-must-not-load" not in loaded
     assert "Context Gate: satisfied" in loaded
+    assert "Public Terminal GPT tools" in loaded
+
+    allowed = run(terminal_mcp.write_file(
+        "allowed.txt", "yes", session_id="context-test", cwd=str(project)
+    ))
+    assert "Bytes Written" in allowed
+
+    other_thread = run(terminal_mcp.write_file(
+        "other-thread.txt", "nope", session_id="context-test-other", cwd=str(project)
+    ))
+    assert "GPT thread context has not been loaded" in other_thread
 
     agents.write_text("rule-two", encoding="utf-8")
-    blocked = run(terminal_mcp.write_file("blocked.txt", "nope", session_id="context-test", cwd=str(project)))
-    assert "Project context has not been loaded" in blocked
+    blocked = run(terminal_mcp.write_file(
+        "blocked.txt", "nope", session_id="context-test", cwd=str(project)
+    ))
+    assert "GPT thread context has not been loaded" in blocked
     assert not (project / "blocked.txt").exists()
+
+    reloaded = run(terminal_mcp.get_thread_context(
+        thread_id="context-test", cwd=str(project), max_chars=100000
+    ))
+    assert "rule-two" in reloaded
+    assert "Context Gate: satisfied" in reloaded
 
 
 def test_local_skills_list_read_and_search(tmp_path, monkeypatch):
@@ -87,13 +130,22 @@ def test_local_skills_list_read_and_search(tmp_path, monkeypatch):
     skill.parent.mkdir(parents=True)
     skill.write_text("# Demo\nUseful terminal workflow\n", encoding="utf-8")
 
-    listing = json.loads(run(terminal_mcp.local_skills(cwd=str(tmp_path))))
+    session = "skills-test"
+    run(terminal_mcp.bootstrap_thread(thread_id=session, cwd=str(tmp_path), max_chars=100000))
+
+    listing = json.loads(run(terminal_mcp.local_skills(
+        cwd=str(tmp_path), session_id=session
+    )))
     assert any(row["name"] == "demo" for row in listing["skills"])
 
-    read = json.loads(run(terminal_mcp.local_skills("read", name="demo", cwd=str(tmp_path))))
+    read = json.loads(run(terminal_mcp.local_skills(
+        "read", name="demo", cwd=str(tmp_path), session_id=session
+    )))
     assert "Useful terminal workflow" in read["content"]
 
-    search = json.loads(run(terminal_mcp.local_skills("search", query="terminal", cwd=str(tmp_path))))
+    search = json.loads(run(terminal_mcp.local_skills(
+        "search", query="terminal", cwd=str(tmp_path), session_id=session
+    )))
     assert any(row["name"] == "demo" for row in search["matches"])
 
 
@@ -239,7 +291,100 @@ def test_filesystem_and_process_lifecycle(tmp_path, monkeypatch):
             for line in started.splitlines()
             if line.startswith("Process ID:")
         )
-        assert "Status: running" in await terminal_mcp.poll_process(process_id)
-        assert "exited" in await terminal_mcp.stop_process(process_id)
+        assert "Status: running" in await terminal_mcp.poll_process(
+            process_id, session_id=session
+        )
+
+        other_session = "fs-test-other"
+        await terminal_mcp.project_context(session_id=other_session, cwd=str(tmp_path))
+        denied = await terminal_mcp.poll_process(process_id, session_id=other_session)
+        assert "not owned by session fs-test-other" in denied
+        denied_stop = await terminal_mcp.stop_process(process_id, session_id=other_session)
+        assert "not owned by session fs-test-other" in denied_stop
+
+        assert "exited" in await terminal_mcp.stop_process(
+            process_id, session_id=session
+        )
 
     run(lifecycle())
+
+
+def test_startup_instructions_include_gpt_rules_skills_and_tools(tmp_path, monkeypatch):
+    home = isolated_home(tmp_path, monkeypatch)
+    gpt_home = home / ".GPT"
+    gpt_home.mkdir()
+    (gpt_home / "AGENTS.md").write_text("startup-gpt-rule", encoding="utf-8")
+    skill = gpt_home / "skills" / "startup-demo" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: startup-demo\ndescription: Startup demo workflow\n---\n# Workflow\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "startup-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+
+    previous = terminal_mcp.mcp._mcp_server.instructions
+    monkeypatch.setattr(terminal_mcp, "WORKSPACE_DIR", project)
+    try:
+        instructions = terminal_mcp._set_startup_instructions()
+        assert "startup-gpt-rule" in instructions
+        assert "startup-demo" in instructions
+        assert "bootstrap_thread" in instructions
+        assert "record_token_usage" in instructions
+        assert "session_id='default' is rejected" in instructions
+    finally:
+        terminal_mcp.mcp._mcp_server.instructions = previous
+
+
+def test_token_usage_database_separates_exact_and_estimated(tmp_path, monkeypatch):
+    home = isolated_home(tmp_path, monkeypatch)
+    gpt_home = home / ".GPT"
+    gpt_home.mkdir()
+    (gpt_home / "AGENTS.md").write_text("usage-rule", encoding="utf-8")
+    project = tmp_path / "usage-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+
+    bootstrap = run(terminal_mcp.bootstrap_thread(
+        thread_id="usage-thread", cwd=str(project), max_chars=100000
+    ))
+    assert "Context Gate: satisfied" in bootstrap
+    assert "Estimated Context Input Tokens" in bootstrap
+
+    recorded = json.loads(run(terminal_mcp.record_token_usage(
+        thread_id="usage-thread",
+        input_tokens=120,
+        output_tokens=35,
+        cached_input_tokens=20,
+        model="test-model",
+        request_id="response-1",
+        metadata={"provider": "test"},
+    )))
+    totals = recorded["totals"]
+    assert totals["exact_input_tokens"] == 120
+    assert totals["exact_output_tokens"] == 35
+    assert totals["exact_cached_input_tokens"] == 20
+    assert totals["estimated_input_tokens"] > 0
+
+    duplicate = json.loads(run(terminal_mcp.record_token_usage(
+        thread_id="usage-thread",
+        input_tokens=120,
+        output_tokens=35,
+        cached_input_tokens=20,
+        model="test-model",
+        request_id="response-1",
+    )))
+    assert duplicate["event_id"] == recorded["event_id"]
+
+    summary = json.loads(run(terminal_mcp.get_token_usage("usage-thread")))
+    assert summary["database"] == str(gpt_home / "thread_usage.db")
+    assert summary["totals"]["events"] == 2
+    assert summary["by_thread"][0]["thread_id"] == "usage-thread"
+    assert summary["recent_events"][0]["model"] == "test-model"
+    assert summary["recent_events"][0]["is_exact"] is True
+
+    invalid = run(terminal_mcp.record_token_usage(
+        thread_id="usage-thread", input_tokens=-1, output_tokens=0
+    ))
+    assert invalid.startswith("Error recording token usage")

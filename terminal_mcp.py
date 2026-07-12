@@ -11,6 +11,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -25,9 +26,11 @@ from urllib.parse import urlsplit, urlunsplit
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from gpt_thread_store import GPTThreadStore
+
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR = Path(os.environ.get("MCP_LOG_DIR", "~/.mcp_terminal_logs")).expanduser().resolve()
+LOG_DIR = Path(os.environ.get("MCP_LOG_DIR", "~/.gpt_terminal_mcp_logs")).expanduser().resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SHELL = os.environ.get("MCP_SHELL", "/bin/bash")
 DEFAULT_TIMEOUT = int(os.environ.get("MCP_DEFAULT_TIMEOUT", "30"))
@@ -36,19 +39,13 @@ PROCESS_BUFFER_LINES = int(os.environ.get("MCP_PROCESS_BUFFER_LINES", "1000"))
 AGENT_DIR_NAME = os.environ.get("MCP_AGENT_DIR_NAME", ".agent")
 AGENT_CONTEXT_MAX_CHARS = int(os.environ.get("MCP_AGENT_CONTEXT_MAX_CHARS", "12000"))
 MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
+DEFAULT_BOOTSTRAP_MAX_CHARS = int(os.environ.get("MCP_BOOTSTRAP_MAX_CHARS", "100000"))
+GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
 
 
 mcp = FastMCP(
-    "Terminal",
-    instructions=(
-        "You are connected to a native development terminal on the host machine.\n"
-        "Use these tools for software development, files, builds, tests, packages, services, and process management.\n"
-        "Use a stable session_id for each independent job; commands in one session are serialized while different sessions can run concurrently.\n"
-        "Before the first executing or modifying action in a project, and whenever cwd or applicable instructions change, call project_context and follow every returned AGENTS.md instruction.\n"
-        "Use local_skills to discover and read project or machine-local skills.\n"
-        "Use local_mcp for MCP servers already configured on this machine; inspect a server's tools before calling it.\n"
-        "Use run_command for Git, HTTP, databases, networking, services, containers, and package management."
-    ),
+    "Terminal GPT Experimental",
+    instructions="Startup context is initialized after tool registration.",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=(os.environ.get("MCP_DNS_REBINDING_PROTECTION", "0") == "1")
     ),
@@ -63,6 +60,7 @@ class SessionState:
     updated_at: float = field(default_factory=time.time)
     command_count: int = 0
     context_fingerprints: dict[str, str] = field(default_factory=dict)
+    bootstrapped_at: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 @dataclass
@@ -159,6 +157,62 @@ def _now_ms() -> int:
 def _normalize_session_id(session_id: str | None) -> str:
     normalized = (session_id or "default").strip()
     return (normalized or "default")[:128]
+
+
+def _gpt_home() -> Path:
+    return GPT_STORE.home()
+
+
+def _gpt_agents_path() -> Path:
+    return GPT_STORE.agents_path()
+
+
+def _thread_db_path() -> Path:
+    return GPT_STORE.db_path()
+
+
+def _ensure_gpt_layout() -> Path:
+    return GPT_STORE.ensure_layout()
+
+
+def _estimate_tokens(text: str) -> int:
+    return GPT_STORE.estimate_tokens(text)
+
+
+def _upsert_thread_record(thread_id: str, cwd: Path, fingerprint: str = "", loaded: bool = False) -> None:
+    GPT_STORE.upsert_thread(thread_id, cwd, fingerprint, loaded=loaded)
+
+
+def _record_usage_event(
+    thread_id: str,
+    *,
+    event_type: str,
+    source: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_input_tokens: int = 0,
+    is_exact: bool = False,
+    model: str = "",
+    request_id: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    return GPT_STORE.record_usage(
+        thread_id,
+        event_type=event_type,
+        source=source,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
+        is_exact=is_exact,
+        model=model,
+        request_id=request_id,
+        metadata=metadata,
+    )
+
+
+def _usage_summary(thread_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+    return GPT_STORE.usage_summary(thread_id, limit)
+
 
 def _format_timestamp(value: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
@@ -367,7 +421,7 @@ def _agent_paths(root: Path, agent_id: str) -> dict[str, Path]:
         "handoff": agent_dir / "HANDOFF.md",
         "state": agent_dir / "STATE.json",
         "lock": base / ".lock",
-        "agents_md": root / "AGENTS.md",
+        "agents_md": root / ".GPT" / "AGENTS.md",
     }
 
 def _ensure_agent_files(paths: dict[str, Path], agent_id: str) -> None:
@@ -515,68 +569,36 @@ def _find_project_root(cwd: Path) -> Path:
 
 
 def _applicable_agents_files(cwd: Path) -> tuple[Path, list[Path]]:
-    cwd = cwd.resolve()
-    root = _find_project_root(cwd)
-    files: list[Path] = []
-    global_override = Path.home() / ".codex" / "AGENTS.override.md"
-    global_normal = Path.home() / ".codex" / "AGENTS.md"
-    if global_override.is_file():
-        files.append(global_override)
-    elif global_normal.is_file():
-        files.append(global_normal)
-
-    chain: list[Path] = [root]
-    if cwd != root:
-        try:
-            relative = cwd.relative_to(root)
-            current = root
-            for part in relative.parts:
-                current = current / part
-                chain.append(current)
-        except ValueError:
-            chain = [cwd]
-    for directory in chain:
-        override = directory / "AGENTS.override.md"
-        normal = directory / "AGENTS.md"
-        if override.is_file():
-            files.append(override)
-        elif normal.is_file():
-            files.append(normal)
-    return root, files
+    return GPT_STORE.applicable_agents_files(cwd, _find_project_root)
 
 
 def _agents_snapshot(cwd: Path) -> tuple[Path, list[tuple[Path, str]], str]:
-    root, paths = _applicable_agents_files(cwd)
-    rows: list[tuple[Path, str]] = []
-    digest = hashlib.sha256()
-    digest.update(str(root).encode())
-    digest.update(b"\0")
-    digest.update(str(cwd.resolve()).encode())
-    digest.update(b"\0")
-    for item in paths:
-        try:
-            content = item.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            content = f"[unreadable: {type(exc).__name__}]"
-        rows.append((item, content))
-        digest.update(str(item.resolve()).encode("utf-8", errors="replace"))
-        digest.update(b"\0")
-        digest.update(content.encode("utf-8", errors="replace"))
-        digest.update(b"\0")
-    return root, rows, digest.hexdigest()
+    return GPT_STORE.agents_snapshot(cwd, _find_project_root)
 
 
 def _context_key(cwd: Path) -> str:
     return str(cwd.resolve())
 
 
-def _context_gate_error(root: Path, cwd: Path, rows: list[tuple[Path, str]]) -> str:
+def _context_gate_error(
+    root: Path,
+    cwd: Path,
+    rows: list[tuple[Path, str]],
+    session_id: str,
+) -> str:
     listed = "\n".join(f"- {path}" for path, _ in rows) or "- none"
+    identity_note = (
+        "The shared session_id='default' is intentionally rejected by this experimental server.\n"
+        "Choose a unique stable thread_id, call bootstrap_thread(thread_id=...), and reuse it as session_id.\n\n"
+        if session_id == "default"
+        else ""
+    )
     return (
-        "Project context has not been loaded, or an applicable AGENTS.md changed.\n"
+        "GPT thread context has not been loaded, or an applicable .GPT/AGENTS.md changed.\n"
         "No action was executed.\n\n"
-        "Call project_context with this cwd, follow the returned instructions, then retry.\n\n"
-        f"Project Root: {root}\nWorking Directory: {cwd}\nApplicable Files:\n{listed}"
+        + identity_note
+        + "Call bootstrap_thread or get_thread_context with this cwd, follow every returned instruction, then retry.\n\n"
+        + f"Thread/Session ID: {session_id}\nProject Root: {root}\nWorking Directory: {cwd}\nApplicable Files:\n{listed}"
     )
 
 
@@ -584,11 +606,10 @@ def _require_project_context(session: SessionState, cwd: Path) -> str | None:
     cwd = cwd.resolve()
     root, rows, fingerprint = _agents_snapshot(cwd)
     key = _context_key(cwd)
-    if not rows:
-        session.context_fingerprints[key] = fingerprint
-        return None
+    if session.session_id == "default":
+        return _context_gate_error(root, cwd, rows, session.session_id)
     if session.context_fingerprints.get(key) != fingerprint:
-        return _context_gate_error(root, cwd, rows)
+        return _context_gate_error(root, cwd, rows, session.session_id)
     return None
 
 
@@ -637,6 +658,8 @@ def _skill_summary(content: str, fields: dict[str, str]) -> str:
 
 def _skill_roots(root: Path) -> list[tuple[str, Path]]:
     candidates = [
+        ("project-gpt", root / ".GPT" / "skills"),
+        ("user-gpt", _gpt_home() / "skills"),
         ("project-codex", root / ".codex" / "skills"),
         ("project-agents", root / ".agents" / "skills"),
         ("project-skills", root / "skills"),
@@ -700,6 +723,9 @@ async def local_skills(
     """Dynamically list, read, or search project and machine-local SKILL.md files."""
     session = await _get_session(session_id)
     run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     root = _find_project_root(run_cwd)
     skills = _discover_skills(root)
     action = action.strip().lower()
@@ -1251,6 +1277,9 @@ async def local_mcp(
     """List, inspect, call, or reset configured MCP servers through persistent downstream connections."""
     session = await _get_session(session_id)
     run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     root = _find_project_root(run_cwd)
     servers = _discover_mcp_servers(root)
     action = action.strip().lower().replace("_", "-")
@@ -1274,10 +1303,6 @@ async def local_mcp(
             max_chars,
             "MCP list",
         )
-
-    gate = _require_project_context(session, run_cwd)
-    if gate:
-        return gate
 
     if action in {"reset", "close"}:
         if not server:
@@ -1447,6 +1472,9 @@ async def set_session_env(name: str, value: str, session_id: str = "default") ->
     """Set an environment variable override for future commands in a session."""
     session = await _get_session(session_id)
     async with session.lock:
+        gate = _require_project_context(session, session.cwd.resolve())
+        if gate:
+            return gate
         session.env[str(name)] = str(value)
         session.updated_at = time.time()
         return f"Set {name} for session {session.session_id}."
@@ -1489,11 +1517,22 @@ async def start_process(command: str, session_id: str = "default", cwd: str | No
         return "\n".join([f"Process ID: {process_id}", f"Session ID: {session.session_id}", f"PID: {process.pid}", f"Command: {command}", f"Working Directory: {run_cwd}", "Status: running"])
 
 @mcp.tool()
-async def poll_process(process_id: str, max_lines: int = 200) -> str:
-    """Read buffered stdout/stderr from a background process."""
+async def poll_process(
+    process_id: str,
+    max_lines: int = 200,
+    session_id: str = "default",
+) -> str:
+    """Read buffered output from a background process owned by this bootstrapped thread."""
+    session = await _get_session(session_id)
+    gate = _require_project_context(session, session.cwd.resolve())
+    if gate:
+        return gate
     async with state_lock:
         state = processes.get(process_id)
-    return f"Error: Unknown process_id: {process_id}" if state is None else _format_process(state, max_lines)
+    if state is None or state.session_id != session.session_id:
+        return f"Error: process_id is unknown or not owned by session {session.session_id}: {process_id}"
+    return _format_process(state, max_lines)
+
 
 @_hidden_tool()
 async def write_process(process_id: str, input_text: str) -> str:
@@ -1511,14 +1550,19 @@ async def write_process(process_id: str, input_text: str) -> str:
     return f"Wrote {len(input_text)} chars to {process_id}."
 
 @mcp.tool()
-async def stop_process(process_id: str) -> str:
-    """Stop a background process."""
+async def stop_process(process_id: str, session_id: str = "default") -> str:
+    """Stop a background process owned by this bootstrapped thread."""
+    session = await _get_session(session_id)
+    gate = _require_project_context(session, session.cwd.resolve())
+    if gate:
+        return gate
     async with state_lock:
         state = processes.get(process_id)
-    if state is None:
-        return f"Error: Unknown process_id: {process_id}"
+    if state is None or state.session_id != session.session_id:
+        return f"Error: process_id is unknown or not owned by session {session.session_id}: {process_id}"
     await _terminate_process_group(state.process)
     return _format_process(state, max_lines=80)
+
 
 @_hidden_tool()
 async def list_processes(session_id: str | None = None) -> str:
@@ -1531,38 +1575,283 @@ async def list_processes(session_id: str | None = None) -> str:
     return "\n".join(f"{p.process_id}\t{_process_status(p)}\tpid={p.process.pid}\tsession={p.session_id}\tcwd={p.cwd}\tcmd={p.command}" for p in sorted(selected, key=lambda item: item.started_at))
 
 
-@mcp.tool()
-async def project_context(
-    session_id: str = "default",
-    cwd: str | None = None,
-    max_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
-) -> str:
-    """Load every applicable AGENTS.md instruction and satisfy the execution gate for this cwd."""
-    session = await _get_session(session_id)
-    run_cwd = _operation_cwd(session, cwd)
+def _public_tool_manifest() -> list[dict[str, str]]:
+    order = tuple(globals().get("PUBLIC_TOOL_ORDER", tuple(mcp._tool_manager._tools.keys())))
+    rows: list[dict[str, str]] = []
+    for name in order:
+        function = globals().get(name)
+        description = ""
+        if function is not None:
+            description = " ".join((function.__doc__ or "").strip().split())
+        if not description:
+            tool = mcp._tool_manager._tools.get(name)
+            description = " ".join((getattr(tool, "description", "") or "").strip().split())
+        rows.append({"name": name, "description": description})
+    return rows
+
+
+def _configured_mcp_manifest(root: Path) -> list[dict[str, str]]:
+    return [
+        _public_mcp_summary(name, config)
+        for name, config in sorted(_discover_mcp_servers(root).items())
+    ]
+
+
+def _build_thread_context_document(
+    thread_id: str,
+    run_cwd: Path,
+) -> tuple[str, Path, list[tuple[Path, str]], str]:
     root, rows, fingerprint = _agents_snapshot(run_cwd)
+    skills = _discover_skills(root)
+    tools = _public_tool_manifest()
+    nested_servers = _configured_mcp_manifest(root)
+
     parts = [
-        f"Session ID: {session.session_id}",
+        "[Terminal GPT Thread Bootstrap]",
+        "MANDATORY: Follow every instruction below strictly for the lifetime of this model thread.",
+        "MANDATORY: Reuse this thread ID as session_id in every later Terminal GPT tool call.",
+        "MANDATORY: If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
+        "",
+        f"Thread ID: {thread_id}",
         f"Working Directory: {run_cwd}",
         f"Project Root: {root}",
+        f"GPT Home: {_gpt_home()}",
+        f"Usage Database: {_thread_db_path()}",
         f"Context Fingerprint: {fingerprint}",
-        f"Applicable Files: {len(rows)}",
+        f"Applicable GPT Instruction Files: {len(rows)}",
         "",
+        "## Mandatory GPT instructions",
     ]
     if rows:
         for path, content in rows:
             parts.extend([f"===== {path} =====", content.rstrip(), ""])
     else:
-        parts.append("No applicable AGENTS.md or AGENTS.override.md files were found.")
-    full = "\n".join(parts).rstrip()
+        parts.extend([
+            "No GPT AGENTS file was found. This should normally be repaired by bootstrap_thread.",
+            "",
+        ])
+
+    parts.extend([f"## Available skills ({len(skills)})"])
+    if skills:
+        for skill in skills:
+            description = skill["description"] or "No description provided. Read the skill before use."
+            parts.append(
+                f"- {skill['name']} [{skill['source']}]: {description} (path: {skill['path']})"
+            )
+    else:
+        parts.append("- No SKILL.md files discovered.")
+
+    parts.extend(["", f"## Public Terminal GPT tools ({len(tools)})"])
+    for tool in tools:
+        parts.append(f"- {tool['name']}: {tool['description'] or 'No description provided.'}")
+
+    parts.extend(["", f"## Configured nested MCP servers ({len(nested_servers)})"])
+    if nested_servers:
+        for server in nested_servers:
+            parts.append(
+                f"- {server['name']}: transport={server['transport']}, endpoint={server['endpoint']}. "
+                "Use local_mcp(action='tools', server=...) before invoking nested tools."
+            )
+    else:
+        parts.append("- No nested MCP servers discovered.")
+
+    parts.extend([
+        "",
+        "## Context recovery and accounting",
+        "- bootstrap_thread: initialize a genuinely new model thread.",
+        "- get_thread_context: reload the complete context after compaction or uncertainty.",
+        "- context_manifest: inspect fingerprints, files, skills, tools, and nested MCP names without loading full instruction bodies.",
+        "- refresh_startup_context: rebuild MCP initialization instructions for future client initializations.",
+        "- record_token_usage: store exact provider-reported input/output/cached-input usage.",
+        "- get_token_usage: retrieve exact and estimated totals separately.",
+        "",
+        "Token-accounting limitation: this MCP cannot independently observe the host model's complete prompt or response usage. "
+        "Exact model totals require the host/runtime to call record_token_usage with provider-reported values. "
+        "Any bootstrap token count stored automatically is explicitly marked as a server estimate.",
+    ])
+    return "\n".join(parts).rstrip(), root, rows, fingerprint
+
+
+async def _load_thread_context(
+    thread_id: str,
+    cwd: str | None,
+    max_chars: int,
+    event_type: str,
+) -> str:
+    _ensure_gpt_layout()
+    normalized = _normalize_session_id(thread_id)
+    if normalized == "default":
+        return (
+            "Error: thread_id must be a unique, stable non-default identifier. "
+            "Generate one for this model thread and reuse it as session_id on every later call."
+        )
+    session = await _get_session(normalized)
+    run_cwd = _resolve_cwd(cwd, session.cwd) if cwd else session.cwd.resolve()
+    full, root, rows, fingerprint = _build_thread_context_document(normalized, run_cwd)
     if max_chars > 0 and len(full) > max_chars:
         return full[:max_chars] + (
             f"\n\n[Context truncated to {max_chars} of {len(full)} chars. Context gate remains unsatisfied. "
-            "Call project_context again with a larger max_chars.]"
+            "Call get_thread_context again with a larger max_chars.]"
         )
+
+    session.cwd = run_cwd
     session.context_fingerprints[_context_key(run_cwd)] = fingerprint
+    session.bootstrapped_at = time.time()
     session.updated_at = time.time()
-    return full + "\n\nContext Gate: satisfied"
+    _upsert_thread_record(normalized, run_cwd, fingerprint, loaded=True)
+    estimated_tokens = _estimate_tokens(full)
+    _record_usage_event(
+        normalized,
+        event_type=event_type,
+        source="server_estimate",
+        input_tokens=estimated_tokens,
+        is_exact=False,
+        request_id=f"{event_type}-{_now_ms()}-{uuid.uuid4().hex[:8]}",
+        metadata={
+            "chars": len(full),
+            "estimation_method": "utf8_bytes_div_4",
+            "project_root": str(root),
+            "instruction_files": [str(path) for path, _ in rows],
+            "context_fingerprint": fingerprint,
+        },
+    )
+    return full + f"\n\nContext Gate: satisfied\nEstimated Context Input Tokens: {estimated_tokens}"
+
+
+@mcp.tool()
+async def bootstrap_thread(
+    thread_id: str,
+    cwd: str | None = None,
+    max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
+) -> str:
+    """Initialize a new model thread with .GPT instructions, all discovered skills, public tools, nested MCP names, and a persistent context fingerprint."""
+    return await _load_thread_context(thread_id, cwd, max_chars, "thread_bootstrap")
+
+
+@mcp.tool()
+async def get_thread_context(
+    thread_id: str,
+    cwd: str | None = None,
+    max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
+) -> str:
+    """Reload the complete GPT thread context after compaction, instruction changes, or uncertainty."""
+    return await _load_thread_context(thread_id, cwd, max_chars, "thread_context_reload")
+
+
+@mcp.tool()
+async def context_manifest(
+    thread_id: str = "",
+    cwd: str | None = None,
+) -> str:
+    """Return a compact manifest of GPT instruction files, skills, public tools, nested MCP servers, fingerprints, and storage paths."""
+    _ensure_gpt_layout()
+    normalized = _normalize_session_id(thread_id) if thread_id else ""
+    if cwd:
+        run_cwd = _resolve_cwd(cwd, WORKSPACE_DIR)
+    elif normalized and normalized in sessions:
+        run_cwd = sessions[normalized].cwd.resolve()
+    else:
+        run_cwd = WORKSPACE_DIR.resolve()
+    root, rows, fingerprint = _agents_snapshot(run_cwd)
+    skills = _discover_skills(root)
+    payload = {
+        "thread_id": normalized or None,
+        "working_directory": str(run_cwd),
+        "project_root": str(root),
+        "gpt_home": str(_gpt_home()),
+        "usage_database": str(_thread_db_path()),
+        "context_fingerprint": fingerprint,
+        "instruction_files": [str(path) for path, _ in rows],
+        "skills": [
+            {
+                "name": skill["name"],
+                "source": skill["source"],
+                "description": skill["description"],
+                "path": skill["path"],
+            }
+            for skill in skills
+        ],
+        "public_tools": _public_tool_manifest(),
+        "nested_mcp_servers": _configured_mcp_manifest(root),
+        "recovery_tools": [
+            "bootstrap_thread",
+            "get_thread_context",
+            "context_manifest",
+            "refresh_startup_context",
+            "record_token_usage",
+            "get_token_usage",
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+@mcp.tool()
+async def refresh_startup_context() -> str:
+    """Rebuild MCP initialization instructions from the current ~/.GPT/AGENTS.md, skill manifest, tool manifest, and nested MCP list."""
+    instructions = _set_startup_instructions()
+    return json.dumps(
+        {
+            "status": "refreshed",
+            "characters": len(instructions),
+            "estimated_tokens": _estimate_tokens(instructions),
+            "applies_to": "future MCP client initializations; existing threads should call get_thread_context",
+            "gpt_agents": str(_gpt_agents_path()),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def record_token_usage(
+    thread_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+    model: str = "",
+    request_id: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Record exact model token usage reported by the host/provider for one thread response."""
+    normalized = _normalize_session_id(thread_id)
+    if normalized == "default":
+        return "Error: thread_id must be a unique non-default identifier."
+    try:
+        event_id = _record_usage_event(
+            normalized,
+            event_type="model_usage",
+            source="host_reported",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            is_exact=True,
+            model=model,
+            request_id=request_id,
+            metadata=metadata,
+        )
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        return f"Error recording token usage: {exc}"
+    summary = _usage_summary(normalized, limit=10)
+    return json.dumps({"event_id": event_id, **summary}, indent=2)
+
+
+@mcp.tool()
+async def get_token_usage(
+    thread_id: str = "",
+    limit: int = 100,
+) -> str:
+    """Return per-thread or global exact and estimated token-usage totals with recent events."""
+    normalized = _normalize_session_id(thread_id) if thread_id else None
+    return json.dumps(_usage_summary(normalized, limit=limit), indent=2)
+
+
+@mcp.tool()
+async def project_context(
+    session_id: str = "default",
+    cwd: str | None = None,
+    max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
+) -> str:
+    """Compatibility alias that loads the complete GPT thread context using session_id as the stable thread identity."""
+    return await _load_thread_context(session_id, cwd, max_chars, "project_context_reload")
 
 
 @_hidden_tool()
@@ -2035,6 +2324,10 @@ async def start_agy_yolo(
 async def stat_path(path: str, session_id: str = "default", cwd: str | None = None) -> str:
     """Return metadata for a file or directory without using shell commands."""
     session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     target = _resolve_path(path, session, cwd)
     if not target.exists():
         return f"Path: {target}\nExists: false"
@@ -2058,6 +2351,10 @@ async def list_dir(
 ) -> str:
     """List directory entries without using shell commands."""
     session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     root = _resolve_path(path, session, cwd)
     if not root.exists():
         return f"Error: path does not exist: {root}"
@@ -2090,6 +2387,10 @@ async def read_file(
 ) -> str:
     """Read a text file directly, with optional line range and truncation."""
     session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     target = _resolve_path(path, session, cwd)
     if not target.exists():
         return f"Error: file does not exist: {target}"
@@ -2261,21 +2562,101 @@ async def move_path(src: str, dst: str, session_id: str = "default", cwd: str | 
     return f"Moved: {source} -> {target}"
 
 
-# Keep discovery deterministic and intentionally small.  The server used to
-# expose implementation-era helpers; only this contract is public now.
+def _build_startup_instructions() -> str:
+    """Build the context sent in the MCP initialize result for each new client session."""
+    _ensure_gpt_layout()
+    run_cwd = WORKSPACE_DIR.resolve()
+    root = _find_project_root(run_cwd)
+    rows, fingerprint = GPT_STORE.global_agents_snapshot()
+    skills = _discover_skills(root)
+    tools = _public_tool_manifest()
+    nested_servers = _configured_mcp_manifest(root)
+    parts = [
+        "You are connected to the isolated Terminal GPT Experimental MCP.",
+        "STRICT REQUIREMENT: At the beginning of each genuinely new model thread, call bootstrap_thread with a unique stable thread_id before substantive terminal work.",
+        "Reuse that exact thread_id as session_id on every later tool call. The shared session_id='default' is rejected for gated work.",
+        "If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
+        "The following global .GPT instructions are mandatory and are separate from Codex's ~/.codex/AGENTS.md.",
+        "Project-specific .GPT instructions are loaded after bootstrap_thread receives the target cwd.",
+        "",
+        f"Startup Context Fingerprint: {fingerprint}",
+        f"GPT Home: {_gpt_home()}",
+        f"Usage Database: {_thread_db_path()}",
+        "",
+        "## Mandatory .GPT instructions",
+    ]
+    for path, content in rows:
+        parts.extend([f"===== {path} =====", content.rstrip(), ""])
+    if not rows:
+        parts.extend(["No .GPT instruction file was discovered.", ""])
+    parts.append(f"## Available skills ({len(skills)})")
+    for skill in skills:
+        parts.append(
+            f"- {skill['name']} [{skill['source']}]: "
+            f"{skill['description'] or 'Read this skill before use.'} (path: {skill['path']})"
+        )
+    if not skills:
+        parts.append("- No skills discovered.")
+    parts.extend(["", f"## Public Terminal GPT tools ({len(tools)})"])
+    for tool in tools:
+        parts.append(f"- {tool['name']}: {tool['description'] or 'No description provided.'}")
+    parts.extend(["", f"## Configured nested MCP servers ({len(nested_servers)})"])
+    for server in nested_servers:
+        parts.append(
+            f"- {server['name']}: transport={server['transport']}, endpoint={server['endpoint']}"
+        )
+    if not nested_servers:
+        parts.append("- No nested MCP servers discovered.")
+    parts.extend([
+        "",
+        "Context recovery tools: bootstrap_thread, get_thread_context, context_manifest, refresh_startup_context.",
+        "Usage tools: record_token_usage and get_token_usage.",
+        "Exact model token usage is unavailable to MCP unless the host/provider reports it through record_token_usage; automatic context counts are marked as estimates.",
+    ])
+    return "\n".join(parts).rstrip()
+
+
+def _set_startup_instructions() -> str:
+    instructions = _build_startup_instructions()
+    mcp._mcp_server.instructions = instructions
+    return instructions
+
+
+def _install_dynamic_initialization() -> None:
+    """Refresh global startup context immediately before every MCP initialize response."""
+    server = mcp._mcp_server
+    original = server.create_initialization_options
+
+    def create_initialization_options(
+        notification_options: Any = None,
+        experimental_capabilities: dict[str, dict[str, Any]] | None = None,
+    ) -> Any:
+        _set_startup_instructions()
+        return original(notification_options, experimental_capabilities)
+
+    server.create_initialization_options = create_initialization_options  # type: ignore[method-assign]
+
+
+# Keep discovery deterministic and intentionally small. The recovery/bootstrap
+# tools are deliberately first so they are visible before any gated work.
 PUBLIC_TOOL_ORDER = (
-    "project_context", "local_skills", "local_mcp", "run_command", "start_process",
-    "poll_process", "stop_process", "set_session_env", "read_file", "write_file",
-    "replace_in_file", "apply_patch", "list_dir", "stat_path", "make_dir", "copy_path",
-    "move_path", "run_codex_yolo", "start_codex_yolo", "run_agy_yolo", "start_agy_yolo",
+    "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
+    "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
+    "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
+    "read_file", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
+    "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
+    "run_agy_yolo", "start_agy_yolo",
 )
 mcp._tool_manager._tools = {name: mcp._tool_manager._tools[name] for name in PUBLIC_TOOL_ORDER}
+_set_startup_instructions()
+_install_dynamic_initialization()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal MCP Server")
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio", help="Transport mode")
     parser.add_argument("--host", default="127.0.0.1", help="Host for SSE/HTTP server")
-    parser.add_argument("--port", type=int, default=8000, help="Port for SSE/HTTP server")
+    parser.add_argument("--port", type=int, default=8011, help="Port for SSE/HTTP server")
     parser.add_argument("--log-level", default=os.environ.get("MCP_UVICORN_LOG_LEVEL", "info"))
     args = parser.parse_args()
     if args.transport in ["sse", "streamable-http"]:

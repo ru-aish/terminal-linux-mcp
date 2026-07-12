@@ -1,7 +1,7 @@
 [project]
-name = "terminal-linux-mcp"
-version = "0.1.0"
-description = "A native Linux terminal MCP server with process, file, project-context, skill, and local-MCP tools."
+name = "terminal-gpt-experimental-mcp"
+version = "0.2.0"
+description = "An isolated Terminal GPT MCP with per-thread context bootstrap, .GPT instructions, skills/tools manifests, and token usage accounting."
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.27.1,<2",

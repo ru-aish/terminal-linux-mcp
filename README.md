@@ -1,6 +1,6 @@
-# Terminal Linux MCP
+# Terminal GPT Experimental MCP
 
-A native Linux terminal MCP server for files, commands, long-running processes, project instructions, local skills, and downstream MCP servers.
+An isolated experimental copy of the Terminal Linux MCP that bootstraps every model thread with GPT-specific instructions, skills, tool manifests, downstream MCP discovery, and persistent token-usage accounting.
 
 The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` starts the Streamable HTTP server and an ngrok tunnel together, prints the final MCP endpoint, and shuts both processes down cleanly.
 
@@ -12,7 +12,9 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 - Native command execution with per-session working directories and environment variables.
 - Foreground and background process management.
 - Direct file read/write/edit/copy/move operations.
-- Mandatory `AGENTS.md` project-context gate before executing or modifying work.
+- Mandatory per-thread bootstrap gate using `~/.GPT/AGENTS.md` and project `.GPT/AGENTS.md` files; Codex `~/.codex/AGENTS.md` is intentionally ignored.
+- MCP initialization instructions include the GPT rules, every discoverable skill, every public Terminal tool, and configured nested MCP server names.
+- SQLite tracking for host-reported model input/output/cached-input tokens plus separately labeled server estimates for returned bootstrap context.
 - Discovery of local `SKILL.md` files.
 - Discovery and proxying of configured MCP servers.
 - Persistent downstream MCP connections keyed by `(session_id, server_name)`.
@@ -20,6 +22,76 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 - Exclusive ownership for configured browser profile directories, preventing two owners from opening the same profile concurrently.
 - Optional bearer authentication for HTTP transports.
 - Safe launcher that refuses occupied ports and refuses an unauthenticated public tunnel unless explicitly overridden.
+
+## Thread bootstrap architecture
+
+This branch is designed to run beside the normal Terminal MCP rather than replace it. Its defaults are isolated:
+
+```text
+Normal Terminal MCP       Experimental Terminal GPT MCP
+port 8000                 port 8011
+~/.codex/AGENTS.md        ~/.GPT/AGENTS.md
+normal server process     separate worktree/process
+```
+
+On MCP initialization, the server sends a startup instruction document containing:
+
+1. The full global `~/.GPT/AGENTS.md` instruction content.
+2. Every discovered `SKILL.md` name, description, source, and path.
+3. Every public Terminal GPT tool and description.
+4. Every configured nested MCP server name and public endpoint summary.
+5. The recovery and token-accounting tools.
+
+Project-specific `.GPT/AGENTS.md` files are intentionally not injected until `bootstrap_thread` receives the target `cwd`, preventing one project’s rules from leaking into another project’s initialization. The global startup payload is rebuilt for every MCP initialization, so changes to global rules or discovered skills are visible to newly initialized clients without restarting the server.
+
+A model thread must then call:
+
+```json
+{
+  "thread_id": "a-unique-stable-id-for-this-model-thread",
+  "cwd": "/absolute/project/path"
+}
+```
+
+through `bootstrap_thread`. The same value must be reused as `session_id` for later tools. The shared value `default` is rejected for gated execution or modification, preventing one chat from inheriting another chat's loaded-context fingerprint.
+
+If the model loses context after compaction or a long conversation, it calls `get_thread_context`. If any applicable `.GPT/AGENTS.md` changes, the fingerprint gate blocks further gated work until the thread reloads its context.
+
+### GPT instruction hierarchy
+
+The experimental server never reads Codex's instruction tree. It resolves GPT instructions in this order:
+
+```text
+~/.GPT/AGENTS.override.md       # overrides ~/.GPT/AGENTS.md
+~/.GPT/AGENTS.md
+<repo>/.GPT/AGENTS.override.md  # overrides that directory's AGENTS.md
+<repo>/.GPT/AGENTS.md
+<repo>/<subdir>/.GPT/AGENTS.md
+...
+```
+
+`MCP_GPT_HOME` changes the global GPT directory. The default is `~/.GPT`.
+
+### Token usage database
+
+The database is stored at:
+
+```text
+~/.GPT/thread_usage.db
+```
+
+It stores a thread record and an append-only usage event stream with:
+
+- input tokens
+- output tokens
+- cached input tokens
+- model and provider request ID
+- exact-versus-estimated classification
+- context fingerprints and bootstrap counts
+
+`record_token_usage` is for exact usage reported by the model host/provider. An MCP server cannot independently observe the ChatGPT host's complete model prompt or response, so exact accounting requires the wrapper/runtime to report those values. Bootstrap text estimates are stored separately as estimated model-input `server_estimate` events and are never represented as exact model usage.
+
+`get_token_usage` returns global or per-thread totals, grouped thread summaries, and recent events. Reusing the same non-empty provider request ID is idempotent and does not double-count a retried report.
 
 ## Requirements
 
@@ -98,7 +170,7 @@ Start the MCP server and tunnel:
 The launcher prints both endpoints:
 
 ```text
-Local MCP endpoint: http://127.0.0.1:8000/mcp
+Local MCP endpoint: http://127.0.0.1:8011/mcp
 Public MCP endpoint: https://example.ngrok.app/mcp
 Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>
 ```
@@ -170,7 +242,11 @@ response = client.responses.create(
             "authorization": os.environ["MCP_BEARER_TOKEN"],
             "require_approval": "always",
             "allowed_tools": [
-                "project_context",
+                "bootstrap_thread",
+                "get_thread_context",
+                "context_manifest",
+                "record_token_usage",
+                "get_token_usage",
                 "list_dir",
                 "stat_path",
                 "read_file",
@@ -188,7 +264,8 @@ OpenAI does not store the MCP `authorization` value in the Response object, so p
 
 | Area | Tools |
 | --- | --- |
-| Project instructions | `project_context` |
+| Thread bootstrap and recovery | `bootstrap_thread`, `get_thread_context`, `context_manifest`, `refresh_startup_context`, `project_context` |
+| Token accounting | `record_token_usage`, `get_token_usage` |
 | Skills and MCP discovery | `local_skills`, `local_mcp` |
 | Commands | `run_command`, `start_process`, `poll_process`, `stop_process` |
 | Session environment | `set_session_env` |
