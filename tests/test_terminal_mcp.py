@@ -1,7 +1,10 @@
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mcp
@@ -103,6 +106,7 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
     server_script = tmp_path / "stateful_server.py"
     server_script.write_text(
         "import os\n"
+        "import time\n"
         "from pathlib import Path\n"
         "from mcp.server.fastmcp import FastMCP\n"
         "m = FastMCP('stateful')\n"
@@ -119,6 +123,10 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
         "        path.write_text('crashed', encoding='utf-8')\n"
         "        os._exit(17)\n"
         "    return 'recovered'\n"
+        "@m.tool()\n"
+        "def slow(seconds: float) -> str:\n"
+        "    time.sleep(seconds)\n"
+        "    return str(os.getpid())\n"
         "m.run(transport='stdio')\n",
         encoding="utf-8",
     )
@@ -197,6 +205,33 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
         ))
         assert recovered == "recovered"
 
+        before_timeout = text(await request(
+            "call", server="stateful", tool="counter", session_id=session, cwd=str(tmp_path)
+        ))
+        before_timeout_pid, before_timeout_count = before_timeout.split(":")
+        assert before_timeout_count == "1"
+
+        started = time.monotonic()
+        timed_out = await request(
+            "call",
+            server="stateful",
+            tool="slow",
+            arguments={"seconds": 10},
+            session_id=session,
+            cwd=str(tmp_path),
+            timeout=1,
+        )
+        elapsed = time.monotonic() - started
+        assert "timed out" in timed_out
+        assert elapsed < 2, f"one-second timeout took {elapsed:.2f}s"
+
+        after_timeout = text(await request(
+            "call", server="stateful", tool="counter", session_id=session, cwd=str(tmp_path)
+        ))
+        after_timeout_pid, after_timeout_count = after_timeout.split(":")
+        assert after_timeout_pid != before_timeout_pid
+        assert after_timeout_count == "1"
+
         reset = await request(
             "reset", server="stateful", session_id=session, cwd=str(tmp_path)
         )
@@ -206,11 +241,96 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
             "call", server="stateful", tool="counter", session_id=session, cwd=str(tmp_path)
         ))
         reset_pid, reset_count = after_reset.split(":")
-        assert reset_pid != second_pid
+        assert reset_pid != after_timeout_pid
         assert reset_count == "1"
 
         await request("reset-all", session_id=session, cwd=str(tmp_path))
         await request("reset-all", session_id="other-owner", cwd=str(tmp_path))
+
+    run(lifecycle())
+
+
+def test_mcp_replacement_keeps_exclusive_resource_until_old_transport_closes(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    profile = tmp_path / "exclusive-profile"
+    config = {
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": [],
+        "url": "",
+        "cwd": str(tmp_path),
+        "env": {"SAB_USER_DATA_DIR": str(profile)},
+        "headers": {},
+        "source": "test",
+        "config_dir": str(tmp_path),
+    }
+
+    async def lifecycle():
+        await terminal_mcp._close_all_mcp_connections()
+        terminal_mcp.mcp_connection_key_locks.clear()
+        key = ("owner", "browser")
+        resource = terminal_mcp._mcp_exclusive_resource(config)
+        assert resource is not None
+        loop = asyncio.get_running_loop()
+        ready = loop.create_future()
+        ready.set_result(None)
+        old = terminal_mcp.PersistentMcpConnection(
+            key=key,
+            config_fingerprint="outdated",
+            queue=asyncio.Queue(),
+            ready=ready,
+            exclusive_resource=resource,
+        )
+        terminal_mcp.mcp_connections[key] = old
+        terminal_mcp.mcp_resource_owners[resource] = key
+
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        opened = asyncio.Event()
+
+        async def fake_close(connection):
+            assert connection is old
+            close_started.set()
+            await allow_close.wait()
+            connection.closed = True
+
+        async def fake_open(session_id, server_name, runtime_config):
+            assert allow_close.is_set(), "replacement opened before the old transport closed"
+            replacement_ready = loop.create_future()
+            replacement_ready.set_result(None)
+            opened.set()
+            return terminal_mcp.PersistentMcpConnection(
+                key=(session_id, server_name),
+                config_fingerprint=terminal_mcp._mcp_config_fingerprint(runtime_config),
+                queue=asyncio.Queue(),
+                ready=replacement_ready,
+                exclusive_resource=terminal_mcp._mcp_exclusive_resource(runtime_config),
+            )
+
+        monkeypatch.setattr(terminal_mcp, "_close_mcp_connection", fake_close)
+        monkeypatch.setattr(terminal_mcp, "_open_mcp_connection", fake_open)
+
+        replacement_task = asyncio.create_task(
+            terminal_mcp._acquire_mcp_connection("owner", "browser", config)
+        )
+        await asyncio.wait_for(close_started.wait(), timeout=1)
+        assert not opened.is_set()
+
+        with pytest.raises(terminal_mcp.McpResourceBusyError):
+            await terminal_mcp._acquire_mcp_connection("other-owner", "browser", config)
+        assert not opened.is_set()
+
+        allow_close.set()
+        replacement = await asyncio.wait_for(replacement_task, timeout=1)
+        assert opened.is_set()
+        assert replacement.key == key
+        assert terminal_mcp.mcp_resource_owners[resource] == key
+
+        await terminal_mcp._release_mcp_connection(replacement)
+        async with terminal_mcp.mcp_connections_lock:
+            terminal_mcp.mcp_connections.clear()
+            terminal_mcp.mcp_resource_owners.clear()
+            terminal_mcp.mcp_connection_key_locks.clear()
 
     run(lifecycle())
 

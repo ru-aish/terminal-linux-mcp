@@ -110,6 +110,7 @@ mcp_connections: dict[tuple[str, str], PersistentMcpConnection] = {}
 mcp_connection_key_locks: dict[tuple[str, str], asyncio.Lock] = {}
 mcp_resource_owners: dict[str, tuple[str, str]] = {}
 mcp_connections_lock = asyncio.Lock()
+mcp_cleanup_tasks: set[asyncio.Task[None]] = set()
 
 
 class McpResourceBusyError(RuntimeError):
@@ -1090,10 +1091,12 @@ async def _close_idle_mcp_connections() -> None:
         for connection in list(mcp_connections.values()):
             task_done = connection.task is not None and connection.task.done()
             if task_done or (connection.active_calls == 0 and connection.last_used <= cutoff):
-                _unregister_mcp_connection_locked(connection, release_resource=False)
+                connection.closed = True
                 stale.append(connection)
     for connection in stale:
         await _close_mcp_connection(connection)
+        async with mcp_connections_lock:
+            _unregister_mcp_connection_locked(connection, release_resource=False)
         await _release_mcp_resource(connection)
 
 
@@ -1117,7 +1120,11 @@ async def _acquire_mcp_connection(
             if connection is not None and (
                 connection.closed or task_done or connection.config_fingerprint != fingerprint
             ):
-                _unregister_mcp_connection_locked(connection)
+                # Keep an exclusive profile/resource reservation until the old
+                # downstream process has actually closed. Releasing ownership
+                # here allowed another session to launch the same browser
+                # profile while the replaced process was still shutting down.
+                _unregister_mcp_connection_locked(connection, release_resource=False)
                 replaced = connection
                 connection = None
 
@@ -1133,6 +1140,8 @@ async def _acquire_mcp_connection(
 
         if replaced is not None:
             await _close_mcp_connection(replaced)
+            if replaced.exclusive_resource != exclusive_resource:
+                await _release_mcp_resource(replaced)
 
         if connection is None:
             try:
@@ -1161,10 +1170,48 @@ async def _release_mcp_connection(connection: PersistentMcpConnection) -> None:
 
 
 async def _discard_mcp_connection(connection: PersistentMcpConnection) -> None:
+    # Keep the generation discoverable until its transport is closed. New
+    # callers for the same key can then join the close instead of starting a
+    # second process against the same exclusive profile.
+    connection.closed = True
+    await _close_mcp_connection(connection)
     async with mcp_connections_lock:
         _unregister_mcp_connection_locked(connection, release_resource=False)
-    await _close_mcp_connection(connection)
     await _release_mcp_resource(connection)
+
+
+async def _abort_mcp_connection(connection: PersistentMcpConnection) -> None:
+    # Keep the closed connection registered until its actor and child transport
+    # have actually stopped. A replacement for the same key will then wait for
+    # this task, while another session remains blocked by exclusive ownership.
+    connection.closed = True
+    task = connection.task
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+    elif task is not None:
+        with contextlib.suppress(BaseException):
+            task.result()
+    async with mcp_connections_lock:
+        _unregister_mcp_connection_locked(connection, release_resource=False)
+    await _release_mcp_resource(connection)
+
+
+def _schedule_mcp_abort(connection: PersistentMcpConnection) -> None:
+    connection.closed = True
+    cleanup = asyncio.create_task(
+        _abort_mcp_connection(connection),
+        name=f"mcp-proxy-cleanup:{connection.key[0]}:{connection.key[1]}",
+    )
+    mcp_cleanup_tasks.add(cleanup)
+
+    def finished(task: asyncio.Task[None]) -> None:
+        mcp_cleanup_tasks.discard(task)
+        with contextlib.suppress(BaseException):
+            task.result()
+
+    cleanup.add_done_callback(finished)
 
 
 async def _reset_mcp_connections(session_id: str, server_name: str | None = None) -> int:
@@ -1175,10 +1222,12 @@ async def _reset_mcp_connections(session_id: str, server_name: str | None = None
                 continue
             if server_name is not None and key[1] != server_name:
                 continue
-            _unregister_mcp_connection_locked(connection, release_resource=False)
+            connection.closed = True
             selected.append(connection)
     for connection in selected:
         await _close_mcp_connection(connection)
+        async with mcp_connections_lock:
+            _unregister_mcp_connection_locked(connection, release_resource=False)
         await _release_mcp_resource(connection)
     return len(selected)
 
@@ -1186,10 +1235,18 @@ async def _reset_mcp_connections(session_id: str, server_name: str | None = None
 async def _close_all_mcp_connections() -> None:
     async with mcp_connections_lock:
         selected = list(mcp_connections.values())
-        mcp_connections.clear()
-        mcp_resource_owners.clear()
+        for connection in selected:
+            connection.closed = True
     for connection in selected:
         await _close_mcp_connection(connection)
+    cleanups = list(mcp_cleanup_tasks)
+    if cleanups:
+        await asyncio.gather(*cleanups, return_exceptions=True)
+    async with mcp_connections_lock:
+        for connection in selected:
+            _unregister_mcp_connection_locked(connection, release_resource=False)
+        if not mcp_connections:
+            mcp_resource_owners.clear()
 
 
 async def _with_mcp_session(
@@ -1216,7 +1273,10 @@ async def _with_mcp_session(
             return result
         except asyncio.CancelledError:
             future.cancel()
-            await _discard_mcp_connection(connection)
+            # Return the caller's timeout promptly while cleanup continues in a
+            # tracked task. The closed connection stays registered until the
+            # child transport exits, preventing overlapping profile owners.
+            _schedule_mcp_abort(connection)
             raise
         except BaseException as exc:
             last_error = exc
