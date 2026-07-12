@@ -370,7 +370,18 @@ class GPTThreadStore:
                 files.append(override)
             elif normal.is_file():
                 files.append(normal)
-        return root, files
+        # The global store can itself sit at the discovered project root (for
+        # example, when work is rooted at a user's home directory).  In that
+        # case it must be injected once, not once as global and once as a
+        # project-level .GPT directory.
+        unique_files: list[Path] = []
+        seen: set[Path] = set()
+        for item in files:
+            resolved = item.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                unique_files.append(item)
+        return root, unique_files
 
     def agents_snapshot(
         self,
