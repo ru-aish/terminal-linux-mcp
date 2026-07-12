@@ -12,6 +12,7 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 - Native command execution with per-session working directories and environment variables.
 - Foreground and background process management.
 - Direct file read/write/edit/copy/move operations.
+- Native local image inspection through `watch_image`, returning MCP `ImageContent` instead of a text path or JSON-wrapped base64 blob.
 - Mandatory per-thread bootstrap gate using `~/.GPT/AGENTS.md` and project `.GPT/AGENTS.md` files; Codex `~/.codex/AGENTS.md` is intentionally ignored.
 - MCP initialization instructions include the GPT rules, every discoverable skill, every public Terminal tool, and configured nested MCP server names.
 - SQLite tracking for host-reported model input/output/cached-input tokens plus separately labeled server estimates for returned bootstrap context.
@@ -71,6 +72,22 @@ The experimental server never reads Codex's instruction tree. It resolves GPT in
 ```
 
 `MCP_GPT_HOME` changes the global GPT directory. The default is `~/.GPT`.
+
+### Native image inspection
+
+`watch_image` accepts an absolute or working-directory-relative local path and returns the original image bytes as native MCP `ImageContent`. This lets an MCP-capable model receive the image as visual input instead of receiving only the filename or a JSON string.
+
+Supported formats are PNG, JPEG, WEBP, and non-animated GIF. The server validates the file signature rather than trusting the extension, rejects malformed or animated GIFs, and reads at most `MCP_WATCH_IMAGE_MAX_BYTES` bytes. The default limit is 20 MiB before base64 expansion.
+
+```text
+watch_image(
+    path="/absolute/path/to/screenshot.png",
+    session_id="the-bootstrapped-thread-id",
+    cwd="/absolute/project/path",
+)
+```
+
+The MCP image content carries base64 data plus its MIME type. It preserves the original file bytes; image-detail selection remains a responsibility of the MCP host when it maps the content into a model request.
 
 ### Token usage database
 
@@ -250,6 +267,7 @@ response = client.responses.create(
                 "list_dir",
                 "stat_path",
                 "read_file",
+                "watch_image",
             ],
         }
     ],
@@ -269,7 +287,7 @@ OpenAI does not store the MCP `authorization` value in the Response object, so p
 | Skills and MCP discovery | `local_skills`, `local_mcp` |
 | Commands | `run_command`, `start_process`, `poll_process`, `stop_process` |
 | Session environment | `set_session_env` |
-| Files | `read_file`, `write_file`, `replace_in_file`, `apply_patch`, `list_dir`, `stat_path`, `make_dir`, `copy_path`, `move_path` |
+| Files and images | `read_file`, `watch_image`, `write_file`, `replace_in_file`, `apply_patch`, `list_dir`, `stat_path`, `make_dir`, `copy_path`, `move_path` |
 | Delegated agents | `run_codex_yolo`, `start_codex_yolo`, `run_agy_yolo`, `start_agy_yolo` |
 
 ## Persistent downstream MCP proxy

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ EXPECTED_TOOLS = [
     "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
     "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
     "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
-    "read_file", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
+    "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
     "run_agy_yolo", "start_agy_yolo",
 ]
@@ -308,6 +309,62 @@ def test_filesystem_and_process_lifecycle(tmp_path, monkeypatch):
 
     run(lifecycle())
 
+
+
+def test_watch_image_returns_native_image_content(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    (tmp_path / ".git").mkdir()
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nqkAAAAASUVORK5CYII="
+    )
+    image = tmp_path / "pixel.data"
+    image.write_bytes(png)
+
+    blocked = run(terminal_mcp.watch_image(
+        str(image), session_id="default", cwd=str(tmp_path)
+    ))
+    assert blocked.isError is True
+    assert "session_id='default' is intentionally rejected" in blocked.content[0].text
+
+    session = "watch-image-test"
+    run(terminal_mcp.bootstrap_thread(session, str(tmp_path), max_chars=100000))
+    result = run(terminal_mcp.watch_image(
+        str(image), session_id=session, cwd=str(tmp_path)
+    ))
+    assert result.isError is False
+    assert isinstance(result.content[0], mcp.types.ImageContent)
+    assert result.content[0].mimeType == "image/png"
+    assert base64.b64decode(result.content[0].data) == png
+    assert isinstance(result.content[1], mcp.types.TextContent)
+    assert "Payload: original file bytes" in result.content[1].text
+
+    invalid = tmp_path / "not-an-image.png"
+    invalid.write_text("not an image", encoding="utf-8")
+    rejected = run(terminal_mcp.watch_image(
+        str(invalid), session_id=session, cwd=str(tmp_path)
+    ))
+    assert rejected.isError is True
+    assert "unsupported image format" in rejected.content[0].text
+
+    one_frame_gif = base64.b64decode(
+        "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+    )
+    descriptor = one_frame_gif.index(b"\x2c")
+    animated_gif = one_frame_gif[:-1] + one_frame_gif[descriptor:-1] + b"\x3b"
+    gif_path = tmp_path / "animated.gif"
+    gif_path.write_bytes(animated_gif)
+    animated = run(terminal_mcp.watch_image(
+        str(gif_path), session_id=session, cwd=str(tmp_path)
+    ))
+    assert animated.isError is True
+    assert "animated GIFs are not supported" in animated.content[0].text
+
+    monkeypatch.setattr(terminal_mcp, "WATCH_IMAGE_MAX_BYTES", len(png) - 1)
+    oversized = run(terminal_mcp.watch_image(
+        str(image), session_id=session, cwd=str(tmp_path)
+    ))
+    assert oversized.isError is True
+    assert "MCP_WATCH_IMAGE_MAX_BYTES" in oversized.content[0].text
 
 def test_startup_instructions_include_gpt_rules_skills_and_tools(tmp_path, monkeypatch):
     home = isolated_home(tmp_path, monkeypatch)

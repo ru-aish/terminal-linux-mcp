@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import socket
 import subprocess
@@ -6,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from mcp import ClientSession
+from mcp import ClientSession, types as mcp_types
 from mcp.client.streamable_http import streamable_http_client
 
 
@@ -174,6 +175,11 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
         "---\nname: http-skill\ndescription: HTTP bootstrap skill\n---\n# Workflow\n",
         encoding="utf-8",
     )
+    image_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nqkAAAAASUVORK5CYII="
+    )
+    image_path = tmp_path / "http-image.png"
+    image_path.write_bytes(image_bytes)
 
     port = _free_port()
     env = dict(**__import__("os").environ)
@@ -213,7 +219,8 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 names = [tool.name for tool in tools.tools]
                 assert names[0] == "bootstrap_thread"
                 assert "record_token_usage" in names
-                assert len(names) == 27
+                assert "watch_image" in names
+                assert len(names) == 28
 
                 blocked = await session.call_tool(
                     "run_command",
@@ -247,6 +254,19 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 )
                 command_text = "\n".join(getattr(item, "text", "") for item in command.content)
                 assert "ready" in command_text
+
+                watched = await session.call_tool(
+                    "watch_image",
+                    {
+                        "path": str(image_path),
+                        "session_id": "http-thread",
+                        "cwd": str(tmp_path),
+                    },
+                )
+                assert watched.isError is False
+                assert isinstance(watched.content[0], mcp_types.ImageContent)
+                assert watched.content[0].mimeType == "image/png"
+                assert base64.b64decode(watched.content[0].data) == image_bytes
 
                 await session.call_tool(
                     "record_token_usage",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -40,6 +42,7 @@ AGENT_DIR_NAME = os.environ.get("MCP_AGENT_DIR_NAME", ".agent")
 AGENT_CONTEXT_MAX_CHARS = int(os.environ.get("MCP_AGENT_CONTEXT_MAX_CHARS", "12000"))
 MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
 DEFAULT_BOOTSTRAP_MAX_CHARS = int(os.environ.get("MCP_BOOTSTRAP_MAX_CHARS", "100000"))
+WATCH_IMAGE_MAX_BYTES = int(os.environ.get("MCP_WATCH_IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
 GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
 
 
@@ -2412,6 +2415,143 @@ async def read_file(
         header.append(f"Char Limit: {max_chars}")
     return "\n".join(header + ["", body])
 
+
+def _watch_image_error(message: str) -> mcp_types.CallToolResult:
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=message)],
+        isError=True,
+    )
+
+
+def _gif_frame_count(data: bytes) -> int | None:
+    """Return GIF image-frame count, or None when the file structure is invalid."""
+    if len(data) < 13 or data[:6] not in {b"GIF87a", b"GIF89a"}:
+        return None
+    offset = 13
+    packed = data[10]
+    if packed & 0x80:
+        offset += 3 * (2 ** ((packed & 0x07) + 1))
+    frames = 0
+
+    def skip_sub_blocks(position: int) -> int | None:
+        while position < len(data):
+            size = data[position]
+            position += 1
+            if size == 0:
+                return position
+            position += size
+            if position > len(data):
+                return None
+        return None
+
+    while offset < len(data):
+        marker = data[offset]
+        if marker == 0x3B:  # trailer
+            return frames
+        if marker == 0x21:  # extension block
+            if offset + 2 > len(data):
+                return None
+            offset = skip_sub_blocks(offset + 2)
+            if offset is None:
+                return None
+            continue
+        if marker == 0x2C:  # image descriptor
+            if offset + 10 > len(data):
+                return None
+            descriptor_packed = data[offset + 9]
+            offset += 10
+            if descriptor_packed & 0x80:
+                offset += 3 * (2 ** ((descriptor_packed & 0x07) + 1))
+            if offset >= len(data):
+                return None
+            offset += 1  # LZW minimum code size
+            offset = skip_sub_blocks(offset)
+            if offset is None:
+                return None
+            frames += 1
+            continue
+        return None
+    return None
+
+
+def _watch_image_mime(data: bytes) -> tuple[str | None, str | None]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", None
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", None
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", None
+    if data[:6] in {b"GIF87a", b"GIF89a"}:
+        frames = _gif_frame_count(data)
+        if frames is None:
+            return None, "Error: malformed GIF image."
+        if frames != 1:
+            return None, f"Error: animated GIFs are not supported; detected {frames} image frames."
+        return "image/gif", None
+    return None, "Error: unsupported image format. Supported formats: PNG, JPEG, WEBP, and non-animated GIF."
+
+
+@mcp.tool(
+    annotations=mcp_types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+async def watch_image(
+    path: str,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> mcp_types.CallToolResult:
+    """Return a local image as native MCP ImageContent so the model can inspect it visually."""
+    session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return _watch_image_error(gate)
+
+    target = _resolve_path(path, session, cwd)
+    if not target.exists():
+        return _watch_image_error(f"Error: image file does not exist: {target}")
+    if not target.is_file():
+        return _watch_image_error(f"Error: image path is not a regular file: {target}")
+
+    max_bytes = max(1, WATCH_IMAGE_MAX_BYTES)
+    try:
+        with target.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError as exc:
+        return _watch_image_error(f"Error reading image {target}: {type(exc).__name__}: {exc}")
+
+    if not data:
+        return _watch_image_error(f"Error: image file is empty: {target}")
+    if len(data) > max_bytes:
+        return _watch_image_error(
+            f"Error: image exceeds MCP_WATCH_IMAGE_MAX_BYTES ({max_bytes} bytes): {target}"
+        )
+
+    mime_type, error = _watch_image_mime(data)
+    if error or mime_type is None:
+        return _watch_image_error(f"{error or 'Error: unsupported image format.'}\nPath: {target}")
+
+    encoded = base64.b64encode(data).decode("ascii")
+    return mcp_types.CallToolResult(
+        content=[
+            mcp_types.ImageContent(type="image", data=encoded, mimeType=mime_type),
+            mcp_types.TextContent(
+                type="text",
+                text=(
+                    f"Image path: {target}\n"
+                    f"MIME type: {mime_type}\n"
+                    f"Bytes: {len(data)}\n"
+                    "Payload: original file bytes"
+                ),
+            ),
+        ],
+        isError=False,
+    )
+
 @mcp.tool()
 async def write_file(
     path: str,
@@ -2643,7 +2783,7 @@ PUBLIC_TOOL_ORDER = (
     "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
     "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
     "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
-    "read_file", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
+    "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
     "run_agy_yolo", "start_agy_yolo",
 )
