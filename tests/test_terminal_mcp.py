@@ -363,3 +363,52 @@ def test_filesystem_and_process_lifecycle(tmp_path, monkeypatch):
         assert "exited" in await terminal_mcp.stop_process(process_id)
 
     run(lifecycle())
+
+
+def test_close_all_releases_only_resources_without_live_replacements(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+
+    async def lifecycle():
+        await terminal_mcp._close_all_mcp_connections()
+        terminal_mcp.mcp_connection_key_locks.clear()
+        loop = asyncio.get_running_loop()
+
+        def connection(key, resource, fingerprint):
+            ready = loop.create_future()
+            ready.set_result(None)
+            return terminal_mcp.PersistentMcpConnection(
+                key=key,
+                config_fingerprint=fingerprint,
+                queue=asyncio.Queue(),
+                ready=ready,
+                exclusive_resource=resource,
+            )
+
+        key_a = ("session-a", "browser")
+        key_b = ("session-b", "browser")
+        resource_a = "resource-a"
+        resource_b = "resource-b"
+        old_a = connection(key_a, resource_a, "old-a")
+        old_b = connection(key_b, resource_b, "old-b")
+        replacement_a = connection(key_a, resource_a, "replacement-a")
+        terminal_mcp.mcp_connections.update({key_a: old_a, key_b: old_b})
+        terminal_mcp.mcp_resource_owners.update({resource_a: key_a, resource_b: key_b})
+
+        async def fake_close(current):
+            current.closed = True
+            if current is old_a:
+                # Model a caller that reconnects while global cleanup is
+                # draining the previous generation.
+                terminal_mcp.mcp_connections[key_a] = replacement_a
+
+        monkeypatch.setattr(terminal_mcp, "_close_mcp_connection", fake_close)
+        await terminal_mcp._close_all_mcp_connections()
+
+        assert terminal_mcp.mcp_connections == {key_a: replacement_a}
+        assert terminal_mcp.mcp_resource_owners == {resource_a: key_a}
+
+        terminal_mcp.mcp_connections.clear()
+        terminal_mcp.mcp_resource_owners.clear()
+        terminal_mcp.mcp_connection_key_locks.clear()
+
+    run(lifecycle())

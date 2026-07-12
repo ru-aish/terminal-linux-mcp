@@ -1245,6 +1245,12 @@ async def _close_all_mcp_connections() -> None:
     async with mcp_connections_lock:
         for connection in selected:
             _unregister_mcp_connection_locked(connection, release_resource=False)
+    # Release each selected resource independently. A concurrent replacement
+    # using the same resource keeps ownership, while resources belonging only
+    # to closed connections are removed even when another connection survives.
+    for connection in selected:
+        await _release_mcp_resource(connection)
+    async with mcp_connections_lock:
         if not mcp_connections:
             mcp_resource_owners.clear()
 

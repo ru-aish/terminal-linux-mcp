@@ -38,6 +38,8 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
     stateful = tmp_path / "stateful_server.py"
     stateful.write_text(
         "import os\n"
+        "import time\n"
+        "from pathlib import Path\n"
         "from mcp.server.fastmcp import FastMCP\n"
         "m = FastMCP('http-stateful')\n"
         "value = 0\n"
@@ -46,6 +48,17 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
         "    global value\n"
         "    value += 1\n"
         "    return f'{os.getpid()}:{value}'\n"
+        "@m.tool()\n"
+        "def crash_once(marker: str) -> str:\n"
+        "    path = Path(marker)\n"
+        "    if not path.exists():\n"
+        "        path.write_text('crashed', encoding='utf-8')\n"
+        "        os._exit(17)\n"
+        "    return 'recovered'\n"
+        "@m.tool()\n"
+        "def slow(seconds: float) -> str:\n"
+        "    time.sleep(seconds)\n"
+        "    return str(os.getpid())\n"
         "m.run(transport='stdio')\n",
         encoding="utf-8",
     )
@@ -137,6 +150,69 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
         assert first_pid == second_pid
         assert (first_count, second_count) == ("1", "2")
         assert '"status": "connected"' in listing
+
+        marker = tmp_path / "http-crash.marker"
+        recovered = text(await call(
+            "local_mcp",
+            {
+                "action": "call",
+                "server": "stateful-http",
+                "tool": "crash_once",
+                "arguments": {"marker": str(marker)},
+                "session_id": session_id,
+                "cwd": str(tmp_path),
+                "timeout": 30,
+            },
+        ))
+        assert recovered == "recovered"
+
+        before_timeout = text(await call(
+            "local_mcp",
+            {
+                "action": "call",
+                "server": "stateful-http",
+                "tool": "counter",
+                "arguments": {},
+                "session_id": session_id,
+                "cwd": str(tmp_path),
+                "timeout": 30,
+            },
+        ))
+        before_timeout_pid, before_timeout_count = before_timeout.split(":")
+        assert before_timeout_count == "1"
+
+        started = time.monotonic()
+        timed_out = text(await call(
+            "local_mcp",
+            {
+                "action": "call",
+                "server": "stateful-http",
+                "tool": "slow",
+                "arguments": {"seconds": 10},
+                "session_id": session_id,
+                "cwd": str(tmp_path),
+                "timeout": 1,
+            },
+        ))
+        elapsed = time.monotonic() - started
+        assert "timed out" in timed_out
+        assert elapsed < 2.5, f"one-second HTTP timeout took {elapsed:.2f}s"
+
+        after_timeout = text(await call(
+            "local_mcp",
+            {
+                "action": "call",
+                "server": "stateful-http",
+                "tool": "counter",
+                "arguments": {},
+                "session_id": session_id,
+                "cwd": str(tmp_path),
+                "timeout": 30,
+            },
+        ))
+        after_timeout_pid, after_timeout_count = after_timeout.split(":")
+        assert after_timeout_pid != before_timeout_pid
+        assert after_timeout_count == "1"
 
         await call(
             "local_mcp",
