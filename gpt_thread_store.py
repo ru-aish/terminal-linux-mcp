@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+import tiktoken
 
 
 DEFAULT_GPT_AGENTS = """# GPT Agent Instructions
@@ -47,6 +48,13 @@ class GPTThreadStore:
 
     def home(self) -> Path:
         configured = os.environ.get(self.home_env) or os.environ.get("GPT_HOME") or "~/.GPT"
+        # Resolve the default against HOME explicitly. Both pathlib and
+        # os.path.expanduser may cache the account home directory, which breaks
+        # isolated host/test environments that set HOME after import.
+        if configured == "~":
+            configured = os.environ.get("HOME", str(Path.home()))
+        elif configured.startswith("~/"):
+            configured = str(Path(os.environ.get("HOME", str(Path.home()))) / configured[2:])
         return Path(configured).expanduser().resolve()
 
     def agents_path(self) -> Path:
@@ -64,12 +72,26 @@ class GPTThreadStore:
         self._init_db()
         return home
 
-    @staticmethod
-    def estimate_tokens(text: str) -> int:
-        """Estimate text tokens without claiming knowledge of the complete model prompt."""
+    _tokenizer: tiktoken.Encoding | None = None
+
+    @classmethod
+    def tokenizer(cls) -> tiktoken.Encoding:
+        """Return the GPT-5-family tokenizer once per process."""
+        if cls._tokenizer is None:
+            cls._tokenizer = tiktoken.get_encoding("o200k_base")
+        return cls._tokenizer
+
+    @classmethod
+    def estimate_tokens(cls, text: str) -> int:
+        """Count text with o200k_base; this is still an estimate of host usage.
+
+        The tokenizer precisely counts the text passed to it, but an MCP cannot
+        see the host's complete prompt envelope, hidden context, or image-token
+        accounting. Callers must therefore label these values as proxy estimates.
+        """
         if not text:
             return 0
-        return max(1, math.ceil(len(text.encode("utf-8")) / 4))
+        return len(cls.tokenizer().encode(text, disallowed_special=()))
 
     @staticmethod
     def _now() -> str:
@@ -309,7 +331,9 @@ class GPTThreadStore:
             ],
             "note": (
                 "Exact model usage exists only when the host reports provider usage. "
-                "Server estimates cover only text returned by this MCP, not the model's complete prompt."
+                "Proxy estimates use the o200k_base tokenizer for MCP tool-call and tool-result text only; "
+                "they exclude host prompt framing, hidden context, and non-text modality token costs. "
+                "Exact model usage exists only when the host reports provider usage."
             ),
         }
 

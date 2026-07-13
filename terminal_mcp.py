@@ -48,10 +48,97 @@ AGENT_CONTEXT_MAX_CHARS = int(os.environ.get("MCP_AGENT_CONTEXT_MAX_CHARS", "120
 MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
 DEFAULT_BOOTSTRAP_MAX_CHARS = int(os.environ.get("MCP_BOOTSTRAP_MAX_CHARS", "100000"))
 WATCH_IMAGE_MAX_BYTES = int(os.environ.get("MCP_WATCH_IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
+TOKEN_ACCOUNTING_MAX_CHARS = int(os.environ.get("MCP_TOKEN_ACCOUNTING_MAX_CHARS", "1000000"))
 GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
 
 
-mcp = FastMCP(
+class AccountingFastMCP(FastMCP):
+    """Record the two text legs of each MCP tool loop without affecting tools.
+
+    A model's tool-call payload is text it emitted; the tool result is text the
+    host may provide back to the model.  This proxy sees both, but not the rest
+    of the host prompt, provider cache accounting, or token costs for images.
+    Accounting failures are deliberately non-fatal: observability must never
+    make a usable terminal tool fail.
+    """
+
+    @staticmethod
+    def _thread_id(arguments: dict[str, Any]) -> str:
+        candidate = arguments.get("thread_id") or arguments.get("session_id") or ""
+        return str(candidate).strip()[:128]
+
+    @staticmethod
+    def _text_for_token_accounting(value: Any) -> tuple[str, dict[str, Any]]:
+        """Serialize textual content only; never tokenize image/audio base64."""
+        media_blocks = 0
+
+        def sanitize(item: Any) -> Any:
+            nonlocal media_blocks
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(mode="json")
+            if isinstance(item, dict):
+                kind = str(item.get("type", ""))
+                if kind in {"image", "audio"} or "data" in item and kind:
+                    media_blocks += 1
+                    return {
+                        "type": kind or "binary",
+                        "mimeType": item.get("mimeType", ""),
+                        "token_accounting": "non-text payload excluded",
+                    }
+                return {str(key): sanitize(child) for key, child in item.items()}
+            if isinstance(item, (list, tuple)):
+                return [sanitize(child) for child in item]
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                return item
+            return str(item)
+
+        text = json.dumps(sanitize(value), ensure_ascii=False, sort_keys=True, default=str)
+        truncated = len(text) > TOKEN_ACCOUNTING_MAX_CHARS
+        if truncated:
+            text = text[:TOKEN_ACCOUNTING_MAX_CHARS]
+        return text, {
+            "media_blocks_excluded": media_blocks,
+            "truncated": truncated,
+            "counted_chars": len(text),
+            "tokenizer": "o200k_base",
+        }
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        # FastMCP's own conversion/validation remains authoritative.
+        result = await super().call_tool(name, arguments)
+        thread_id = self._thread_id(arguments)
+        if not thread_id or thread_id == "default":
+            return result
+        try:
+            call_text, call_metadata = self._text_for_token_accounting(
+                {"name": name, "arguments": arguments}
+            )
+            result_text, result_metadata = self._text_for_token_accounting(result)
+            _record_usage_event(
+                thread_id,
+                event_type="mcp_tool_loop",
+                source="proxy_estimate",
+                input_tokens=_estimate_tokens(result_text),
+                output_tokens=_estimate_tokens(call_text),
+                is_exact=False,
+                request_id=f"mcp-{_now_ms()}-{uuid.uuid4().hex[:12]}",
+                metadata={
+                    "tool_name": name,
+                    "output": call_metadata,
+                    "input": result_metadata,
+                    "meaning": {
+                        "output_tokens": "estimated text emitted by the model as this MCP tool call",
+                        "input_tokens": "estimated textual tool result available to the next model turn",
+                    },
+                },
+            )
+        except Exception:
+            # Token accounting is best-effort diagnostics, never an execution gate.
+            pass
+        return result
+
+
+mcp = AccountingFastMCP(
     "Terminal GPT Experimental",
     instructions="Startup context is initialized after tool registration.",
     transport_security=TransportSecuritySettings(

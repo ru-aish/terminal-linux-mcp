@@ -26,6 +26,8 @@ def isolated_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("MCP_GPT_HOME", raising=False)
+    monkeypatch.delenv("GPT_HOME", raising=False)
     return home
 
 
@@ -474,3 +476,25 @@ def test_token_usage_database_separates_exact_and_estimated(tmp_path, monkeypatc
         thread_id="usage-thread", input_tokens=-1, output_tokens=0
     ))
     assert invalid.startswith("Error recording token usage")
+
+
+def test_proxy_records_tool_call_output_and_tool_result_input_with_o200k(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "proxy-accounting"
+    project.mkdir()
+    (project / ".git").mkdir()
+
+    async def exercise():
+        thread_id = "proxy-accounting-thread"
+        await terminal_mcp.mcp.call_tool(
+            "bootstrap_thread", {"thread_id": thread_id, "cwd": str(project), "max_chars": 100000}
+        )
+        await terminal_mcp.mcp.call_tool("context_manifest", {"thread_id": thread_id, "cwd": str(project)})
+        return terminal_mcp._usage_summary(thread_id, limit=20)
+
+    summary = run(exercise())
+    events = [event for event in summary["recent_events"] if event["source"] == "proxy_estimate"]
+    assert len(events) == 2
+    assert all(event["output_tokens"] > 0 for event in events)
+    assert all(event["input_tokens"] > 0 for event in events)
+    assert all(event["metadata"]["input"]["tokenizer"] == "o200k_base" for event in events)

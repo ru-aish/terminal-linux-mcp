@@ -106,7 +106,9 @@ It stores a thread record and an append-only usage event stream with:
 - exact-versus-estimated classification
 - context fingerprints and bootstrap counts
 
-`record_token_usage` is for exact usage reported by the model host/provider. An MCP server cannot independently observe the ChatGPT host's complete model prompt or response, so exact accounting requires the wrapper/runtime to report those values. Bootstrap text estimates are stored separately as estimated model-input `server_estimate` events and are never represented as exact model usage.
+`record_token_usage` is for exact usage reported by the model host/provider. An MCP server cannot independently observe the ChatGPT host's complete model prompt or response, so exact accounting requires the wrapper/runtime to report those values.
+
+The proxy additionally records a clearly separate `proxy_estimate` event for every non-default thread tool call. It uses `tiktoken`'s `o200k_base` encoding: the tool-call name and JSON arguments are estimated model output, while the textual tool result is estimated model input available on the next turn. It deliberately excludes image/audio payloads and cannot calculate provider prompt-cache hits. Bootstrap text remains a `server_estimate` input event. These estimates must not be added to exact provider totals, because they describe overlapping portions of the same model turns.
 
 `get_token_usage` returns global or per-thread totals, grouped thread summaries, and recent events. Reusing the same non-empty provider request ID is idempotent and does not double-count a retried report.
 
