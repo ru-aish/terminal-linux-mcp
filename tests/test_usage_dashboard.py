@@ -79,6 +79,7 @@ def test_dashboard_snapshot_separates_exact_estimates_and_counts_tools(tmp_path,
 
 
 def test_dashboard_routes_assets_api_and_cookie_auth(tmp_path, monkeypatch):
+    monkeypatch.delenv("MCP_DASHBOARD_TOKEN", raising=False)
     store = make_store(tmp_path, monkeypatch)
     store.record_usage(
         "live-thread",
@@ -129,6 +130,7 @@ def test_dashboard_routes_assets_api_and_cookie_auth(tmp_path, monkeypatch):
         )
         assert login.status_code == 303
         assert "terminal_usage_dashboard" in login.headers["set-cookie"]
+        assert "dashboard-secret" not in login.headers["set-cookie"]
         assert client.get("/dashboard/api").status_code == 200
 
 

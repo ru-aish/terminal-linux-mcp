@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -23,19 +25,24 @@ def _dashboard_token() -> str:
     return os.environ.get("MCP_DASHBOARD_TOKEN", "").strip()
 
 
-def _supplied_token(request: Request) -> str:
-    cookie = request.cookies.get(DASHBOARD_COOKIE, "")
-    if cookie:
-        return cookie
-    authorization = request.headers.get("authorization", "")
-    if authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return ""
+def _session_cookie_value(token: str) -> str:
+    return hmac.new(
+        token.encode("utf-8"),
+        b"terminal-mcp-dashboard-session-v1",
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _authorized(request: Request) -> bool:
     expected = _dashboard_token()
-    return not expected or secrets.compare_digest(_supplied_token(request), expected)
+    if not expected:
+        return True
+    cookie = request.cookies.get(DASHBOARD_COOKIE, "")
+    if cookie and secrets.compare_digest(cookie, _session_cookie_value(expected)):
+        return True
+    authorization = request.headers.get("authorization", "")
+    supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+    return bool(supplied) and secrets.compare_digest(supplied, expected)
 
 
 def _secure_cookie(request: Request) -> bool:
@@ -113,7 +120,7 @@ def install_usage_dashboard(app: Any, store: GPTThreadStore) -> None:
         response = RedirectResponse("/dashboard", status_code=303)
         response.set_cookie(
             DASHBOARD_COOKIE,
-            expected,
+            _session_cookie_value(expected),
             max_age=60 * 60 * 24 * 30,
             httponly=True,
             secure=_secure_cookie(request),
