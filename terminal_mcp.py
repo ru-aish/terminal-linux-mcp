@@ -38,6 +38,11 @@ SHELL = os.environ.get("MCP_SHELL", "/bin/bash")
 DEFAULT_TIMEOUT = int(os.environ.get("MCP_DEFAULT_TIMEOUT", "30"))
 DEFAULT_MAX_OUTPUT_CHARS = int(os.environ.get("MCP_MAX_OUTPUT_CHARS", "24000"))
 PROCESS_BUFFER_LINES = int(os.environ.get("MCP_PROCESS_BUFFER_LINES", "1000"))
+CAPTURE_MEMORY_CHARS = int(os.environ.get("MCP_CAPTURE_MEMORY_CHARS", "65536"))
+WORKLOAD_ISOLATION = os.environ.get("MCP_WORKLOAD_ISOLATION", "auto").lower()
+WORKLOAD_MEMORY_MAX = os.environ.get("MCP_WORKLOAD_MEMORY_MAX", "")
+WORKLOAD_CPU_QUOTA = os.environ.get("MCP_WORKLOAD_CPU_QUOTA", "")
+WORKLOAD_TASKS_MAX = os.environ.get("MCP_WORKLOAD_TASKS_MAX", "")
 AGENT_DIR_NAME = os.environ.get("MCP_AGENT_DIR_NAME", ".agent")
 AGENT_CONTEXT_MAX_CHARS = int(os.environ.get("MCP_AGENT_CONTEXT_MAX_CHARS", "12000"))
 MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
@@ -78,6 +83,54 @@ class ProcessState:
     stderr_lines: deque[str] = field(default_factory=lambda: deque(maxlen=PROCESS_BUFFER_LINES))
     stdout_closed: bool = False
     stderr_closed: bool = False
+    unit_name: str | None = None
+
+
+@dataclass
+class StreamCapture:
+    """Bound output in RAM; spill only large output while preserving a useful tail."""
+    request_id: str
+    label: str
+    memory_limit: int
+    _chunks: list[str] = field(default_factory=list)
+    _chars: int = 0
+    _total: int = 0
+    _tail: deque[str] = field(default_factory=deque)
+    _tail_chars: int = 0
+    _path: str | None = None
+    _file: Any = None
+
+    def append(self, value: str) -> None:
+        if not value:
+            return
+        self._total += len(value)
+        self._tail.append(value)
+        self._tail_chars += len(value)
+        while self._tail and self._tail_chars > self.memory_limit:
+            removed = self._tail.popleft()
+            self._tail_chars -= len(removed)
+        if self._file is None and self._chars + len(value) <= self.memory_limit:
+            self._chunks.append(value)
+            self._chars += len(value)
+            return
+        if self._file is None:
+            self._path = _write_log_file(self.request_id, self.label.lower(), "".join(self._chunks))
+            self._file = open(self._path, "a", encoding="utf-8", errors="replace")
+            self._chunks.clear()
+            self._chars = 0
+        self._file.write(value)
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def text(self, max_chars: int) -> tuple[str, str | None]:
+        self.close()
+        if self._path is None:
+            return "".join(self._chunks), None
+        kept = "".join(self._tail)[-max(1, max_chars):]
+        return (f"[output streamed to disk: kept last {min(len(kept), max_chars)} of {self._total} chars; full {self.label} saved to {self._path}]\n{kept}", self._path)
 
 
 @dataclass
@@ -307,6 +360,90 @@ async def _terminate_process_group(process: asyncio.subprocess.Process, grace_se
         except ProcessLookupError:
             return
     await process.wait()
+
+
+def _safe_unit_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-.")[:48] or "task"
+
+
+def _systemd_workload_prefix(session_id: str, request_id: str) -> tuple[list[str], str | None]:
+    """Launch workload commands outside the MCP service cgroup when supported."""
+    if WORKLOAD_ISOLATION == "off" or shutil.which("systemd-run") is None:
+        return [], None
+    unit = f"mcp-workload-{_safe_unit_component(session_id)}-{_safe_unit_component(request_id)}.scope"
+    args = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", "--slice=mcp-workloads.slice"]
+    if WORKLOAD_MEMORY_MAX:
+        args.extend(["-p", f"MemoryMax={WORKLOAD_MEMORY_MAX}"])
+    if WORKLOAD_CPU_QUOTA:
+        args.extend(["-p", f"CPUQuota={WORKLOAD_CPU_QUOTA}"])
+    if WORKLOAD_TASKS_MAX:
+        args.extend(["-p", f"TasksMax={WORKLOAD_TASKS_MAX}"])
+    return args + ["--"], unit
+
+
+async def _spawn_workload(
+    args: list[str], *, shell: bool, session: SessionState, request_id: str,
+    cwd: Path, env: dict[str, str] | None, stdin: int | None = None,
+) -> tuple[asyncio.subprocess.Process, str | None]:
+    prefix, unit = _systemd_workload_prefix(session.session_id, request_id)
+    if prefix:
+        try:
+            return await asyncio.create_subprocess_exec(
+                *prefix, *args, cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            ), unit
+        except (FileNotFoundError, OSError):
+            if WORKLOAD_ISOLATION == "required":
+                raise
+    if WORKLOAD_ISOLATION == "required":
+        raise RuntimeError("MCP workload isolation is required but systemd-run is unavailable")
+    if shell:
+        return await asyncio.create_subprocess_shell(
+            args[-1], cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            executable=SHELL, start_new_session=True,
+        ), None
+    return await asyncio.create_subprocess_exec(
+        *args, cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    ), None
+
+
+async def _stop_workload(process: asyncio.subprocess.Process, unit_name: str | None) -> None:
+    if unit_name and shutil.which("systemctl"):
+        control = await asyncio.create_subprocess_exec("systemctl", "--user", "stop", unit_name, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await control.wait()
+    await _terminate_process_group(process)
+
+
+async def _capture_stream(stream: asyncio.StreamReader | None, capture: StreamCapture) -> None:
+    if stream is None:
+        return
+    while chunk := await stream.read(16 * 1024):
+        capture.append(chunk.decode("utf-8", errors="replace"))
+
+
+async def _collect_bounded_output(process: asyncio.subprocess.Process, request_id: str, timeout: int | None, unit_name: str | None = None) -> tuple[StreamCapture, StreamCapture, bool]:
+    stdout = StreamCapture(request_id, "STDOUT", CAPTURE_MEMORY_CHARS)
+    stderr = StreamCapture(request_id, "STDERR", CAPTURE_MEMORY_CHARS)
+    drains = [asyncio.create_task(_capture_stream(process.stdout, stdout)), asyncio.create_task(_capture_stream(process.stderr, stderr))]
+    timed_out = False
+    try:
+        if timeout and timeout > 0:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        else:
+            await process.wait()
+    except asyncio.TimeoutError:
+        timed_out = True
+    finally:
+        if timed_out:
+            await _stop_workload(process, unit_name)
+        await asyncio.gather(*drains, return_exceptions=True)
+        stdout.close()
+        stderr.close()
+    return stdout, stderr, timed_out
 
 async def _drain_stream(stream: asyncio.StreamReader | None, sink: deque[str], close_attr: str, state: ProcessState) -> None:
     if stream is None:
@@ -1376,19 +1513,12 @@ async def run_command(
                 return gate
             marker = f"__MCP_PWD_{uuid.uuid4().hex}__"
             modified = f"{command}\n\nprintf '\\n{marker}:%s\\n' \"$PWD\""
-            process = await asyncio.create_subprocess_shell(
-                modified,
-                cwd=str(run_cwd),
-                env=_build_env(session, env),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                executable=SHELL,
-                start_new_session=True,
+            process, unit_name = await _spawn_workload(
+                [SHELL, "-lc", modified], shell=True, session=session, request_id=request_id,
+                cwd=run_cwd, env=env,
             )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                await _terminate_process_group(process)
+            stdout_capture, stderr_capture, timed_out = await _collect_bounded_output(process, request_id, timeout, unit_name)
+            if timed_out:
                 return "\n\n".join([
                     f"Request ID: {request_id}",
                     f"Session ID: {session.session_id}",
@@ -1396,8 +1526,8 @@ async def run_command(
                     f"Duration: {time.time() - started:.2f}s",
                     f"Working Directory: {session.cwd}",
                 ])
-            stdout_raw = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-            stderr_raw = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+            stdout_raw, stdout_log = stdout_capture.text(max_output_chars)
+            stderr_raw, stderr_log = stderr_capture.text(max_output_chars)
             stdout_clean, new_cwd = _strip_pwd_marker(stdout_raw, marker)
             if new_cwd:
                 candidate = Path(new_cwd).expanduser()
@@ -1405,8 +1535,14 @@ async def run_command(
                     session.cwd = candidate.resolve()
             session.command_count += 1
             session.updated_at = time.time()
-            stdout_clean, stdout_log = _truncate_output("STDOUT", stdout_clean, request_id, max_output_chars)
-            stderr_clean, stderr_log = _truncate_output("STDERR", stderr_raw.rstrip(), request_id, max_output_chars)
+            if stdout_log:
+                extra_stdout_log = None
+            else:
+                stdout_clean, extra_stdout_log = _truncate_output("STDOUT", stdout_clean, request_id, max_output_chars)
+            if stderr_log:
+                extra_stderr_log = None
+            else:
+                stderr_clean, extra_stderr_log = _truncate_output("STDERR", stderr_raw.rstrip(), request_id, max_output_chars)
             response = [f"Request ID: {request_id}", f"Session ID: {session.session_id}"]
             if stdout_clean.strip():
                 response.append(f"STDOUT:\n{stdout_clean}")
@@ -1417,7 +1553,7 @@ async def run_command(
                 f"Duration: {time.time() - started:.2f}s",
                 f"Working Directory: {session.cwd}",
             ])
-            logs = [path for path in [stdout_log, stderr_log] if path]
+            logs = [path for path in [stdout_log, stderr_log, extra_stdout_log, extra_stderr_log] if path]
             if logs:
                 response.append("Full Output Logs:\n" + "\n".join(logs))
             return "\n\n".join(response)
@@ -1500,24 +1636,18 @@ async def start_process(command: str, session_id: str = "default", cwd: str | No
         gate = _require_project_context(session, run_cwd)
         if gate:
             return gate
-        process = await asyncio.create_subprocess_shell(
-            command,
-            cwd=str(run_cwd),
-            env=_build_env(session, env),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            executable=SHELL,
-            start_new_session=True,
-        )
         process_id = f"proc-{_now_ms()}-{uuid.uuid4().hex[:8]}"
-        state = ProcessState(process_id, session.session_id, command, run_cwd, process)
+        process, unit_name = await _spawn_workload(
+            [SHELL, "-lc", command], shell=True, session=session, request_id=process_id,
+            cwd=run_cwd, env=env, stdin=asyncio.subprocess.PIPE,
+        )
+        state = ProcessState(process_id, session.session_id, command, run_cwd, process, unit_name=unit_name)
         async with state_lock:
             processes[process_id] = state
         asyncio.create_task(_drain_stream(process.stdout, state.stdout_lines, "stdout_closed", state))
         asyncio.create_task(_drain_stream(process.stderr, state.stderr_lines, "stderr_closed", state))
         session.updated_at = time.time()
-        return "\n".join([f"Process ID: {process_id}", f"Session ID: {session.session_id}", f"PID: {process.pid}", f"Command: {command}", f"Working Directory: {run_cwd}", "Status: running"])
+        return "\n".join([f"Process ID: {process_id}", f"Session ID: {session.session_id}", f"PID: {process.pid}", f"Workload Unit: {unit_name or 'process-group'}", f"Command: {command}", f"Working Directory: {run_cwd}", "Status: running"])
 
 @mcp.tool()
 async def poll_process(
@@ -1563,7 +1693,7 @@ async def stop_process(process_id: str, session_id: str = "default") -> str:
         state = processes.get(process_id)
     if state is None or state.session_id != session.session_id:
         return f"Error: process_id is unknown or not owned by session {session.session_id}: {process_id}"
-    await _terminate_process_group(state.process)
+    await _stop_workload(state.process, state.unit_name)
     return _format_process(state, max_lines=80)
 
 
@@ -2156,23 +2286,16 @@ async def _run_agent_cli(
 ) -> str:
     request_id = f"agent-{_now_ms()}-{uuid.uuid4().hex[:8]}"
     started = time.time()
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(run_cwd),
-        env=_build_env(session, env),
+    process, unit_name = await _spawn_workload(
+        args, shell=False, session=session, request_id=request_id, cwd=run_cwd, env=env,
         stdin=asyncio.subprocess.PIPE if prompt_stdin is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
     )
-    try:
-        communicate = process.communicate(prompt_stdin.encode("utf-8") if prompt_stdin is not None else None)
-        if timeout and timeout > 0:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(communicate, timeout=timeout)
-        else:
-            stdout_bytes, stderr_bytes = await communicate
-    except asyncio.TimeoutError:
-        await _terminate_process_group(process)
+    if prompt_stdin is not None and process.stdin is not None:
+        process.stdin.write(prompt_stdin.encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+    stdout_capture, stderr_capture, timed_out = await _collect_bounded_output(process, request_id, timeout, unit_name)
+    if timed_out:
         return "\n\n".join([
             f"Request ID: {request_id}",
             f"Command: {_command_display(args)}",
@@ -2180,10 +2303,18 @@ async def _run_agent_cli(
             f"Duration: {time.time() - started:.2f}s",
             f"Working Directory: {run_cwd}",
         ])
-    stdout = stdout_bytes.decode("utf-8", errors="replace").rstrip() if stdout_bytes else ""
-    stderr = stderr_bytes.decode("utf-8", errors="replace").rstrip() if stderr_bytes else ""
-    stdout, stdout_log = _truncate_output("STDOUT", stdout, request_id, max_output_chars)
-    stderr, stderr_log = _truncate_output("STDERR", stderr, request_id, max_output_chars)
+    stdout, stdout_log = stdout_capture.text(max_output_chars)
+    stderr, stderr_log = stderr_capture.text(max_output_chars)
+    if stdout_log:
+        stdout = stdout.rstrip()
+        extra_stdout_log = None
+    else:
+        stdout, extra_stdout_log = _truncate_output("STDOUT", stdout.rstrip(), request_id, max_output_chars)
+    if stderr_log:
+        stderr = stderr.rstrip()
+        extra_stderr_log = None
+    else:
+        stderr, extra_stderr_log = _truncate_output("STDERR", stderr.rstrip(), request_id, max_output_chars)
     response = [
         f"Request ID: {request_id}",
         f"Command: {_command_display(args)}",
@@ -2195,7 +2326,7 @@ async def _run_agent_cli(
         response.append(f"STDOUT:\n{stdout}")
     if stderr.strip():
         response.append(f"STDERR:\n{stderr}")
-    logs = [path for path in [stdout_log, stderr_log] if path]
+    logs = [path for path in [stdout_log, stderr_log, extra_stdout_log, extra_stderr_log] if path]
     if logs:
         response.append("Full Output Logs:\n" + "\n".join(logs))
     return "\n\n".join(response)
@@ -2207,17 +2338,12 @@ async def _start_agent_cli(
     session: SessionState,
     env: dict[str, str] | None,
 ) -> str:
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(run_cwd),
-        env=_build_env(session, env),
-        stdin=asyncio.subprocess.PIPE if prompt_stdin is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
     process_id = f"proc-{_now_ms()}-{uuid.uuid4().hex[:8]}"
-    state = ProcessState(process_id, session.session_id, _command_display(args), run_cwd, process)
+    process, unit_name = await _spawn_workload(
+        args, shell=False, session=session, request_id=process_id, cwd=run_cwd, env=env,
+        stdin=asyncio.subprocess.PIPE if prompt_stdin is not None else None,
+    )
+    state = ProcessState(process_id, session.session_id, _command_display(args), run_cwd, process, unit_name=unit_name)
     async with state_lock:
         processes[process_id] = state
     asyncio.create_task(_drain_stream(process.stdout, state.stdout_lines, "stdout_closed", state))
@@ -2231,6 +2357,7 @@ async def _start_agent_cli(
         f"Process ID: {process_id}",
         f"Session ID: {session.session_id}",
         f"PID: {process.pid}",
+        f"Workload Unit: {unit_name or 'process-group'}",
         f"Command: {_command_display(args)}",
         f"Working Directory: {run_cwd}",
         "Status: running",
