@@ -11,8 +11,12 @@
   };
 
   const $ = (id) => document.getElementById(id);
-  const number = new Intl.NumberFormat("en-IN");
-  const compact = new Intl.NumberFormat("en-IN", { notation: "compact", maximumFractionDigits: 1 });
+  const number = new Intl.NumberFormat("en-US");
+  const compact = new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    compactDisplay: "short",
+    maximumFractionDigits: 1,
+  });
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -112,20 +116,58 @@
       </svg>`;
   }
 
+  function createToolRow(tool) {
+    const row = document.createElement("div");
+    row.className = "tool-row";
+    row.dataset.toolName = tool.name;
+    row.innerHTML = `
+      <span class="tool-name"></span>
+      <strong class="tool-count"></strong>
+      <div class="tool-track" aria-hidden="true"><div class="tool-fill"></div></div>
+      <span class="tool-meta"></span>`;
+    return row;
+  }
+
+  function updateToolRow(row, tool, max) {
+    const name = row.querySelector(".tool-name");
+    const count = row.querySelector(".tool-count");
+    const fill = row.querySelector(".tool-fill");
+    const meta = row.querySelector(".tool-meta");
+
+    name.textContent = tool.name;
+    name.title = tool.name;
+    count.textContent = formatCount(tool.calls);
+    count.title = number.format(tool.calls || 0);
+    fill.style.width = `${Math.max(3, tool.calls / max * 100).toFixed(1)}%`;
+    meta.textContent = `${formatCount(tool.input_tokens)} result tokens · ${formatCount(tool.output_tokens)} call tokens · ${relativeTime(tool.last_seen)}`;
+  }
+
   function renderTools(tools) {
     const list = $("toolList");
     if (!tools?.length) {
-      list.innerHTML = '<div class="empty-row">No tool calls in this window.</div>';
+      list.replaceChildren(Object.assign(document.createElement("div"), {
+        className: "empty-row",
+        textContent: "No tool calls in this window.",
+      }));
       return;
     }
+
     const max = Math.max(...tools.map((tool) => tool.calls), 1);
-    list.innerHTML = tools.map((tool) => `
-      <div class="tool-row">
-        <span class="tool-name" title="${escapeHtml(tool.name)}">${escapeHtml(tool.name)}</span>
-        <strong class="tool-count">${formatCount(tool.calls)}</strong>
-        <div class="tool-track" aria-hidden="true"><div class="tool-fill" style="width:${Math.max(3, tool.calls / max * 100).toFixed(1)}%"></div></div>
-        <span class="tool-meta">${formatCount(tool.input_tokens)} result tokens · ${formatCount(tool.output_tokens)} call tokens · ${relativeTime(tool.last_seen)}</span>
-      </div>`).join("");
+    const existing = new Map(
+      [...list.querySelectorAll(".tool-row")].map((row) => [row.dataset.toolName, row]),
+    );
+    const activeNames = new Set(tools.map((tool) => tool.name));
+
+    list.querySelectorAll(".empty-row").forEach((row) => row.remove());
+    existing.forEach((row, name) => {
+      if (!activeNames.has(name)) row.remove();
+    });
+
+    tools.forEach((tool) => {
+      const row = existing.get(tool.name) || createToolRow(tool);
+      updateToolRow(row, tool, max);
+      list.appendChild(row);
+    });
   }
 
   function renderEvents(events) {

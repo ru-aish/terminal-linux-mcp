@@ -84,7 +84,7 @@ h2 { margin: 0; font-family: var(--display); font-size: clamp(1.45rem, 6vw, 2.45
 .tool-name { min-width: 0; font-family: var(--mono); font-size: .77rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-count { font-family: var(--display); font-size: 1.2rem; }
 .tool-track { grid-column: 1 / -1; height: 7px; background: #d4d7d2; overflow: hidden; border-radius: 99px; }
-.tool-fill { height: 100%; background: var(--exact); border-radius: inherit; transform-origin: left; animation: grow .5s ease-out both; }
+.tool-fill { height: 100%; background: var(--exact); border-radius: inherit; }
 .tool-meta { grid-column: 1 / -1; color: var(--muted); font-size: .64rem; margin-top: -3px; }
 
 .event-rail { list-style: none; padding: 0 0 0 18px; margin: 0; position: relative; }
@@ -166,5 +166,4 @@ footer form { margin: 0; }
 }
 
 @keyframes pulse { 50% { box-shadow: 0 0 0 8px rgba(49,94,89,0); } }
-@keyframes grow { from { transform: scaleX(0); } }
 @keyframes eventIn { from { opacity: 0; transform: translateY(-8px); } }
