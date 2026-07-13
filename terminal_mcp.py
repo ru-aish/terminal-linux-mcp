@@ -2858,20 +2858,15 @@ def _build_startup_instructions() -> str:
         parts.extend(["No .GPT instruction file was discovered.", ""])
     parts.append(f"## Available skills ({len(skills)})")
     for skill in skills:
-        parts.append(
-            f"- {skill['name']} [{skill['source']}]: "
-            f"{skill['description'] or 'Read this skill before use.'} (path: {skill['path']})"
-        )
+        parts.append(f"- {skill['name']}")
     if not skills:
         parts.append("- No skills discovered.")
     parts.extend(["", f"## Public Terminal GPT tools ({len(tools)})"])
     for tool in tools:
-        parts.append(f"- {tool['name']}: {tool['description'] or 'No description provided.'}")
+        parts.append(f"- {tool['name']}")
     parts.extend(["", f"## Configured nested MCP servers ({len(nested_servers)})"])
     for server in nested_servers:
-        parts.append(
-            f"- {server['name']}: transport={server['transport']}, endpoint={server['endpoint']}"
-        )
+        parts.append(f"- {server['name']}")
     if not nested_servers:
         parts.append("- No nested MCP servers discovered.")
     parts.extend([
