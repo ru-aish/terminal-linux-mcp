@@ -29,6 +29,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from gpt_thread_store import GPTThreadStore
+from usage_dashboard import install_usage_dashboard
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -263,7 +264,8 @@ class BearerAuthMiddleware:
         self.token = token
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http":
+        path = str(scope.get("path", ""))
+        if scope.get("type") != "http" or path == "/dashboard" or path.startswith("/dashboard/"):
             await self.app(scope, receive, send)
             return
 
@@ -3012,6 +3014,7 @@ def main() -> None:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
+        install_usage_dashboard(app, GPT_STORE)
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
         if bearer_token:
             app.add_middleware(BearerAuthMiddleware, token=bearer_token)

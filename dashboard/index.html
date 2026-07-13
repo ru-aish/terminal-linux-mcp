@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#e7e8e3">
+  <title>Terminal MCP · Usage ledger</title>
+  <link rel="stylesheet" href="/dashboard/assets/dashboard.css">
+  <script src="/dashboard/assets/dashboard.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to usage data</a>
+  <div class="page-shell">
+    <header class="masthead">
+      <a class="identity" href="/dashboard" aria-label="Terminal MCP usage dashboard">
+        <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="identity-copy">
+          <strong>Terminal MCP</strong>
+          <small>Usage ledger</small>
+        </span>
+      </a>
+      <div class="connection" id="connection" data-state="connecting" aria-live="polite">
+        <span class="connection-dot" aria-hidden="true"></span>
+        <span id="connectionLabel">Connecting</span>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" aria-labelledby="pageTitle">
+        <div class="hero-copy">
+          <p class="eyebrow">Live accounting · exact and estimated kept separate</p>
+          <h1 id="pageTitle">See what every agent thread is spending.</h1>
+          <p class="hero-note">The ledger reads the MCP SQLite store directly and updates whenever a tool loop or provider usage event lands.</p>
+        </div>
+
+        <div class="window-control" aria-label="Dashboard time window">
+          <span>Window</span>
+          <div class="window-buttons" role="group">
+            <button type="button" data-hours="1">1h</button>
+            <button type="button" data-hours="6">6h</button>
+            <button type="button" data-hours="24" aria-pressed="true">24h</button>
+            <button type="button" data-hours="168">7d</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="scoreboard" aria-label="Usage totals">
+        <article class="score score-exact">
+          <div class="score-label"><span class="swatch swatch-exact"></span>Exact model tokens · all time</div>
+          <strong id="exactTokens" class="score-value">—</strong>
+          <p><span id="exactInput">—</span> input · <span id="exactOutput">—</span> output</p>
+        </article>
+        <article class="score score-estimated">
+          <div class="score-label"><span class="swatch swatch-estimated"></span>Proxy text estimate · all time</div>
+          <strong id="estimatedTokens" class="score-value">—</strong>
+          <p>Observed MCP call and result text</p>
+        </article>
+        <article class="score">
+          <div class="score-label">Tool calls · all time</div>
+          <strong id="toolCalls" class="score-value">—</strong>
+          <p><span id="callRate">—</span> calls/min over 5m</p>
+        </article>
+        <article class="score">
+          <div class="score-label">Active threads</div>
+          <strong id="activeThreads" class="score-value">—</strong>
+          <p>Last 10m · <span id="threadTotal">—</span> threads recorded</p>
+        </article>
+      </section>
+
+      <section class="flow-section" aria-labelledby="flowTitle">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Token flow</p>
+            <h2 id="flowTitle">Usage over the selected window</h2>
+          </div>
+          <div class="legend" aria-label="Chart legend">
+            <span><i class="swatch swatch-exact"></i>Exact</span>
+            <span><i class="swatch swatch-estimated"></i>Estimated</span>
+            <span><i class="swatch swatch-calls"></i>Calls</span>
+          </div>
+        </div>
+        <div class="chart-wrap" id="chartWrap">
+          <div class="chart-empty">Waiting for usage events…</div>
+        </div>
+        <div class="flow-foot">
+          <span id="windowSummary">No window data yet</span>
+          <span id="lastUpdated">Not updated</span>
+        </div>
+      </section>
+
+      <div class="workbench">
+        <section class="tool-section" aria-labelledby="toolTitle">
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">Tool mix</p>
+              <h2 id="toolTitle">Calls by capability</h2>
+            </div>
+            <span class="micro-stat" id="databaseSize">DB —</span>
+          </div>
+          <div class="tool-list" id="toolList">
+            <div class="empty-row">No tool calls in this window.</div>
+          </div>
+        </section>
+
+        <section class="event-section" aria-labelledby="eventTitle">
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">Live rail</p>
+              <h2 id="eventTitle">Newest accounting events</h2>
+            </div>
+            <span class="micro-stat" id="eventCount">0 events</span>
+          </div>
+          <ol class="event-rail" id="eventRail" aria-live="polite">
+            <li class="empty-row">Waiting for the first event.</li>
+          </ol>
+        </section>
+      </div>
+
+      <section class="thread-section" aria-labelledby="threadTitle">
+        <div class="section-heading thread-heading">
+          <div>
+            <p class="eyebrow">Thread ledger</p>
+            <h2 id="threadTitle">Where usage is accumulating</h2>
+          </div>
+          <label class="thread-search">
+            <span class="sr-only">Filter threads</span>
+            <input id="threadSearch" type="search" placeholder="Filter thread or path" autocomplete="off">
+          </label>
+        </div>
+        <div class="thread-table" role="table" aria-label="Usage by thread">
+          <div class="thread-table-head" role="row">
+            <span role="columnheader">Thread</span>
+            <span role="columnheader">Calls</span>
+            <span role="columnheader">Exact</span>
+            <span role="columnheader">Estimate</span>
+            <span role="columnheader">Last event</span>
+          </div>
+          <div id="threadRows" class="thread-rows">
+            <div class="empty-row">No threads recorded.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="method" aria-labelledby="methodTitle">
+        <p class="eyebrow">Reading the numbers</p>
+        <h2 id="methodTitle">Two ledgers, not one blended total.</h2>
+        <div class="method-grid">
+          <p><strong>Exact</strong> is provider-reported model usage. Cached input is shown as context, but it is already part of input tokens.</p>
+          <p><strong>Estimated</strong> uses the GPT-5-family tokenizer on text visible to the MCP proxy: the tool call emitted by the model and the result returned to it.</p>
+          <p id="accountingNote">These figures can overlap and should not be added together as a billable total.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span id="databasePath">SQLite usage store</span>
+      <form method="post" action="/dashboard/logout"><button class="text-button" type="submit">Lock dashboard</button></form>
+    </footer>
+  </div>
+  <noscript>This dashboard needs JavaScript to stream live usage data.</noscript>
+</body>
+</html>

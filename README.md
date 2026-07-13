@@ -16,6 +16,7 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 - Mandatory per-thread bootstrap gate using `~/.GPT/AGENTS.md` and project `.GPT/AGENTS.md` files; Codex `~/.codex/AGENTS.md` is intentionally ignored.
 - MCP initialization instructions include the GPT rules, every discoverable skill, every public Terminal tool, and configured nested MCP server names.
 - SQLite tracking for host-reported model input/output/cached-input tokens plus separately labeled server estimates for returned bootstrap context.
+- A mobile-first live usage ledger at `/dashboard`, mounted in the same HTTP process and updated through Server-Sent Events.
 - Discovery of local `SKILL.md` files.
 - Discovery and proxying of configured MCP servers.
 - Persistent downstream MCP connections keyed by `(session_id, server_name)`.
@@ -111,6 +112,20 @@ It stores a thread record and an append-only usage event stream with:
 The proxy additionally records a clearly separate `proxy_estimate` event for every non-default thread tool call. It uses `tiktoken`'s `o200k_base` encoding: the tool-call name and JSON arguments are estimated model output, while the textual tool result is estimated model input available on the next turn. It deliberately excludes image/audio payloads and cannot calculate provider prompt-cache hits. Bootstrap text remains a `server_estimate` input event. These estimates must not be added to exact provider totals, because they describe overlapping portions of the same model turns.
 
 `get_token_usage` returns global or per-thread totals, grouped thread summaries, and recent events. Reusing the same non-empty provider request ID is idempotent and does not double-count a retried report.
+
+### Live usage dashboard
+
+For SSE or Streamable HTTP transports, the same server process exposes:
+
+```text
+/dashboard          interactive usage ledger
+/dashboard/api      current JSON snapshot
+/dashboard/events   live Server-Sent Events stream
+```
+
+The dashboard shows exact provider-reported tokens, proxy-estimated MCP text, tool-call counts and ranking, active/recent threads, time-window charts, and the newest accounting events. Exact and estimated figures stay visually and numerically separate because they can overlap.
+
+Set `MCP_DASHBOARD_TOKEN` to require the dashboard login form. The MCP bearer middleware deliberately leaves `/dashboard` to this cookie-based browser flow; `/mcp` continues to use `MCP_BEARER_TOKEN` independently. When the dashboard token is unset, the dashboard inherits the reachability of the HTTP server and any tunnel in front of it, so do not expose it publicly without another access policy.
 
 ## Requirements
 
