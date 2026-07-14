@@ -33,7 +33,7 @@ async def inspect_server(url: str, token: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Connect to a Terminal MCP endpoint and list its tools.")
-    parser.add_argument("url", nargs="?", default="http://127.0.0.1:8000/mcp")
+    parser.add_argument("url", nargs="?", default="http://127.0.0.1:8011/mcp")
     parser.add_argument(
         "--token",
         default=os.environ.get("MCP_BEARER_TOKEN"),

@@ -1,6 +1,6 @@
-# Terminal Linux MCP
+# Terminal GPT Experimental MCP
 
-A native Linux terminal MCP server for files, commands, long-running processes, project instructions, local skills, and downstream MCP servers.
+An isolated experimental copy of the Terminal Linux MCP that bootstraps every model thread with GPT-specific instructions, skills, tool manifests, downstream MCP discovery, and persistent token-usage accounting.
 
 The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` starts the Streamable HTTP server and an ngrok tunnel together, prints the final MCP endpoint, and shuts both processes down cleanly.
 
@@ -12,7 +12,11 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 - Native command execution with per-session working directories and environment variables.
 - Foreground and background process management.
 - Direct file read/write/edit/copy/move operations.
-- Mandatory `AGENTS.md` project-context gate before executing or modifying work.
+- Native local image inspection through `watch_image`, returning MCP `ImageContent` instead of a text path or JSON-wrapped base64 blob.
+- Mandatory per-thread bootstrap gate using `~/.GPT/AGENTS.md` and project `.GPT/AGENTS.md` files; Codex `~/.codex/AGENTS.md` is intentionally ignored.
+- MCP initialization instructions include the GPT rules, every discoverable skill, every public Terminal tool, and configured nested MCP server names.
+- SQLite tracking for host-reported model input/output/cached-input tokens plus separately labeled server estimates for returned bootstrap context.
+- A mobile-first live usage ledger at `/dashboard`, mounted in the same HTTP process and updated through Server-Sent Events.
 - Discovery of local `SKILL.md` files.
 - Discovery and proxying of configured MCP servers.
 - Persistent downstream MCP connections keyed by `(session_id, server_name)`.
@@ -20,6 +24,108 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 - Exclusive ownership for configured browser profile directories, preventing two owners from opening the same profile concurrently.
 - Optional bearer authentication for HTTP transports.
 - Safe launcher that refuses occupied ports and refuses an unauthenticated public tunnel unless explicitly overridden.
+
+## Thread bootstrap architecture
+
+This branch is designed to run beside the normal Terminal MCP rather than replace it. Its defaults are isolated:
+
+```text
+Normal Terminal MCP       Experimental Terminal GPT MCP
+port 8000                 port 8011
+~/.codex/AGENTS.md        ~/.GPT/AGENTS.md
+normal server process     separate worktree/process
+```
+
+On MCP initialization, the server sends a startup instruction document containing:
+
+1. The full global `~/.GPT/AGENTS.md` instruction content.
+2. Every discovered `SKILL.md` name, description, source, and path.
+3. Every public Terminal GPT tool and description.
+4. Every configured nested MCP server name and public endpoint summary.
+5. The recovery and token-accounting tools.
+
+Project-specific `.GPT/AGENTS.md` files are intentionally not injected until `bootstrap_thread` receives the target `cwd`, preventing one project’s rules from leaking into another project’s initialization. The global startup payload is rebuilt for every MCP initialization, so changes to global rules or discovered skills are visible to newly initialized clients without restarting the server.
+
+A model thread must then call:
+
+```json
+{
+  "thread_id": "a-unique-stable-id-for-this-model-thread",
+  "cwd": "/absolute/project/path"
+}
+```
+
+through `bootstrap_thread`. The same value must be reused as `session_id` for later tools. The shared value `default` is rejected for gated execution or modification, preventing one chat from inheriting another chat's loaded-context fingerprint.
+
+If the model loses context after compaction or a long conversation, it calls `get_thread_context`. If any applicable `.GPT/AGENTS.md` changes, the fingerprint gate blocks further gated work until the thread reloads its context.
+
+### GPT instruction hierarchy
+
+The experimental server never reads Codex's instruction tree. It resolves GPT instructions in this order:
+
+```text
+~/.GPT/AGENTS.override.md       # overrides ~/.GPT/AGENTS.md
+~/.GPT/AGENTS.md
+<repo>/.GPT/AGENTS.override.md  # overrides that directory's AGENTS.md
+<repo>/.GPT/AGENTS.md
+<repo>/<subdir>/.GPT/AGENTS.md
+...
+```
+
+`MCP_GPT_HOME` changes the global GPT directory. The default is `~/.GPT`.
+
+### Native image inspection
+
+`watch_image` accepts an absolute or working-directory-relative local path and returns the original image bytes as native MCP `ImageContent`. This lets an MCP-capable model receive the image as visual input instead of receiving only the filename or a JSON string.
+
+Supported formats are PNG, JPEG, WEBP, and non-animated GIF. The server validates the file signature rather than trusting the extension, rejects malformed or animated GIFs, and reads at most `MCP_WATCH_IMAGE_MAX_BYTES` bytes. The default limit is 20 MiB before base64 expansion.
+
+```text
+watch_image(
+    path="/absolute/path/to/screenshot.png",
+    session_id="the-bootstrapped-thread-id",
+    cwd="/absolute/project/path",
+)
+```
+
+The MCP image content carries base64 data plus its MIME type. It preserves the original file bytes; image-detail selection remains a responsibility of the MCP host when it maps the content into a model request.
+
+### Token usage database
+
+The database is stored at:
+
+```text
+~/.GPT/thread_usage.db
+```
+
+It stores a thread record and an append-only usage event stream with:
+
+- input tokens
+- output tokens
+- cached input tokens
+- model and provider request ID
+- exact-versus-estimated classification
+- context fingerprints and bootstrap counts
+
+`record_token_usage` is for exact usage reported by the model host/provider. An MCP server cannot independently observe the ChatGPT host's complete model prompt or response, so exact accounting requires the wrapper/runtime to report those values.
+
+The proxy additionally records a clearly separate `proxy_estimate` event for every non-default thread tool call. It uses `tiktoken`'s `o200k_base` encoding: the tool-call name and JSON arguments are estimated model output, while the textual tool result is estimated model input available on the next turn. It deliberately excludes image/audio payloads and cannot calculate provider prompt-cache hits. Bootstrap text remains a `server_estimate` input event. These estimates must not be added to exact provider totals, because they describe overlapping portions of the same model turns.
+
+`get_token_usage` returns global or per-thread totals, grouped thread summaries, and recent events. Reusing the same non-empty provider request ID is idempotent and does not double-count a retried report.
+
+### Live usage dashboard
+
+For SSE or Streamable HTTP transports, the same server process exposes:
+
+```text
+/dashboard          interactive usage ledger
+/dashboard/api      current JSON snapshot
+/dashboard/events   live Server-Sent Events stream
+```
+
+The dashboard shows exact provider-reported tokens, proxy-estimated MCP text, tool-call counts and ranking, active/recent threads, time-window charts, and the newest accounting events. Exact and estimated figures stay visually and numerically separate because they can overlap.
+
+Set `MCP_DASHBOARD_TOKEN` to require the dashboard login form. The MCP bearer middleware deliberately leaves `/dashboard` to this cookie-based browser flow; `/mcp` continues to use `MCP_BEARER_TOKEN` independently. When the dashboard token is unset, the dashboard inherits the reachability of the HTTP server and any tunnel in front of it, so do not expose it publicly without another access policy.
 
 ## Requirements
 
@@ -98,7 +204,7 @@ Start the MCP server and tunnel:
 The launcher prints both endpoints:
 
 ```text
-Local MCP endpoint: http://127.0.0.1:8000/mcp
+Local MCP endpoint: http://127.0.0.1:8011/mcp
 Public MCP endpoint: https://example.ngrok.app/mcp
 Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>
 ```
@@ -170,10 +276,15 @@ response = client.responses.create(
             "authorization": os.environ["MCP_BEARER_TOKEN"],
             "require_approval": "always",
             "allowed_tools": [
-                "project_context",
+                "bootstrap_thread",
+                "get_thread_context",
+                "context_manifest",
+                "record_token_usage",
+                "get_token_usage",
                 "list_dir",
                 "stat_path",
                 "read_file",
+                "watch_image",
             ],
         }
     ],
@@ -188,11 +299,12 @@ OpenAI does not store the MCP `authorization` value in the Response object, so p
 
 | Area | Tools |
 | --- | --- |
-| Project instructions | `project_context` |
+| Thread bootstrap and recovery | `bootstrap_thread`, `get_thread_context`, `context_manifest`, `refresh_startup_context`, `project_context` |
+| Token accounting | `record_token_usage`, `get_token_usage` |
 | Skills and MCP discovery | `local_skills`, `local_mcp` |
 | Commands | `run_command`, `start_process`, `poll_process`, `stop_process` |
 | Session environment | `set_session_env` |
-| Files | `read_file`, `write_file`, `replace_in_file`, `apply_patch`, `list_dir`, `stat_path`, `make_dir`, `copy_path`, `move_path` |
+| Files and images | `read_file`, `watch_image`, `write_file`, `replace_in_file`, `apply_patch`, `list_dir`, `stat_path`, `make_dir`, `copy_path`, `move_path` |
 | Delegated agents | `run_codex_yolo`, `start_codex_yolo`, `run_agy_yolo`, `start_agy_yolo` |
 
 ## Persistent downstream MCP proxy

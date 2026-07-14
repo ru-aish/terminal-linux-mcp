@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -11,6 +12,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -22,33 +24,124 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from gpt_thread_store import GPTThreadStore
+from usage_dashboard import install_usage_dashboard
+
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR = Path(os.environ.get("MCP_LOG_DIR", "~/.mcp_terminal_logs")).expanduser().resolve()
+LOG_DIR = Path(os.environ.get("MCP_LOG_DIR", "~/.gpt_terminal_mcp_logs")).expanduser().resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SHELL = os.environ.get("MCP_SHELL", "/bin/bash")
 DEFAULT_TIMEOUT = int(os.environ.get("MCP_DEFAULT_TIMEOUT", "30"))
 DEFAULT_MAX_OUTPUT_CHARS = int(os.environ.get("MCP_MAX_OUTPUT_CHARS", "24000"))
 PROCESS_BUFFER_LINES = int(os.environ.get("MCP_PROCESS_BUFFER_LINES", "1000"))
+CAPTURE_MEMORY_CHARS = int(os.environ.get("MCP_CAPTURE_MEMORY_CHARS", "65536"))
+WORKLOAD_ISOLATION = os.environ.get("MCP_WORKLOAD_ISOLATION", "auto").lower()
+WORKLOAD_MEMORY_MAX = os.environ.get("MCP_WORKLOAD_MEMORY_MAX", "")
+WORKLOAD_CPU_QUOTA = os.environ.get("MCP_WORKLOAD_CPU_QUOTA", "")
+WORKLOAD_TASKS_MAX = os.environ.get("MCP_WORKLOAD_TASKS_MAX", "")
 AGENT_DIR_NAME = os.environ.get("MCP_AGENT_DIR_NAME", ".agent")
 AGENT_CONTEXT_MAX_CHARS = int(os.environ.get("MCP_AGENT_CONTEXT_MAX_CHARS", "12000"))
 MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
+DEFAULT_BOOTSTRAP_MAX_CHARS = int(os.environ.get("MCP_BOOTSTRAP_MAX_CHARS", "100000"))
+WATCH_IMAGE_MAX_BYTES = int(os.environ.get("MCP_WATCH_IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
+TOKEN_ACCOUNTING_MAX_CHARS = int(os.environ.get("MCP_TOKEN_ACCOUNTING_MAX_CHARS", "1000000"))
+GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
 
 
-mcp = FastMCP(
-    "Terminal",
-    instructions=(
-        "You are connected to a native development terminal on the host machine.\n"
-        "Use these tools for software development, files, builds, tests, packages, services, and process management.\n"
-        "Use a stable session_id for each independent job; commands in one session are serialized while different sessions can run concurrently.\n"
-        "Before the first executing or modifying action in a project, and whenever cwd or applicable instructions change, call project_context and follow every returned AGENTS.md instruction.\n"
-        "Use local_skills to discover and read project or machine-local skills.\n"
-        "Use local_mcp for MCP servers already configured on this machine; inspect a server's tools before calling it.\n"
-        "Use run_command for Git, HTTP, databases, networking, services, containers, and package management."
-    ),
+class AccountingFastMCP(FastMCP):
+    """Record the two text legs of each MCP tool loop without affecting tools.
+
+    A model's tool-call payload is text it emitted; the tool result is text the
+    host may provide back to the model.  This proxy sees both, but not the rest
+    of the host prompt, provider cache accounting, or token costs for images.
+    Accounting failures are deliberately non-fatal: observability must never
+    make a usable terminal tool fail.
+    """
+
+    @staticmethod
+    def _thread_id(arguments: dict[str, Any]) -> str:
+        candidate = arguments.get("thread_id") or arguments.get("session_id") or ""
+        return str(candidate).strip()[:128]
+
+    @staticmethod
+    def _text_for_token_accounting(value: Any) -> tuple[str, dict[str, Any]]:
+        """Serialize textual content only; never tokenize image/audio base64."""
+        media_blocks = 0
+
+        def sanitize(item: Any) -> Any:
+            nonlocal media_blocks
+            if hasattr(item, "model_dump"):
+                item = item.model_dump(mode="json")
+            if isinstance(item, dict):
+                kind = str(item.get("type", ""))
+                if kind in {"image", "audio"} or "data" in item and kind:
+                    media_blocks += 1
+                    return {
+                        "type": kind or "binary",
+                        "mimeType": item.get("mimeType", ""),
+                        "token_accounting": "non-text payload excluded",
+                    }
+                return {str(key): sanitize(child) for key, child in item.items()}
+            if isinstance(item, (list, tuple)):
+                return [sanitize(child) for child in item]
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                return item
+            return str(item)
+
+        text = json.dumps(sanitize(value), ensure_ascii=False, sort_keys=True, default=str)
+        truncated = len(text) > TOKEN_ACCOUNTING_MAX_CHARS
+        if truncated:
+            text = text[:TOKEN_ACCOUNTING_MAX_CHARS]
+        return text, {
+            "media_blocks_excluded": media_blocks,
+            "truncated": truncated,
+            "counted_chars": len(text),
+            "tokenizer": "o200k_base",
+        }
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        # FastMCP's own conversion/validation remains authoritative.
+        result = await super().call_tool(name, arguments)
+        thread_id = self._thread_id(arguments)
+        if not thread_id or thread_id == "default":
+            return result
+        try:
+            call_text, call_metadata = self._text_for_token_accounting(
+                {"name": name, "arguments": arguments}
+            )
+            result_text, result_metadata = self._text_for_token_accounting(result)
+            _record_usage_event(
+                thread_id,
+                event_type="mcp_tool_loop",
+                source="proxy_estimate",
+                input_tokens=_estimate_tokens(result_text),
+                output_tokens=_estimate_tokens(call_text),
+                is_exact=False,
+                request_id=f"mcp-{_now_ms()}-{uuid.uuid4().hex[:12]}",
+                metadata={
+                    "tool_name": name,
+                    "output": call_metadata,
+                    "input": result_metadata,
+                    "meaning": {
+                        "output_tokens": "estimated text emitted by the model as this MCP tool call",
+                        "input_tokens": "estimated textual tool result available to the next model turn",
+                    },
+                },
+            )
+        except Exception:
+            # Token accounting is best-effort diagnostics, never an execution gate.
+            pass
+        return result
+
+
+mcp = AccountingFastMCP(
+    "Terminal GPT Experimental",
+    instructions="Startup context is initialized after tool registration.",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=(os.environ.get("MCP_DNS_REBINDING_PROTECTION", "0") == "1")
     ),
@@ -63,6 +156,7 @@ class SessionState:
     updated_at: float = field(default_factory=time.time)
     command_count: int = 0
     context_fingerprints: dict[str, str] = field(default_factory=dict)
+    bootstrapped_at: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 @dataclass
@@ -77,6 +171,54 @@ class ProcessState:
     stderr_lines: deque[str] = field(default_factory=lambda: deque(maxlen=PROCESS_BUFFER_LINES))
     stdout_closed: bool = False
     stderr_closed: bool = False
+    unit_name: str | None = None
+
+
+@dataclass
+class StreamCapture:
+    """Bound output in RAM; spill only large output while preserving a useful tail."""
+    request_id: str
+    label: str
+    memory_limit: int
+    _chunks: list[str] = field(default_factory=list)
+    _chars: int = 0
+    _total: int = 0
+    _tail: deque[str] = field(default_factory=deque)
+    _tail_chars: int = 0
+    _path: str | None = None
+    _file: Any = None
+
+    def append(self, value: str) -> None:
+        if not value:
+            return
+        self._total += len(value)
+        self._tail.append(value)
+        self._tail_chars += len(value)
+        while self._tail and self._tail_chars > self.memory_limit:
+            removed = self._tail.popleft()
+            self._tail_chars -= len(removed)
+        if self._file is None and self._chars + len(value) <= self.memory_limit:
+            self._chunks.append(value)
+            self._chars += len(value)
+            return
+        if self._file is None:
+            self._path = _write_log_file(self.request_id, self.label.lower(), "".join(self._chunks))
+            self._file = open(self._path, "a", encoding="utf-8", errors="replace")
+            self._chunks.clear()
+            self._chars = 0
+        self._file.write(value)
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def text(self, max_chars: int) -> tuple[str, str | None]:
+        self.close()
+        if self._path is None:
+            return "".join(self._chunks), None
+        kept = "".join(self._tail)[-max(1, max_chars):]
+        return (f"[output streamed to disk: kept last {min(len(kept), max_chars)} of {self._total} chars; full {self.label} saved to {self._path}]\n{kept}", self._path)
 
 
 @dataclass
@@ -122,7 +264,8 @@ class BearerAuthMiddleware:
         self.token = token
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http":
+        path = str(scope.get("path", ""))
+        if scope.get("type") != "http" or path == "/dashboard" or path.startswith("/dashboard/"):
             await self.app(scope, receive, send)
             return
 
@@ -159,6 +302,62 @@ def _now_ms() -> int:
 def _normalize_session_id(session_id: str | None) -> str:
     normalized = (session_id or "default").strip()
     return (normalized or "default")[:128]
+
+
+def _gpt_home() -> Path:
+    return GPT_STORE.home()
+
+
+def _gpt_agents_path() -> Path:
+    return GPT_STORE.agents_path()
+
+
+def _thread_db_path() -> Path:
+    return GPT_STORE.db_path()
+
+
+def _ensure_gpt_layout() -> Path:
+    return GPT_STORE.ensure_layout()
+
+
+def _estimate_tokens(text: str) -> int:
+    return GPT_STORE.estimate_tokens(text)
+
+
+def _upsert_thread_record(thread_id: str, cwd: Path, fingerprint: str = "", loaded: bool = False) -> None:
+    GPT_STORE.upsert_thread(thread_id, cwd, fingerprint, loaded=loaded)
+
+
+def _record_usage_event(
+    thread_id: str,
+    *,
+    event_type: str,
+    source: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_input_tokens: int = 0,
+    is_exact: bool = False,
+    model: str = "",
+    request_id: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    return GPT_STORE.record_usage(
+        thread_id,
+        event_type=event_type,
+        source=source,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
+        is_exact=is_exact,
+        model=model,
+        request_id=request_id,
+        metadata=metadata,
+    )
+
+
+def _usage_summary(thread_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+    return GPT_STORE.usage_summary(thread_id, limit)
+
 
 def _format_timestamp(value: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
@@ -250,6 +449,90 @@ async def _terminate_process_group(process: asyncio.subprocess.Process, grace_se
         except ProcessLookupError:
             return
     await process.wait()
+
+
+def _safe_unit_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-.")[:48] or "task"
+
+
+def _systemd_workload_prefix(session_id: str, request_id: str) -> tuple[list[str], str | None]:
+    """Launch workload commands outside the MCP service cgroup when supported."""
+    if WORKLOAD_ISOLATION == "off" or shutil.which("systemd-run") is None:
+        return [], None
+    unit = f"mcp-workload-{_safe_unit_component(session_id)}-{_safe_unit_component(request_id)}.scope"
+    args = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", "--slice=mcp-workloads.slice"]
+    if WORKLOAD_MEMORY_MAX:
+        args.extend(["-p", f"MemoryMax={WORKLOAD_MEMORY_MAX}"])
+    if WORKLOAD_CPU_QUOTA:
+        args.extend(["-p", f"CPUQuota={WORKLOAD_CPU_QUOTA}"])
+    if WORKLOAD_TASKS_MAX:
+        args.extend(["-p", f"TasksMax={WORKLOAD_TASKS_MAX}"])
+    return args + ["--"], unit
+
+
+async def _spawn_workload(
+    args: list[str], *, shell: bool, session: SessionState, request_id: str,
+    cwd: Path, env: dict[str, str] | None, stdin: int | None = None,
+) -> tuple[asyncio.subprocess.Process, str | None]:
+    prefix, unit = _systemd_workload_prefix(session.session_id, request_id)
+    if prefix:
+        try:
+            return await asyncio.create_subprocess_exec(
+                *prefix, *args, cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            ), unit
+        except (FileNotFoundError, OSError):
+            if WORKLOAD_ISOLATION == "required":
+                raise
+    if WORKLOAD_ISOLATION == "required":
+        raise RuntimeError("MCP workload isolation is required but systemd-run is unavailable")
+    if shell:
+        return await asyncio.create_subprocess_shell(
+            args[-1], cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            executable=SHELL, start_new_session=True,
+        ), None
+    return await asyncio.create_subprocess_exec(
+        *args, cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    ), None
+
+
+async def _stop_workload(process: asyncio.subprocess.Process, unit_name: str | None) -> None:
+    if unit_name and shutil.which("systemctl"):
+        control = await asyncio.create_subprocess_exec("systemctl", "--user", "stop", unit_name, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await control.wait()
+    await _terminate_process_group(process)
+
+
+async def _capture_stream(stream: asyncio.StreamReader | None, capture: StreamCapture) -> None:
+    if stream is None:
+        return
+    while chunk := await stream.read(16 * 1024):
+        capture.append(chunk.decode("utf-8", errors="replace"))
+
+
+async def _collect_bounded_output(process: asyncio.subprocess.Process, request_id: str, timeout: int | None, unit_name: str | None = None) -> tuple[StreamCapture, StreamCapture, bool]:
+    stdout = StreamCapture(request_id, "STDOUT", CAPTURE_MEMORY_CHARS)
+    stderr = StreamCapture(request_id, "STDERR", CAPTURE_MEMORY_CHARS)
+    drains = [asyncio.create_task(_capture_stream(process.stdout, stdout)), asyncio.create_task(_capture_stream(process.stderr, stderr))]
+    timed_out = False
+    try:
+        if timeout and timeout > 0:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        else:
+            await process.wait()
+    except asyncio.TimeoutError:
+        timed_out = True
+    finally:
+        if timed_out:
+            await _stop_workload(process, unit_name)
+        await asyncio.gather(*drains, return_exceptions=True)
+        stdout.close()
+        stderr.close()
+    return stdout, stderr, timed_out
 
 async def _drain_stream(stream: asyncio.StreamReader | None, sink: deque[str], close_attr: str, state: ProcessState) -> None:
     if stream is None:
@@ -367,7 +650,7 @@ def _agent_paths(root: Path, agent_id: str) -> dict[str, Path]:
         "handoff": agent_dir / "HANDOFF.md",
         "state": agent_dir / "STATE.json",
         "lock": base / ".lock",
-        "agents_md": root / "AGENTS.md",
+        "agents_md": root / ".GPT" / "AGENTS.md",
     }
 
 def _ensure_agent_files(paths: dict[str, Path], agent_id: str) -> None:
@@ -515,68 +798,36 @@ def _find_project_root(cwd: Path) -> Path:
 
 
 def _applicable_agents_files(cwd: Path) -> tuple[Path, list[Path]]:
-    cwd = cwd.resolve()
-    root = _find_project_root(cwd)
-    files: list[Path] = []
-    global_override = Path.home() / ".codex" / "AGENTS.override.md"
-    global_normal = Path.home() / ".codex" / "AGENTS.md"
-    if global_override.is_file():
-        files.append(global_override)
-    elif global_normal.is_file():
-        files.append(global_normal)
-
-    chain: list[Path] = [root]
-    if cwd != root:
-        try:
-            relative = cwd.relative_to(root)
-            current = root
-            for part in relative.parts:
-                current = current / part
-                chain.append(current)
-        except ValueError:
-            chain = [cwd]
-    for directory in chain:
-        override = directory / "AGENTS.override.md"
-        normal = directory / "AGENTS.md"
-        if override.is_file():
-            files.append(override)
-        elif normal.is_file():
-            files.append(normal)
-    return root, files
+    return GPT_STORE.applicable_agents_files(cwd, _find_project_root)
 
 
 def _agents_snapshot(cwd: Path) -> tuple[Path, list[tuple[Path, str]], str]:
-    root, paths = _applicable_agents_files(cwd)
-    rows: list[tuple[Path, str]] = []
-    digest = hashlib.sha256()
-    digest.update(str(root).encode())
-    digest.update(b"\0")
-    digest.update(str(cwd.resolve()).encode())
-    digest.update(b"\0")
-    for item in paths:
-        try:
-            content = item.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            content = f"[unreadable: {type(exc).__name__}]"
-        rows.append((item, content))
-        digest.update(str(item.resolve()).encode("utf-8", errors="replace"))
-        digest.update(b"\0")
-        digest.update(content.encode("utf-8", errors="replace"))
-        digest.update(b"\0")
-    return root, rows, digest.hexdigest()
+    return GPT_STORE.agents_snapshot(cwd, _find_project_root)
 
 
 def _context_key(cwd: Path) -> str:
     return str(cwd.resolve())
 
 
-def _context_gate_error(root: Path, cwd: Path, rows: list[tuple[Path, str]]) -> str:
+def _context_gate_error(
+    root: Path,
+    cwd: Path,
+    rows: list[tuple[Path, str]],
+    session_id: str,
+) -> str:
     listed = "\n".join(f"- {path}" for path, _ in rows) or "- none"
+    identity_note = (
+        "The shared session_id='default' is intentionally rejected by this experimental server.\n"
+        "Choose a unique stable thread_id, call bootstrap_thread(thread_id=...), and reuse it as session_id.\n\n"
+        if session_id == "default"
+        else ""
+    )
     return (
-        "Project context has not been loaded, or an applicable AGENTS.md changed.\n"
+        "GPT thread context has not been loaded, or an applicable .GPT/AGENTS.md changed.\n"
         "No action was executed.\n\n"
-        "Call project_context with this cwd, follow the returned instructions, then retry.\n\n"
-        f"Project Root: {root}\nWorking Directory: {cwd}\nApplicable Files:\n{listed}"
+        + identity_note
+        + "Call bootstrap_thread or get_thread_context with this cwd, follow every returned instruction, then retry.\n\n"
+        + f"Thread/Session ID: {session_id}\nProject Root: {root}\nWorking Directory: {cwd}\nApplicable Files:\n{listed}"
     )
 
 
@@ -584,11 +835,10 @@ def _require_project_context(session: SessionState, cwd: Path) -> str | None:
     cwd = cwd.resolve()
     root, rows, fingerprint = _agents_snapshot(cwd)
     key = _context_key(cwd)
-    if not rows:
-        session.context_fingerprints[key] = fingerprint
-        return None
+    if session.session_id == "default":
+        return _context_gate_error(root, cwd, rows, session.session_id)
     if session.context_fingerprints.get(key) != fingerprint:
-        return _context_gate_error(root, cwd, rows)
+        return _context_gate_error(root, cwd, rows, session.session_id)
     return None
 
 
@@ -637,6 +887,8 @@ def _skill_summary(content: str, fields: dict[str, str]) -> str:
 
 def _skill_roots(root: Path) -> list[tuple[str, Path]]:
     candidates = [
+        ("project-gpt", root / ".GPT" / "skills"),
+        ("user-gpt", _gpt_home() / "skills"),
         ("project-codex", root / ".codex" / "skills"),
         ("project-agents", root / ".agents" / "skills"),
         ("project-skills", root / "skills"),
@@ -700,6 +952,9 @@ async def local_skills(
     """Dynamically list, read, or search project and machine-local SKILL.md files."""
     session = await _get_session(session_id)
     run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     root = _find_project_root(run_cwd)
     skills = _discover_skills(root)
     action = action.strip().lower()
@@ -1251,6 +1506,9 @@ async def local_mcp(
     """List, inspect, call, or reset configured MCP servers through persistent downstream connections."""
     session = await _get_session(session_id)
     run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     root = _find_project_root(run_cwd)
     servers = _discover_mcp_servers(root)
     action = action.strip().lower().replace("_", "-")
@@ -1274,10 +1532,6 @@ async def local_mcp(
             max_chars,
             "MCP list",
         )
-
-    gate = _require_project_context(session, run_cwd)
-    if gate:
-        return gate
 
     if action in {"reset", "close"}:
         if not server:
@@ -1348,19 +1602,12 @@ async def run_command(
                 return gate
             marker = f"__MCP_PWD_{uuid.uuid4().hex}__"
             modified = f"{command}\n\nprintf '\\n{marker}:%s\\n' \"$PWD\""
-            process = await asyncio.create_subprocess_shell(
-                modified,
-                cwd=str(run_cwd),
-                env=_build_env(session, env),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                executable=SHELL,
-                start_new_session=True,
+            process, unit_name = await _spawn_workload(
+                [SHELL, "-lc", modified], shell=True, session=session, request_id=request_id,
+                cwd=run_cwd, env=env,
             )
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                await _terminate_process_group(process)
+            stdout_capture, stderr_capture, timed_out = await _collect_bounded_output(process, request_id, timeout, unit_name)
+            if timed_out:
                 return "\n\n".join([
                     f"Request ID: {request_id}",
                     f"Session ID: {session.session_id}",
@@ -1368,8 +1615,8 @@ async def run_command(
                     f"Duration: {time.time() - started:.2f}s",
                     f"Working Directory: {session.cwd}",
                 ])
-            stdout_raw = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-            stderr_raw = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+            stdout_raw, stdout_log = stdout_capture.text(max_output_chars)
+            stderr_raw, stderr_log = stderr_capture.text(max_output_chars)
             stdout_clean, new_cwd = _strip_pwd_marker(stdout_raw, marker)
             if new_cwd:
                 candidate = Path(new_cwd).expanduser()
@@ -1377,8 +1624,14 @@ async def run_command(
                     session.cwd = candidate.resolve()
             session.command_count += 1
             session.updated_at = time.time()
-            stdout_clean, stdout_log = _truncate_output("STDOUT", stdout_clean, request_id, max_output_chars)
-            stderr_clean, stderr_log = _truncate_output("STDERR", stderr_raw.rstrip(), request_id, max_output_chars)
+            if stdout_log:
+                extra_stdout_log = None
+            else:
+                stdout_clean, extra_stdout_log = _truncate_output("STDOUT", stdout_clean, request_id, max_output_chars)
+            if stderr_log:
+                extra_stderr_log = None
+            else:
+                stderr_clean, extra_stderr_log = _truncate_output("STDERR", stderr_raw.rstrip(), request_id, max_output_chars)
             response = [f"Request ID: {request_id}", f"Session ID: {session.session_id}"]
             if stdout_clean.strip():
                 response.append(f"STDOUT:\n{stdout_clean}")
@@ -1389,7 +1642,7 @@ async def run_command(
                 f"Duration: {time.time() - started:.2f}s",
                 f"Working Directory: {session.cwd}",
             ])
-            logs = [path for path in [stdout_log, stderr_log] if path]
+            logs = [path for path in [stdout_log, stderr_log, extra_stdout_log, extra_stderr_log] if path]
             if logs:
                 response.append("Full Output Logs:\n" + "\n".join(logs))
             return "\n\n".join(response)
@@ -1447,6 +1700,9 @@ async def set_session_env(name: str, value: str, session_id: str = "default") ->
     """Set an environment variable override for future commands in a session."""
     session = await _get_session(session_id)
     async with session.lock:
+        gate = _require_project_context(session, session.cwd.resolve())
+        if gate:
+            return gate
         session.env[str(name)] = str(value)
         session.updated_at = time.time()
         return f"Set {name} for session {session.session_id}."
@@ -1469,31 +1725,36 @@ async def start_process(command: str, session_id: str = "default", cwd: str | No
         gate = _require_project_context(session, run_cwd)
         if gate:
             return gate
-        process = await asyncio.create_subprocess_shell(
-            command,
-            cwd=str(run_cwd),
-            env=_build_env(session, env),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            executable=SHELL,
-            start_new_session=True,
-        )
         process_id = f"proc-{_now_ms()}-{uuid.uuid4().hex[:8]}"
-        state = ProcessState(process_id, session.session_id, command, run_cwd, process)
+        process, unit_name = await _spawn_workload(
+            [SHELL, "-lc", command], shell=True, session=session, request_id=process_id,
+            cwd=run_cwd, env=env, stdin=asyncio.subprocess.PIPE,
+        )
+        state = ProcessState(process_id, session.session_id, command, run_cwd, process, unit_name=unit_name)
         async with state_lock:
             processes[process_id] = state
         asyncio.create_task(_drain_stream(process.stdout, state.stdout_lines, "stdout_closed", state))
         asyncio.create_task(_drain_stream(process.stderr, state.stderr_lines, "stderr_closed", state))
         session.updated_at = time.time()
-        return "\n".join([f"Process ID: {process_id}", f"Session ID: {session.session_id}", f"PID: {process.pid}", f"Command: {command}", f"Working Directory: {run_cwd}", "Status: running"])
+        return "\n".join([f"Process ID: {process_id}", f"Session ID: {session.session_id}", f"PID: {process.pid}", f"Workload Unit: {unit_name or 'process-group'}", f"Command: {command}", f"Working Directory: {run_cwd}", "Status: running"])
 
 @mcp.tool()
-async def poll_process(process_id: str, max_lines: int = 200) -> str:
-    """Read buffered stdout/stderr from a background process."""
+async def poll_process(
+    process_id: str,
+    max_lines: int = 200,
+    session_id: str = "default",
+) -> str:
+    """Read buffered output from a background process owned by this bootstrapped thread."""
+    session = await _get_session(session_id)
+    gate = _require_project_context(session, session.cwd.resolve())
+    if gate:
+        return gate
     async with state_lock:
         state = processes.get(process_id)
-    return f"Error: Unknown process_id: {process_id}" if state is None else _format_process(state, max_lines)
+    if state is None or state.session_id != session.session_id:
+        return f"Error: process_id is unknown or not owned by session {session.session_id}: {process_id}"
+    return _format_process(state, max_lines)
+
 
 @_hidden_tool()
 async def write_process(process_id: str, input_text: str) -> str:
@@ -1511,14 +1772,19 @@ async def write_process(process_id: str, input_text: str) -> str:
     return f"Wrote {len(input_text)} chars to {process_id}."
 
 @mcp.tool()
-async def stop_process(process_id: str) -> str:
-    """Stop a background process."""
+async def stop_process(process_id: str, session_id: str = "default") -> str:
+    """Stop a background process owned by this bootstrapped thread."""
+    session = await _get_session(session_id)
+    gate = _require_project_context(session, session.cwd.resolve())
+    if gate:
+        return gate
     async with state_lock:
         state = processes.get(process_id)
-    if state is None:
-        return f"Error: Unknown process_id: {process_id}"
-    await _terminate_process_group(state.process)
+    if state is None or state.session_id != session.session_id:
+        return f"Error: process_id is unknown or not owned by session {session.session_id}: {process_id}"
+    await _stop_workload(state.process, state.unit_name)
     return _format_process(state, max_lines=80)
+
 
 @_hidden_tool()
 async def list_processes(session_id: str | None = None) -> str:
@@ -1531,38 +1797,283 @@ async def list_processes(session_id: str | None = None) -> str:
     return "\n".join(f"{p.process_id}\t{_process_status(p)}\tpid={p.process.pid}\tsession={p.session_id}\tcwd={p.cwd}\tcmd={p.command}" for p in sorted(selected, key=lambda item: item.started_at))
 
 
-@mcp.tool()
-async def project_context(
-    session_id: str = "default",
-    cwd: str | None = None,
-    max_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
-) -> str:
-    """Load every applicable AGENTS.md instruction and satisfy the execution gate for this cwd."""
-    session = await _get_session(session_id)
-    run_cwd = _operation_cwd(session, cwd)
+def _public_tool_manifest() -> list[dict[str, str]]:
+    order = tuple(globals().get("PUBLIC_TOOL_ORDER", tuple(mcp._tool_manager._tools.keys())))
+    rows: list[dict[str, str]] = []
+    for name in order:
+        function = globals().get(name)
+        description = ""
+        if function is not None:
+            description = " ".join((function.__doc__ or "").strip().split())
+        if not description:
+            tool = mcp._tool_manager._tools.get(name)
+            description = " ".join((getattr(tool, "description", "") or "").strip().split())
+        rows.append({"name": name, "description": description})
+    return rows
+
+
+def _configured_mcp_manifest(root: Path) -> list[dict[str, str]]:
+    return [
+        _public_mcp_summary(name, config)
+        for name, config in sorted(_discover_mcp_servers(root).items())
+    ]
+
+
+def _build_thread_context_document(
+    thread_id: str,
+    run_cwd: Path,
+) -> tuple[str, Path, list[tuple[Path, str]], str]:
     root, rows, fingerprint = _agents_snapshot(run_cwd)
+    skills = _discover_skills(root)
+    tools = _public_tool_manifest()
+    nested_servers = _configured_mcp_manifest(root)
+
     parts = [
-        f"Session ID: {session.session_id}",
+        "[Terminal GPT Thread Bootstrap]",
+        "MANDATORY: Follow every instruction below strictly for the lifetime of this model thread.",
+        "MANDATORY: Reuse this thread ID as session_id in every later Terminal GPT tool call.",
+        "MANDATORY: If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
+        "",
+        f"Thread ID: {thread_id}",
         f"Working Directory: {run_cwd}",
         f"Project Root: {root}",
+        f"GPT Home: {_gpt_home()}",
+        f"Usage Database: {_thread_db_path()}",
         f"Context Fingerprint: {fingerprint}",
-        f"Applicable Files: {len(rows)}",
+        f"Applicable GPT Instruction Files: {len(rows)}",
         "",
+        "## Mandatory GPT instructions",
     ]
     if rows:
         for path, content in rows:
             parts.extend([f"===== {path} =====", content.rstrip(), ""])
     else:
-        parts.append("No applicable AGENTS.md or AGENTS.override.md files were found.")
-    full = "\n".join(parts).rstrip()
+        parts.extend([
+            "No GPT AGENTS file was found. This should normally be repaired by bootstrap_thread.",
+            "",
+        ])
+
+    parts.extend([f"## Available skills ({len(skills)})"])
+    if skills:
+        for skill in skills:
+            description = skill["description"] or "No description provided. Read the skill before use."
+            parts.append(
+                f"- {skill['name']} [{skill['source']}]: {description} (path: {skill['path']})"
+            )
+    else:
+        parts.append("- No SKILL.md files discovered.")
+
+    parts.extend(["", f"## Public Terminal GPT tools ({len(tools)})"])
+    for tool in tools:
+        parts.append(f"- {tool['name']}: {tool['description'] or 'No description provided.'}")
+
+    parts.extend(["", f"## Configured nested MCP servers ({len(nested_servers)})"])
+    if nested_servers:
+        for server in nested_servers:
+            parts.append(
+                f"- {server['name']}: transport={server['transport']}, endpoint={server['endpoint']}. "
+                "Use local_mcp(action='tools', server=...) before invoking nested tools."
+            )
+    else:
+        parts.append("- No nested MCP servers discovered.")
+
+    parts.extend([
+        "",
+        "## Context recovery and accounting",
+        "- bootstrap_thread: initialize a genuinely new model thread.",
+        "- get_thread_context: reload the complete context after compaction or uncertainty.",
+        "- context_manifest: inspect fingerprints, files, skills, tools, and nested MCP names without loading full instruction bodies.",
+        "- refresh_startup_context: rebuild MCP initialization instructions for future client initializations.",
+        "- record_token_usage: store exact provider-reported input/output/cached-input usage.",
+        "- get_token_usage: retrieve exact and estimated totals separately.",
+        "",
+        "Token-accounting limitation: this MCP cannot independently observe the host model's complete prompt or response usage. "
+        "Exact model totals require the host/runtime to call record_token_usage with provider-reported values. "
+        "Any bootstrap token count stored automatically is explicitly marked as a server estimate.",
+    ])
+    return "\n".join(parts).rstrip(), root, rows, fingerprint
+
+
+async def _load_thread_context(
+    thread_id: str,
+    cwd: str | None,
+    max_chars: int,
+    event_type: str,
+) -> str:
+    _ensure_gpt_layout()
+    normalized = _normalize_session_id(thread_id)
+    if normalized == "default":
+        return (
+            "Error: thread_id must be a unique, stable non-default identifier. "
+            "Generate one for this model thread and reuse it as session_id on every later call."
+        )
+    session = await _get_session(normalized)
+    run_cwd = _resolve_cwd(cwd, session.cwd) if cwd else session.cwd.resolve()
+    full, root, rows, fingerprint = _build_thread_context_document(normalized, run_cwd)
     if max_chars > 0 and len(full) > max_chars:
         return full[:max_chars] + (
             f"\n\n[Context truncated to {max_chars} of {len(full)} chars. Context gate remains unsatisfied. "
-            "Call project_context again with a larger max_chars.]"
+            "Call get_thread_context again with a larger max_chars.]"
         )
+
+    session.cwd = run_cwd
     session.context_fingerprints[_context_key(run_cwd)] = fingerprint
+    session.bootstrapped_at = time.time()
     session.updated_at = time.time()
-    return full + "\n\nContext Gate: satisfied"
+    _upsert_thread_record(normalized, run_cwd, fingerprint, loaded=True)
+    estimated_tokens = _estimate_tokens(full)
+    _record_usage_event(
+        normalized,
+        event_type=event_type,
+        source="server_estimate",
+        input_tokens=estimated_tokens,
+        is_exact=False,
+        request_id=f"{event_type}-{_now_ms()}-{uuid.uuid4().hex[:8]}",
+        metadata={
+            "chars": len(full),
+            "estimation_method": "utf8_bytes_div_4",
+            "project_root": str(root),
+            "instruction_files": [str(path) for path, _ in rows],
+            "context_fingerprint": fingerprint,
+        },
+    )
+    return full + f"\n\nContext Gate: satisfied\nEstimated Context Input Tokens: {estimated_tokens}"
+
+
+@mcp.tool()
+async def bootstrap_thread(
+    thread_id: str,
+    cwd: str | None = None,
+    max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
+) -> str:
+    """Initialize a new model thread with .GPT instructions, all discovered skills, public tools, nested MCP names, and a persistent context fingerprint."""
+    return await _load_thread_context(thread_id, cwd, max_chars, "thread_bootstrap")
+
+
+@mcp.tool()
+async def get_thread_context(
+    thread_id: str,
+    cwd: str | None = None,
+    max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
+) -> str:
+    """Reload the complete GPT thread context after compaction, instruction changes, or uncertainty."""
+    return await _load_thread_context(thread_id, cwd, max_chars, "thread_context_reload")
+
+
+@mcp.tool()
+async def context_manifest(
+    thread_id: str = "",
+    cwd: str | None = None,
+) -> str:
+    """Return a compact manifest of GPT instruction files, skills, public tools, nested MCP servers, fingerprints, and storage paths."""
+    _ensure_gpt_layout()
+    normalized = _normalize_session_id(thread_id) if thread_id else ""
+    if cwd:
+        run_cwd = _resolve_cwd(cwd, WORKSPACE_DIR)
+    elif normalized and normalized in sessions:
+        run_cwd = sessions[normalized].cwd.resolve()
+    else:
+        run_cwd = WORKSPACE_DIR.resolve()
+    root, rows, fingerprint = _agents_snapshot(run_cwd)
+    skills = _discover_skills(root)
+    payload = {
+        "thread_id": normalized or None,
+        "working_directory": str(run_cwd),
+        "project_root": str(root),
+        "gpt_home": str(_gpt_home()),
+        "usage_database": str(_thread_db_path()),
+        "context_fingerprint": fingerprint,
+        "instruction_files": [str(path) for path, _ in rows],
+        "skills": [
+            {
+                "name": skill["name"],
+                "source": skill["source"],
+                "description": skill["description"],
+                "path": skill["path"],
+            }
+            for skill in skills
+        ],
+        "public_tools": _public_tool_manifest(),
+        "nested_mcp_servers": _configured_mcp_manifest(root),
+        "recovery_tools": [
+            "bootstrap_thread",
+            "get_thread_context",
+            "context_manifest",
+            "refresh_startup_context",
+            "record_token_usage",
+            "get_token_usage",
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+@mcp.tool()
+async def refresh_startup_context() -> str:
+    """Rebuild MCP initialization instructions from the current ~/.GPT/AGENTS.md, skill manifest, tool manifest, and nested MCP list."""
+    instructions = _set_startup_instructions()
+    return json.dumps(
+        {
+            "status": "refreshed",
+            "characters": len(instructions),
+            "estimated_tokens": _estimate_tokens(instructions),
+            "applies_to": "future MCP client initializations; existing threads should call get_thread_context",
+            "gpt_agents": str(_gpt_agents_path()),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+async def record_token_usage(
+    thread_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+    model: str = "",
+    request_id: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Record exact model token usage reported by the host/provider for one thread response."""
+    normalized = _normalize_session_id(thread_id)
+    if normalized == "default":
+        return "Error: thread_id must be a unique non-default identifier."
+    try:
+        event_id = _record_usage_event(
+            normalized,
+            event_type="model_usage",
+            source="host_reported",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            is_exact=True,
+            model=model,
+            request_id=request_id,
+            metadata=metadata,
+        )
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        return f"Error recording token usage: {exc}"
+    summary = _usage_summary(normalized, limit=10)
+    return json.dumps({"event_id": event_id, **summary}, indent=2)
+
+
+@mcp.tool()
+async def get_token_usage(
+    thread_id: str = "",
+    limit: int = 100,
+) -> str:
+    """Return per-thread or global exact and estimated token-usage totals with recent events."""
+    normalized = _normalize_session_id(thread_id) if thread_id else None
+    return json.dumps(_usage_summary(normalized, limit=limit), indent=2)
+
+
+@mcp.tool()
+async def project_context(
+    session_id: str = "default",
+    cwd: str | None = None,
+    max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
+) -> str:
+    """Compatibility alias that loads the complete GPT thread context using session_id as the stable thread identity."""
+    return await _load_thread_context(session_id, cwd, max_chars, "project_context_reload")
 
 
 @_hidden_tool()
@@ -1864,23 +2375,16 @@ async def _run_agent_cli(
 ) -> str:
     request_id = f"agent-{_now_ms()}-{uuid.uuid4().hex[:8]}"
     started = time.time()
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(run_cwd),
-        env=_build_env(session, env),
+    process, unit_name = await _spawn_workload(
+        args, shell=False, session=session, request_id=request_id, cwd=run_cwd, env=env,
         stdin=asyncio.subprocess.PIPE if prompt_stdin is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
     )
-    try:
-        communicate = process.communicate(prompt_stdin.encode("utf-8") if prompt_stdin is not None else None)
-        if timeout and timeout > 0:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(communicate, timeout=timeout)
-        else:
-            stdout_bytes, stderr_bytes = await communicate
-    except asyncio.TimeoutError:
-        await _terminate_process_group(process)
+    if prompt_stdin is not None and process.stdin is not None:
+        process.stdin.write(prompt_stdin.encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+    stdout_capture, stderr_capture, timed_out = await _collect_bounded_output(process, request_id, timeout, unit_name)
+    if timed_out:
         return "\n\n".join([
             f"Request ID: {request_id}",
             f"Command: {_command_display(args)}",
@@ -1888,10 +2392,18 @@ async def _run_agent_cli(
             f"Duration: {time.time() - started:.2f}s",
             f"Working Directory: {run_cwd}",
         ])
-    stdout = stdout_bytes.decode("utf-8", errors="replace").rstrip() if stdout_bytes else ""
-    stderr = stderr_bytes.decode("utf-8", errors="replace").rstrip() if stderr_bytes else ""
-    stdout, stdout_log = _truncate_output("STDOUT", stdout, request_id, max_output_chars)
-    stderr, stderr_log = _truncate_output("STDERR", stderr, request_id, max_output_chars)
+    stdout, stdout_log = stdout_capture.text(max_output_chars)
+    stderr, stderr_log = stderr_capture.text(max_output_chars)
+    if stdout_log:
+        stdout = stdout.rstrip()
+        extra_stdout_log = None
+    else:
+        stdout, extra_stdout_log = _truncate_output("STDOUT", stdout.rstrip(), request_id, max_output_chars)
+    if stderr_log:
+        stderr = stderr.rstrip()
+        extra_stderr_log = None
+    else:
+        stderr, extra_stderr_log = _truncate_output("STDERR", stderr.rstrip(), request_id, max_output_chars)
     response = [
         f"Request ID: {request_id}",
         f"Command: {_command_display(args)}",
@@ -1903,7 +2415,7 @@ async def _run_agent_cli(
         response.append(f"STDOUT:\n{stdout}")
     if stderr.strip():
         response.append(f"STDERR:\n{stderr}")
-    logs = [path for path in [stdout_log, stderr_log] if path]
+    logs = [path for path in [stdout_log, stderr_log, extra_stdout_log, extra_stderr_log] if path]
     if logs:
         response.append("Full Output Logs:\n" + "\n".join(logs))
     return "\n\n".join(response)
@@ -1915,17 +2427,12 @@ async def _start_agent_cli(
     session: SessionState,
     env: dict[str, str] | None,
 ) -> str:
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(run_cwd),
-        env=_build_env(session, env),
-        stdin=asyncio.subprocess.PIPE if prompt_stdin is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
     process_id = f"proc-{_now_ms()}-{uuid.uuid4().hex[:8]}"
-    state = ProcessState(process_id, session.session_id, _command_display(args), run_cwd, process)
+    process, unit_name = await _spawn_workload(
+        args, shell=False, session=session, request_id=process_id, cwd=run_cwd, env=env,
+        stdin=asyncio.subprocess.PIPE if prompt_stdin is not None else None,
+    )
+    state = ProcessState(process_id, session.session_id, _command_display(args), run_cwd, process, unit_name=unit_name)
     async with state_lock:
         processes[process_id] = state
     asyncio.create_task(_drain_stream(process.stdout, state.stdout_lines, "stdout_closed", state))
@@ -1939,6 +2446,7 @@ async def _start_agent_cli(
         f"Process ID: {process_id}",
         f"Session ID: {session.session_id}",
         f"PID: {process.pid}",
+        f"Workload Unit: {unit_name or 'process-group'}",
         f"Command: {_command_display(args)}",
         f"Working Directory: {run_cwd}",
         "Status: running",
@@ -2035,6 +2543,10 @@ async def start_agy_yolo(
 async def stat_path(path: str, session_id: str = "default", cwd: str | None = None) -> str:
     """Return metadata for a file or directory without using shell commands."""
     session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     target = _resolve_path(path, session, cwd)
     if not target.exists():
         return f"Path: {target}\nExists: false"
@@ -2058,6 +2570,10 @@ async def list_dir(
 ) -> str:
     """List directory entries without using shell commands."""
     session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     root = _resolve_path(path, session, cwd)
     if not root.exists():
         return f"Error: path does not exist: {root}"
@@ -2090,6 +2606,10 @@ async def read_file(
 ) -> str:
     """Read a text file directly, with optional line range and truncation."""
     session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
     target = _resolve_path(path, session, cwd)
     if not target.exists():
         return f"Error: file does not exist: {target}"
@@ -2110,6 +2630,143 @@ async def read_file(
     if truncated_by_chars:
         header.append(f"Char Limit: {max_chars}")
     return "\n".join(header + ["", body])
+
+
+def _watch_image_error(message: str) -> mcp_types.CallToolResult:
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=message)],
+        isError=True,
+    )
+
+
+def _gif_frame_count(data: bytes) -> int | None:
+    """Return GIF image-frame count, or None when the file structure is invalid."""
+    if len(data) < 13 or data[:6] not in {b"GIF87a", b"GIF89a"}:
+        return None
+    offset = 13
+    packed = data[10]
+    if packed & 0x80:
+        offset += 3 * (2 ** ((packed & 0x07) + 1))
+    frames = 0
+
+    def skip_sub_blocks(position: int) -> int | None:
+        while position < len(data):
+            size = data[position]
+            position += 1
+            if size == 0:
+                return position
+            position += size
+            if position > len(data):
+                return None
+        return None
+
+    while offset < len(data):
+        marker = data[offset]
+        if marker == 0x3B:  # trailer
+            return frames
+        if marker == 0x21:  # extension block
+            if offset + 2 > len(data):
+                return None
+            offset = skip_sub_blocks(offset + 2)
+            if offset is None:
+                return None
+            continue
+        if marker == 0x2C:  # image descriptor
+            if offset + 10 > len(data):
+                return None
+            descriptor_packed = data[offset + 9]
+            offset += 10
+            if descriptor_packed & 0x80:
+                offset += 3 * (2 ** ((descriptor_packed & 0x07) + 1))
+            if offset >= len(data):
+                return None
+            offset += 1  # LZW minimum code size
+            offset = skip_sub_blocks(offset)
+            if offset is None:
+                return None
+            frames += 1
+            continue
+        return None
+    return None
+
+
+def _watch_image_mime(data: bytes) -> tuple[str | None, str | None]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", None
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", None
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", None
+    if data[:6] in {b"GIF87a", b"GIF89a"}:
+        frames = _gif_frame_count(data)
+        if frames is None:
+            return None, "Error: malformed GIF image."
+        if frames != 1:
+            return None, f"Error: animated GIFs are not supported; detected {frames} image frames."
+        return "image/gif", None
+    return None, "Error: unsupported image format. Supported formats: PNG, JPEG, WEBP, and non-animated GIF."
+
+
+@mcp.tool(
+    annotations=mcp_types.ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+async def watch_image(
+    path: str,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> mcp_types.CallToolResult:
+    """Return a local image as native MCP ImageContent so the model can inspect it visually."""
+    session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return _watch_image_error(gate)
+
+    target = _resolve_path(path, session, cwd)
+    if not target.exists():
+        return _watch_image_error(f"Error: image file does not exist: {target}")
+    if not target.is_file():
+        return _watch_image_error(f"Error: image path is not a regular file: {target}")
+
+    max_bytes = max(1, WATCH_IMAGE_MAX_BYTES)
+    try:
+        with target.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError as exc:
+        return _watch_image_error(f"Error reading image {target}: {type(exc).__name__}: {exc}")
+
+    if not data:
+        return _watch_image_error(f"Error: image file is empty: {target}")
+    if len(data) > max_bytes:
+        return _watch_image_error(
+            f"Error: image exceeds MCP_WATCH_IMAGE_MAX_BYTES ({max_bytes} bytes): {target}"
+        )
+
+    mime_type, error = _watch_image_mime(data)
+    if error or mime_type is None:
+        return _watch_image_error(f"{error or 'Error: unsupported image format.'}\nPath: {target}")
+
+    encoded = base64.b64encode(data).decode("ascii")
+    return mcp_types.CallToolResult(
+        content=[
+            mcp_types.ImageContent(type="image", data=encoded, mimeType=mime_type),
+            mcp_types.TextContent(
+                type="text",
+                text=(
+                    f"Image path: {target}\n"
+                    f"MIME type: {mime_type}\n"
+                    f"Bytes: {len(data)}\n"
+                    "Payload: original file bytes"
+                ),
+            ),
+        ],
+        isError=False,
+    )
 
 @mcp.tool()
 async def write_file(
@@ -2261,27 +2918,103 @@ async def move_path(src: str, dst: str, session_id: str = "default", cwd: str | 
     return f"Moved: {source} -> {target}"
 
 
-# Keep discovery deterministic and intentionally small.  The server used to
-# expose implementation-era helpers; only this contract is public now.
+def _build_startup_instructions() -> str:
+    """Build the context sent in the MCP initialize result for each new client session."""
+    _ensure_gpt_layout()
+    run_cwd = WORKSPACE_DIR.resolve()
+    root = _find_project_root(run_cwd)
+    rows, fingerprint = GPT_STORE.global_agents_snapshot()
+    skills = _discover_skills(root)
+    tools = _public_tool_manifest()
+    nested_servers = _configured_mcp_manifest(root)
+    parts = [
+        "You are connected to the isolated Terminal GPT Experimental MCP.",
+        "STRICT REQUIREMENT: At the beginning of each genuinely new model thread, call bootstrap_thread with a unique stable thread_id before substantive terminal work.",
+        "Reuse that exact thread_id as session_id on every later tool call. The shared session_id='default' is rejected for gated work.",
+        "If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
+        "The following global .GPT instructions are mandatory and are separate from Codex's ~/.codex/AGENTS.md.",
+        "Project-specific .GPT instructions are loaded after bootstrap_thread receives the target cwd.",
+        "",
+        f"Startup Context Fingerprint: {fingerprint}",
+        f"GPT Home: {_gpt_home()}",
+        f"Usage Database: {_thread_db_path()}",
+        "",
+        "## Mandatory .GPT instructions",
+    ]
+    for path, content in rows:
+        parts.extend([f"===== {path} =====", content.rstrip(), ""])
+    if not rows:
+        parts.extend(["No .GPT instruction file was discovered.", ""])
+    parts.append(f"## Available skills ({len(skills)})")
+    for skill in skills:
+        parts.append(f"- {skill['name']}")
+    if not skills:
+        parts.append("- No skills discovered.")
+    parts.extend(["", f"## Public Terminal GPT tools ({len(tools)})"])
+    for tool in tools:
+        parts.append(f"- {tool['name']}")
+    parts.extend(["", f"## Configured nested MCP servers ({len(nested_servers)})"])
+    for server in nested_servers:
+        parts.append(f"- {server['name']}")
+    if not nested_servers:
+        parts.append("- No nested MCP servers discovered.")
+    parts.extend([
+        "",
+        "Context recovery tools: bootstrap_thread, get_thread_context, context_manifest, refresh_startup_context.",
+        "Usage tools: record_token_usage and get_token_usage.",
+        "Exact model token usage is unavailable to MCP unless the host/provider reports it through record_token_usage; automatic context counts are marked as estimates.",
+    ])
+    return "\n".join(parts).rstrip()
+
+
+def _set_startup_instructions() -> str:
+    instructions = _build_startup_instructions()
+    mcp._mcp_server.instructions = instructions
+    return instructions
+
+
+def _install_dynamic_initialization() -> None:
+    """Refresh global startup context immediately before every MCP initialize response."""
+    server = mcp._mcp_server
+    original = server.create_initialization_options
+
+    def create_initialization_options(
+        notification_options: Any = None,
+        experimental_capabilities: dict[str, dict[str, Any]] | None = None,
+    ) -> Any:
+        _set_startup_instructions()
+        return original(notification_options, experimental_capabilities)
+
+    server.create_initialization_options = create_initialization_options  # type: ignore[method-assign]
+
+
+# Keep discovery deterministic and intentionally small. The recovery/bootstrap
+# tools are deliberately first so they are visible before any gated work.
 PUBLIC_TOOL_ORDER = (
-    "project_context", "local_skills", "local_mcp", "run_command", "start_process",
-    "poll_process", "stop_process", "set_session_env", "read_file", "write_file",
-    "replace_in_file", "apply_patch", "list_dir", "stat_path", "make_dir", "copy_path",
-    "move_path", "run_codex_yolo", "start_codex_yolo", "run_agy_yolo", "start_agy_yolo",
+    "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
+    "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
+    "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
+    "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
+    "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
+    "run_agy_yolo", "start_agy_yolo",
 )
 mcp._tool_manager._tools = {name: mcp._tool_manager._tools[name] for name in PUBLIC_TOOL_ORDER}
+_set_startup_instructions()
+_install_dynamic_initialization()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal MCP Server")
     parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio", help="Transport mode")
     parser.add_argument("--host", default="127.0.0.1", help="Host for SSE/HTTP server")
-    parser.add_argument("--port", type=int, default=8000, help="Port for SSE/HTTP server")
+    parser.add_argument("--port", type=int, default=8011, help="Port for SSE/HTTP server")
     parser.add_argument("--log-level", default=os.environ.get("MCP_UVICORN_LOG_LEVEL", "info"))
     args = parser.parse_args()
     if args.transport in ["sse", "streamable-http"]:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
+        install_usage_dashboard(app, GPT_STORE)
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
         if bearer_token:
             app.add_middleware(BearerAuthMiddleware, token=bearer_token)
