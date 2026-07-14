@@ -13,6 +13,7 @@ The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` start
 - Foreground and background process management.
 - Direct file read/write/edit/copy/move operations.
 - Native local image inspection through `watch_image`, returning MCP `ImageContent` instead of a text path or JSON-wrapped base64 blob.
+- Optional persistent per-thread goals with fixed finish conditions, evidence-gated completion, and 15-minute reminder injection.
 - Mandatory per-thread bootstrap gate using `~/.GPT/AGENTS.md` and project `.GPT/AGENTS.md` files; Codex `~/.codex/AGENTS.md` is intentionally ignored.
 - MCP initialization instructions include the GPT rules, every discoverable skill, every public Terminal tool, and configured nested MCP server names.
 - SQLite tracking for host-reported model input/output/cached-input tokens plus separately labeled server estimates for returned bootstrap context.
@@ -73,6 +74,26 @@ The experimental server never reads Codex's instruction tree. It resolves GPT in
 ```
 
 `MCP_GPT_HOME` changes the global GPT directory. The default is `~/.GPT`.
+
+### Persistent thread goals
+
+`thread_goal` stores one optional goal per bootstrapped thread. A goal contains an objective and fixed finish conditions; it remains active until `complete` receives exactly one non-empty evidence entry per condition, or `technical_error` records a genuine blocking failure. `resume` reactivates a technical-error goal and `clear` removes it.
+
+When the goal has not been returned to the model for `MCP_GOAL_REMINDER_SECONDS` (15 minutes by default), the first later tool result atomically receives a compact `<goal_context>` block. The reminder is appended without flattening native image content or changing an existing MCP error flag. `bootstrap_thread`, `get_thread_context`, and `thread_goal(action="get")` also return the goal and reset the reminder timer.
+
+```text
+thread_goal(
+    action="set",
+    session_id="the-bootstrapped-thread-id",
+    objective="Finish and verify the requested implementation",
+    finish_conditions=[
+        "The requested behavior exists",
+        "Relevant success and failure tests pass",
+    ],
+)
+```
+
+The server cannot start a new model turn by itself. It persists and re-injects the goal so a compatible host or the next user/model turn can continue from the full objective instead of treating partial progress as completion.
 
 ### Native image inspection
 
@@ -279,6 +300,7 @@ response = client.responses.create(
                 "bootstrap_thread",
                 "get_thread_context",
                 "context_manifest",
+                "thread_goal",
                 "record_token_usage",
                 "get_token_usage",
                 "list_dir",
@@ -300,6 +322,7 @@ OpenAI does not store the MCP `authorization` value in the Response object, so p
 | Area | Tools |
 | --- | --- |
 | Thread bootstrap and recovery | `bootstrap_thread`, `get_thread_context`, `context_manifest`, `refresh_startup_context`, `project_context` |
+| Persistent goal | `thread_goal` |
 | Token accounting | `record_token_usage`, `get_token_usage` |
 | Skills and MCP discovery | `local_skills`, `local_mcp` |
 | Commands | `run_command`, `start_process`, `poll_process`, `stop_process` |
