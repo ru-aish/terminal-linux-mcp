@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -218,9 +219,10 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 tools = await session.list_tools()
                 names = [tool.name for tool in tools.tools]
                 assert names[0] == "bootstrap_thread"
+                assert "thread_goal" in names
                 assert "record_token_usage" in names
                 assert "watch_image" in names
-                assert len(names) == 28
+                assert len(names) == 29
 
                 blocked = await session.call_tool(
                     "run_command",
@@ -244,6 +246,39 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 assert "http-global-rule" in bootstrap_text
                 assert "http-project-rule" in bootstrap_text
 
+                goal_set = await session.call_tool(
+                    "thread_goal",
+                    {
+                        "action": "set",
+                        "session_id": "http-thread",
+                        "objective": "Verify HTTP goal persistence",
+                        "finish_conditions": ["Goal survives context reload"],
+                        "cwd": str(tmp_path),
+                    },
+                )
+                goal_payload = json.loads(
+                    "\n".join(getattr(item, "text", "") for item in goal_set.content)
+                )
+                assert goal_payload["goal"]["status"] == "active"
+                reloaded = await session.call_tool(
+                    "get_thread_context",
+                    {
+                        "thread_id": "http-thread",
+                        "cwd": str(tmp_path),
+                        "max_chars": 100000,
+                    },
+                )
+                reloaded_text = "\n".join(
+                    getattr(item, "text", "") for item in reloaded.content
+                )
+                assert "## Active thread goal" in reloaded_text
+                assert "Verify HTTP goal persistence" in reloaded_text
+                with sqlite3.connect(gpt_home / "thread_usage.db") as connection:
+                    connection.execute(
+                        "UPDATE thread_goals SET last_seen_at = '2000-01-01T00:00:00Z' WHERE thread_id = ?",
+                        ("http-thread",),
+                    )
+
                 command = await session.call_tool(
                     "run_command",
                     {
@@ -254,6 +289,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 )
                 command_text = "\n".join(getattr(item, "text", "") for item in command.content)
                 assert "ready" in command_text
+                assert "Periodic active-goal reminder" in command_text
 
                 watched = await session.call_tool(
                     "watch_image",
