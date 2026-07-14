@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -11,7 +12,7 @@ import terminal_mcp
 
 EXPECTED_TOOLS = [
     "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
-    "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
+    "thread_goal", "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
     "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
@@ -124,6 +125,167 @@ def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
     ))
     assert "rule-two" in reloaded
     assert "Context Gate: satisfied" in reloaded
+
+
+def test_thread_goal_lifecycle_and_bootstrap_restoration(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "goal-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    thread_id = "goal-lifecycle-thread"
+
+    run(terminal_mcp.bootstrap_thread(thread_id, str(project), max_chars=100000))
+    created = json.loads(run(terminal_mcp.thread_goal(
+        action="set",
+        session_id=thread_id,
+        objective="Finish the goal implementation",
+        finish_conditions=["Feature exists", "Tests pass"],
+        cwd=str(project),
+    )))
+    assert created["goal"]["status"] == "active"
+    assert created["goal"]["finish_conditions"] == ["Feature exists", "Tests pass"]
+    fresh_store = terminal_mcp.GPTThreadStore(lambda: project)
+    assert fresh_store.get_goal(thread_id)["objective"] == "Finish the goal implementation"
+
+    incomplete = run(terminal_mcp.thread_goal(
+        action="complete",
+        session_id=thread_id,
+        evidence=["Feature exists"],
+        cwd=str(project),
+    ))
+    assert "exactly one evidence entry" in incomplete
+    assert terminal_mcp.GPT_STORE.get_goal(thread_id)["status"] == "active"
+
+    terminal_mcp.sessions.pop(thread_id, None)
+    restored = run(terminal_mcp.bootstrap_thread(thread_id, str(project), max_chars=100000))
+    assert "## Active thread goal" in restored
+    assert "Finish the goal implementation" in restored
+    assert "Tests pass" in restored
+
+    completed = json.loads(run(terminal_mcp.thread_goal(
+        action="complete",
+        session_id=thread_id,
+        evidence=["Implemented in terminal_mcp.py", "Targeted and full tests passed"],
+        cwd=str(project),
+    )))
+    assert completed["goal"]["status"] == "completed"
+    assert len(completed["goal"]["completion_evidence"]) == 2
+
+    run(terminal_mcp.thread_goal(
+        action="set",
+        session_id=thread_id,
+        objective="Recover from a genuine infrastructure failure",
+        finish_conditions=["Infrastructure is available"],
+        cwd=str(project),
+    ))
+    technical_error = json.loads(run(terminal_mcp.thread_goal(
+        action="technical_error",
+        session_id=thread_id,
+        reason="Required remote endpoint is unavailable",
+        cwd=str(project),
+    )))
+    assert technical_error["goal"]["status"] == "technical_error"
+    resumed = json.loads(run(terminal_mcp.thread_goal(
+        action="resume",
+        session_id=thread_id,
+        cwd=str(project),
+    )))
+    assert resumed["goal"]["status"] == "active"
+    cleared = json.loads(run(terminal_mcp.thread_goal(
+        action="clear",
+        session_id=thread_id,
+        cwd=str(project),
+    )))
+    assert cleared["cleared"] is True
+    assert terminal_mcp.GPT_STORE.get_goal(thread_id) is None
+
+
+def test_due_goal_reminder_appends_once_to_text_image_and_error(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "goal-reminder-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    text_path = project / "note.txt"
+    text_path.write_text("hello", encoding="utf-8")
+    image_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2nqkAAAAASUVORK5CYII="
+    )
+    image_path = project / "pixel.png"
+    image_path.write_bytes(image_bytes)
+    thread_id = "goal-reminder-thread"
+
+    run(terminal_mcp.bootstrap_thread(thread_id, str(project), max_chars=100000))
+    run(terminal_mcp.thread_goal(
+        action="set",
+        session_id=thread_id,
+        objective="Inspect all requested artifacts",
+        finish_conditions=["Text inspected", "Image inspected"],
+        cwd=str(project),
+    ))
+
+    def make_due() -> None:
+        with terminal_mcp.GPT_STORE._connect() as connection:
+            connection.execute(
+                "UPDATE thread_goals SET last_seen_at = '2000-01-01T00:00:00Z' WHERE thread_id = ?",
+                (thread_id,),
+            )
+
+    make_due()
+    text_result = run(terminal_mcp.mcp.call_tool(
+        "read_file",
+        {"path": str(text_path), "session_id": thread_id, "cwd": str(project)},
+    ))
+    text_blocks = text_result[0]
+    assert any("Periodic active-goal reminder" in block.text for block in text_blocks)
+
+    second_result = run(terminal_mcp.mcp.call_tool(
+        "read_file",
+        {"path": str(text_path), "session_id": thread_id, "cwd": str(project)},
+    ))
+    assert not any("Periodic active-goal reminder" in block.text for block in second_result[0])
+
+    make_due()
+    image_result = run(terminal_mcp.mcp.call_tool(
+        "watch_image",
+        {"path": str(image_path), "session_id": thread_id, "cwd": str(project)},
+    ))
+    assert isinstance(image_result, mcp.types.CallToolResult)
+    assert any(isinstance(block, mcp.types.ImageContent) for block in image_result.content)
+    assert any(
+        isinstance(block, mcp.types.TextContent)
+        and "Periodic active-goal reminder" in block.text
+        for block in image_result.content
+    )
+
+    make_due()
+    error_result = run(terminal_mcp.mcp.call_tool(
+        "watch_image",
+        {"path": str(project / "missing.png"), "session_id": thread_id, "cwd": str(project)},
+    ))
+    assert error_result.isError is True
+    assert any(
+        isinstance(block, mcp.types.TextContent)
+        and "Periodic active-goal reminder" in block.text
+        for block in error_result.content
+    )
+
+
+def test_goal_reminder_claim_is_atomic(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    thread_id = "goal-atomic-thread"
+    terminal_mcp.GPT_STORE.set_goal(thread_id, "Atomic reminder", ["Only one caller receives it"])
+    with terminal_mcp.GPT_STORE._connect() as connection:
+        connection.execute(
+            "UPDATE thread_goals SET last_seen_at = '2000-01-01T00:00:00Z' WHERE thread_id = ?",
+            (thread_id,),
+        )
+
+    def claim():
+        return terminal_mcp.GPT_STORE.claim_goal_reminder(thread_id, interval_seconds=900)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda _: claim(), range(4)))
+    assert sum(result is not None for result in results) == 1
 
 
 def test_bounded_command_capture_spills_large_output(tmp_path, monkeypatch):
@@ -419,6 +581,8 @@ def test_startup_instructions_include_gpt_rules_skills_and_tools(tmp_path, monke
         assert "startup-gpt-rule" in instructions
         assert "startup-demo" in instructions
         assert "bootstrap_thread" in instructions
+        assert "thread_goal" in instructions
+        assert "/goal <objective>" in instructions
         assert "record_token_usage" in instructions
         assert "session_id='default' is rejected" in instructions
     finally:

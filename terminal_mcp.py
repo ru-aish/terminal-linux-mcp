@@ -50,7 +50,52 @@ MCP_PROXY_IDLE_TIMEOUT = int(os.environ.get("MCP_PROXY_IDLE_TIMEOUT", "1800"))
 DEFAULT_BOOTSTRAP_MAX_CHARS = int(os.environ.get("MCP_BOOTSTRAP_MAX_CHARS", "100000"))
 WATCH_IMAGE_MAX_BYTES = int(os.environ.get("MCP_WATCH_IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
 TOKEN_ACCOUNTING_MAX_CHARS = int(os.environ.get("MCP_TOKEN_ACCOUNTING_MAX_CHARS", "1000000"))
+GOAL_REMINDER_SECONDS = int(os.environ.get("MCP_GOAL_REMINDER_SECONDS", "900"))
 GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
+
+
+def _format_goal_context(goal: dict[str, Any], *, reminder: bool = False) -> str:
+    heading = "Periodic active-goal reminder" if reminder else "Thread goal context"
+    conditions = "\n".join(
+        f"{index}. {condition}"
+        for index, condition in enumerate(goal["finish_conditions"], start=1)
+    )
+    lines = [
+        "<goal_context>",
+        heading,
+        f"Status: {goal['status']}",
+        f"Objective: {goal['objective']}",
+        "Finish conditions:",
+        conditions or "(none)",
+    ]
+    if goal["status"] == "active":
+        lines.append(
+            "Keep working toward the full objective; do not stop for partial success, and call thread_goal(action='complete') only with one evidence entry per condition."
+        )
+    elif goal["status"] == "technical_error":
+        lines.append(f"Technical error: {goal['technical_error_reason']}")
+    lines.append("</goal_context>")
+    return "\n".join(lines)
+
+
+def _append_goal_context(result: Any, goal: dict[str, Any]) -> Any:
+    reminder = mcp_types.TextContent(
+        type="text",
+        text=_format_goal_context(goal, reminder=True),
+    )
+    if isinstance(result, mcp_types.CallToolResult):
+        return result.model_copy(update={"content": [*result.content, reminder]})
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], list):
+        return ([*result[0], reminder], result[1])
+    if isinstance(result, list):
+        return [*result, reminder]
+    if isinstance(result, dict):
+        return mcp_types.CallToolResult(
+            content=[reminder],
+            structuredContent=result,
+            isError=False,
+        )
+    return [mcp_types.TextContent(type="text", text=str(result)), reminder]
 
 
 class AccountingFastMCP(FastMCP):
@@ -110,6 +155,17 @@ class AccountingFastMCP(FastMCP):
         thread_id = self._thread_id(arguments)
         if not thread_id or thread_id == "default":
             return result
+        try:
+            if name != "thread_goal":
+                goal = GPT_STORE.claim_goal_reminder(
+                    thread_id,
+                    interval_seconds=GOAL_REMINDER_SECONDS,
+                )
+                if goal is not None:
+                    result = _append_goal_context(result, goal)
+        except Exception:
+            # Goal reminders are persistence aids and must never break a tool.
+            pass
         try:
             call_text, call_metadata = self._text_for_token_accounting(
                 {"name": name, "arguments": arguments}
@@ -1827,6 +1883,7 @@ def _build_thread_context_document(
     skills = _discover_skills(root)
     tools = _public_tool_manifest()
     nested_servers = _configured_mcp_manifest(root)
+    goal = GPT_STORE.get_goal(thread_id, mark_seen=True)
 
     parts = [
         "[Terminal GPT Thread Bootstrap]",
@@ -1876,6 +1933,9 @@ def _build_thread_context_document(
             )
     else:
         parts.append("- No nested MCP servers discovered.")
+
+    if goal is not None and goal["status"] in {"active", "technical_error"}:
+        parts.extend(["", "## Active thread goal", _format_goal_context(goal)])
 
     parts.extend([
         "",
@@ -1983,6 +2043,7 @@ async def context_manifest(
         "gpt_home": str(_gpt_home()),
         "usage_database": str(_thread_db_path()),
         "context_fingerprint": fingerprint,
+        "thread_goal": GPT_STORE.get_goal(normalized, mark_seen=True) if normalized else None,
         "instruction_files": [str(path) for path, _ in rows],
         "skills": [
             {
@@ -2064,6 +2125,47 @@ async def get_token_usage(
     """Return per-thread or global exact and estimated token-usage totals with recent events."""
     normalized = _normalize_session_id(thread_id) if thread_id else None
     return json.dumps(_usage_summary(normalized, limit=limit), indent=2)
+
+
+@mcp.tool()
+async def thread_goal(
+    action: str = "get",
+    session_id: str = "default",
+    objective: str = "",
+    finish_conditions: list[str] | None = None,
+    evidence: list[str] | None = None,
+    reason: str = "",
+    cwd: str | None = None,
+) -> str:
+    """Set, inspect, complete, pause for a technical error, resume, or clear one persistent goal for this thread."""
+    session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    gate = _require_project_context(session, run_cwd)
+    if gate:
+        return gate
+    action = action.strip().lower().replace("-", "_")
+    try:
+        if action in {"set", "create"}:
+            goal = GPT_STORE.set_goal(session.session_id, objective, finish_conditions)
+        elif action in {"get", "show"}:
+            goal = GPT_STORE.get_goal(session.session_id, mark_seen=True)
+            return json.dumps({"goal": goal}, indent=2)
+        elif action == "complete":
+            goal = GPT_STORE.complete_goal(session.session_id, evidence)
+        elif action in {"technical_error", "block"}:
+            goal = GPT_STORE.mark_goal_technical_error(session.session_id, reason)
+        elif action == "resume":
+            goal = GPT_STORE.resume_goal(session.session_id)
+        elif action == "clear":
+            cleared = GPT_STORE.clear_goal(session.session_id)
+            return json.dumps({"cleared": cleared, "thread_id": session.session_id}, indent=2)
+        else:
+            return (
+                "Error: action must be set, get, complete, technical_error, resume, or clear."
+            )
+    except (TypeError, ValueError, sqlite3.Error) as exc:
+        return f"Error updating thread goal: {exc}"
+    return json.dumps({"goal": goal}, indent=2)
 
 
 @mcp.tool()
@@ -2932,6 +3034,7 @@ def _build_startup_instructions() -> str:
         "STRICT REQUIREMENT: At the beginning of each genuinely new model thread, call bootstrap_thread with a unique stable thread_id before substantive terminal work.",
         "Reuse that exact thread_id as session_id on every later tool call. The shared session_id='default' is rejected for gated work.",
         "If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
+        "When the user writes /goal <objective>, call thread_goal(action='set') with explicit finish conditions and continue until each condition has evidence and the goal is completed, unless a real technical error blocks further work.",
         "The following global .GPT instructions are mandatory and are separate from Codex's ~/.codex/AGENTS.md.",
         "Project-specific .GPT instructions are loaded after bootstrap_thread receives the target cwd.",
         "",
@@ -2992,7 +3095,7 @@ def _install_dynamic_initialization() -> None:
 # tools are deliberately first so they are visible before any gated work.
 PUBLIC_TOOL_ORDER = (
     "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
-    "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
+    "thread_goal", "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
     "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",

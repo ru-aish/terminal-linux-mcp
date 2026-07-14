@@ -30,6 +30,10 @@ from Codex's `~/.codex/AGENTS.md`.
 7. Do not expose secrets, credentials, private tokens, or unrelated private data.
 8. For code changes, implement thoroughly, test meaningful success and failure paths,
    self-review the final diff, and report limitations honestly.
+
+## Goal strategy
+
+When the user writes `/goal <objective>`, call `thread_goal(action="set")` with explicit finish conditions and keep working until every condition is evidenced and the goal is completed, unless a real technical error prevents further progress.
 """
 
 
@@ -146,8 +150,297 @@ class GPTThreadStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_request_unique
                     ON usage_events(thread_id, source, request_id)
                     WHERE request_id <> '';
+
+                CREATE TABLE IF NOT EXISTS thread_goals (
+                    thread_id TEXT PRIMARY KEY,
+                    objective TEXT NOT NULL,
+                    finish_conditions_json TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'technical_error')),
+                    completion_evidence_json TEXT NOT NULL DEFAULT '[]',
+                    technical_error_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    technical_error_at TEXT,
+                    FOREIGN KEY(thread_id) REFERENCES threads(thread_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_thread_goals_status_seen
+                    ON thread_goals(status, last_seen_at);
                 """
             )
+
+    @staticmethod
+    def _clean_goal_text(value: str, *, field: str, max_chars: int) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        cleaned = " ".join(value.strip().split())
+        if not cleaned:
+            raise ValueError(f"{field} must not be empty")
+        if len(cleaned) > max_chars:
+            raise ValueError(f"{field} must be at most {max_chars} characters")
+        return cleaned
+
+    @classmethod
+    def _clean_goal_list(
+        cls,
+        values: list[str] | None,
+        *,
+        field: str,
+        max_items: int,
+        max_item_chars: int,
+    ) -> list[str]:
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"{field} must be a non-empty list")
+        if len(values) > max_items:
+            raise ValueError(f"{field} must contain at most {max_items} items")
+        return [
+            cls._clean_goal_text(value, field=f"{field}[{index}]", max_chars=max_item_chars)
+            for index, value in enumerate(values)
+        ]
+
+    @staticmethod
+    def _goal_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "thread_id": row["thread_id"],
+            "objective": row["objective"],
+            "finish_conditions": json.loads(row["finish_conditions_json"] or "[]"),
+            "status": row["status"],
+            "completion_evidence": json.loads(row["completion_evidence_json"] or "[]"),
+            "technical_error_reason": row["technical_error_reason"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "last_seen_at": row["last_seen_at"],
+            "completed_at": row["completed_at"],
+            "technical_error_at": row["technical_error_at"],
+        }
+
+    def set_goal(
+        self,
+        thread_id: str,
+        objective: str,
+        finish_conditions: list[str] | None,
+    ) -> dict[str, Any]:
+        objective = self._clean_goal_text(objective, field="objective", max_chars=8000)
+        conditions = self._clean_goal_list(
+            finish_conditions,
+            field="finish_conditions",
+            max_items=50,
+            max_item_chars=2000,
+        )
+        self._init_db()
+        now = self._now()
+        workspace = self._workspace_provider().resolve()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO threads (
+                    thread_id, cwd, context_fingerprint, context_loaded_at,
+                    bootstrap_count, created_at, updated_at
+                ) VALUES (?, ?, '', NULL, 0, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (thread_id, str(workspace), now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO thread_goals (
+                    thread_id, objective, finish_conditions_json, status,
+                    completion_evidence_json, technical_error_reason,
+                    created_at, updated_at, last_seen_at, completed_at, technical_error_at
+                ) VALUES (?, ?, ?, 'active', '[]', '', ?, ?, ?, NULL, NULL)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    objective = excluded.objective,
+                    finish_conditions_json = excluded.finish_conditions_json,
+                    status = 'active',
+                    completion_evidence_json = '[]',
+                    technical_error_reason = '',
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    last_seen_at = excluded.last_seen_at,
+                    completed_at = NULL,
+                    technical_error_at = NULL
+                """,
+                (thread_id, objective, json.dumps(conditions), now, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        goal = self._goal_row(row)
+        assert goal is not None
+        return goal
+
+    def get_goal(self, thread_id: str, *, mark_seen: bool = False) -> dict[str, Any] | None:
+        self._init_db()
+        now = self._now()
+        with self._connect() as connection:
+            if mark_seen:
+                connection.execute(
+                    "UPDATE thread_goals SET last_seen_at = ?, updated_at = ? WHERE thread_id = ?",
+                    (now, now, thread_id),
+                )
+            row = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        return self._goal_row(row)
+
+    def complete_goal(self, thread_id: str, evidence: list[str] | None) -> dict[str, Any]:
+        self._init_db()
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            goal = self._goal_row(row)
+            if goal is None:
+                raise ValueError("no goal exists for this thread")
+            if goal["status"] != "active":
+                raise ValueError(f"goal status must be active, not {goal['status']}")
+            cleaned_evidence = self._clean_goal_list(
+                evidence,
+                field="evidence",
+                max_items=50,
+                max_item_chars=4000,
+            )
+            conditions = goal["finish_conditions"]
+            if len(cleaned_evidence) != len(conditions):
+                raise ValueError(
+                    "completion requires exactly one evidence entry for each finish condition "
+                    f"({len(conditions)} required, {len(cleaned_evidence)} provided)"
+                )
+            connection.execute(
+                """
+                UPDATE thread_goals
+                SET status = 'completed', completion_evidence_json = ?,
+                    technical_error_reason = '', updated_at = ?, last_seen_at = ?,
+                    completed_at = ?, technical_error_at = NULL
+                WHERE thread_id = ?
+                """,
+                (json.dumps(cleaned_evidence), now, now, now, thread_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        completed = self._goal_row(updated)
+        assert completed is not None
+        return completed
+
+    def mark_goal_technical_error(self, thread_id: str, reason: str) -> dict[str, Any]:
+        reason = self._clean_goal_text(reason, field="reason", max_chars=4000)
+        self._init_db()
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("no goal exists for this thread")
+            if row["status"] != "active":
+                raise ValueError(f"goal status must be active, not {row['status']}")
+            connection.execute(
+                """
+                UPDATE thread_goals
+                SET status = 'technical_error', technical_error_reason = ?,
+                    updated_at = ?, last_seen_at = ?, technical_error_at = ?
+                WHERE thread_id = ?
+                """,
+                (reason, now, now, now, thread_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        goal = self._goal_row(updated)
+        assert goal is not None
+        return goal
+
+    def resume_goal(self, thread_id: str) -> dict[str, Any]:
+        self._init_db()
+        now = self._now()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("no goal exists for this thread")
+            if row["status"] != "technical_error":
+                raise ValueError(f"only a technical_error goal can be resumed, not {row['status']}")
+            connection.execute(
+                """
+                UPDATE thread_goals
+                SET status = 'active', technical_error_reason = '',
+                    updated_at = ?, last_seen_at = ?, technical_error_at = NULL
+                WHERE thread_id = ?
+                """,
+                (now, now, thread_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        goal = self._goal_row(updated)
+        assert goal is not None
+        return goal
+
+    def clear_goal(self, thread_id: str) -> bool:
+        self._init_db()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            )
+        return cursor.rowcount > 0
+
+    def claim_goal_reminder(
+        self,
+        thread_id: str,
+        *,
+        interval_seconds: int,
+    ) -> dict[str, Any] | None:
+        """Atomically claim one due reminder for an active thread goal."""
+        self._init_db()
+        interval = max(1, interval_seconds)
+        now = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            candidate = connection.execute(
+                "SELECT last_seen_at FROM thread_goals WHERE thread_id = ? AND status = 'active'",
+                (thread_id,),
+            ).fetchone()
+        if candidate is None:
+            return None
+        if (now - self._parse_utc(candidate["last_seen_at"])).total_seconds() < interval:
+            return None
+
+        now_text = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ? AND status = 'active'",
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            last_seen = self._parse_utc(row["last_seen_at"])
+            if (now - last_seen).total_seconds() < interval:
+                return None
+            connection.execute(
+                "UPDATE thread_goals SET last_seen_at = ?, updated_at = ? WHERE thread_id = ?",
+                (now_text, now_text, thread_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM thread_goals WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        return self._goal_row(updated)
 
     def upsert_thread(
         self,
