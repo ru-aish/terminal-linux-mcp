@@ -3742,8 +3742,14 @@ async def agent_send(
     idempotency_key: str = "",
     session_id: str = "default",
     cwd: str | None = None,
+    purpose: str = "instruction",
 ) -> str:
-    """Queue an ordered parent/child follow-up; active turns are not interrupted by default."""
+    """Queue an ordered parent/child message.
+
+    Use ``purpose=question`` for a blocking child-to-parent question and
+    ``purpose=answer`` for the direct parent's reply. Active turns are not
+    interrupted unless ``interrupt_policy=interrupt`` is explicit.
+    """
     if gate := await _chat_agent_gate(session_id, cwd):
         return gate
     try:
@@ -3753,6 +3759,7 @@ async def agent_send(
             message,
             interrupt_policy=interrupt_policy,
             idempotency_key=idempotency_key or None,
+            purpose=purpose,
         )
         get_chat_agent_service().wake()
         return _chat_agent_json(result)

@@ -20,6 +20,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from conversation_gateway import ConversationGateway, DeliveryState
+from durable_ledger import DurableLedger
+
 from chat_internal_client import (
     DEFAULT_CODEX_CDP_ENDPOINT,
     InternalChatClient,
@@ -418,139 +421,85 @@ def classify_thread_state(
     stale_after_seconds: float = 600.0,
     progress_observed_at: float | None = None,
 ) -> ThreadDecision:
-    """Classify canonical thread state without looking at visible UI controls.
+    """Compatibility adapter over the canonical pure state reducer."""
+    from state_reducer import ReducedState, reduce_snapshot
 
-    Ambiguous or stale in-progress messages are never treated as safe continuation
-    parents. The watchdog may report them, refetch them, and wait for a terminal
-    canonical state, but it will not submit from an unverified in-progress node.
-    """
-    meaningful = [
-        (index, turn)
-        for index, turn in enumerate(snapshot.turns)
-        if turn.text.strip()
-    ]
-    if not meaningful:
-        return ThreadDecision(ThreadDecisionState.UNKNOWN, "conversation transcript is empty")
-
-    latest_index, latest = meaningful[-1]
-    if latest_index <= task_start_index:
-        return ThreadDecision(
-            ThreadDecisionState.AWAITING_ASSISTANT,
-            "no assistant response exists after the current task start",
-        )
-
-    status = latest.status.strip().casefold()
-    marker_present = any(line.strip() == completion_marker for line in latest.text.splitlines())
-
+    meaningful = [(index, turn) for index, turn in enumerate(snapshot.turns) if turn.text.strip()]
+    latest_index = meaningful[-1][0] if meaningful else task_start_index + 1
+    latest = meaningful[-1][1] if meaningful else None
     if snapshot.active_stream:
-        return ThreadDecision(
-            ThreadDecisionState.RUNNING_OWNED_STREAM,
-            "a watchdog-owned completion stream is active",
+        return ThreadDecision(ThreadDecisionState.RUNNING_OWNED_STREAM, "a watchdog-owned completion stream is active")
+    if latest is not None and (snapshot.running or latest.role == "assistant" and (latest.status.casefold() in RUNNING_MESSAGE_STATUSES or latest.end_turn is False)) and now is not None:
+        reference = progress_observed_at if progress_observed_at is not None else snapshot.update_time
+        if reference is not None and stale_after_seconds > 0 and now - reference >= stale_after_seconds:
+            return ThreadDecision(ThreadDecisionState.INTERRUPTED_OR_STALE, "canonical generation is stale; continuation is blocked")
+    turns = [turn.as_dict() for turn in snapshot.turns]
+    if not snapshot.canonical:
+        for item in turns:
+            if item.get("role") == "assistant":
+                item["status"] = item.get("status") or "finished_successfully"
+                if item.get("end_turn") is None:
+                    item["end_turn"] = True
+    # The legacy watchdog adapter's non-canonical snapshots are already the
+    # result of its adapter-level inspection.  Canonical gateway snapshots must
+    # carry an explicit verification bit and remain fail-closed.
+    verified = snapshot.state_verified or not snapshot.canonical
+    if not turns and not snapshot.canonical:
+        # Older adapters expose bounded role-specific arrays.  Convert that
+        # compatibility shape once, then let the reducer make the decision.
+        users = list(snapshot.user_messages)
+        assistants = list(snapshot.assistant_messages)
+        if users and len(users) > len(assistants):
+            turns = [{"key": f"user-{index}", "role": "user", "text": text,
+                      "status": "finished_successfully", "end_turn": True}
+                     for index, text in enumerate(users)]
+        else:
+            turns = [{"key": f"assistant-{index}", "role": "assistant", "text": text,
+                      "status": "finished_successfully", "end_turn": True}
+                     for index, text in enumerate(assistants)]
+        if not turns:
+            return ThreadDecision(
+                ThreadDecisionState.UNKNOWN,
+                "conversation transcript is empty; continuation is unsafe",
+            )
+        verified = True
+        meaningful = [(index, item) for index, item in enumerate(turns) if str(item.get("text") or "").strip()]
+        latest_index, latest_item = meaningful[-1] if meaningful else (task_start_index + 1, turns[-1])
+        latest = ConversationTurn(
+            str(latest_item.get("key") or ""), str(latest_item.get("role") or ""),
+            str(latest_item.get("text") or ""), status=str(latest_item.get("status") or ""),
+            end_turn=latest_item.get("end_turn"),
         )
-
-    canonical_in_progress = bool(
-        latest.role == "assistant"
-        and (status in RUNNING_MESSAGE_STATUSES or latest.end_turn is False)
+    if latest_index <= task_start_index:
+        return ThreadDecision(ThreadDecisionState.AWAITING_ASSISTANT, "no assistant response exists after the current task start")
+    reduction = reduce_snapshot(
+        {"completion_marker": completion_marker,
+         "status": "stopped_incomplete" if not snapshot.canonical else ""},
+        {"state_verified": verified, "canonical": snapshot.canonical,
+         "current_node": snapshot.current_node, "running": snapshot.running,
+         "active_stream": snapshot.active_stream,
+         "turns": turns},
     )
-    if canonical_in_progress or snapshot.running:
-        progress_reference = (
-            progress_observed_at
-            if progress_observed_at is not None
-            else snapshot.update_time
-        )
-        stale = bool(
-            now is not None
-            and progress_reference is not None
-            and stale_after_seconds > 0
-            and now - progress_reference >= stale_after_seconds
-        )
-        if stale:
-            return ThreadDecision(
-                ThreadDecisionState.INTERRUPTED_OR_STALE,
-                "canonical generation has shown no structural progress within the stale interval; continuation is blocked until a terminal state is observed",
-            )
-        return ThreadDecision(
-            ThreadDecisionState.RUNNING_CANONICAL,
-            f"latest canonical generation is active{f' ({status})' if status else ''}",
-        )
+    if reduction.state is ReducedState.COMPLETED:
+        return ThreadDecision(ThreadDecisionState.COMPLETED, reduction.reason, completion_turn=latest)
+    if reduction.state is ReducedState.RUNNING:
+        return ThreadDecision(ThreadDecisionState.RUNNING_CANONICAL, reduction.reason)
+    if reduction.state is ReducedState.STALE:
+        return ThreadDecision(ThreadDecisionState.INTERRUPTED_OR_STALE, reduction.reason)
+    if reduction.state is ReducedState.AWAITING_ASSISTANT:
+        if (
+            latest is not None
+            and continuation_message
+            and latest.text.strip() == continuation_message.strip()
+        ):
+            return ThreadDecision(ThreadDecisionState.DUPLICATE_PENDING, "the continuation prompt is already the latest user turn")
+        return ThreadDecision(ThreadDecisionState.AWAITING_ASSISTANT, reduction.reason)
+    if reduction.state is ReducedState.STOPPED_INCOMPLETE and any(action.value == "send_continuation" for action in reduction.actions):
+        return ThreadDecision(ThreadDecisionState.STOPPED_INCOMPLETE, reduction.reason, can_continue=True)
+    if reduction.state is ReducedState.UNKNOWN and not snapshot.state_verified:
+        return ThreadDecision(ThreadDecisionState.UNKNOWN, reduction.reason)
+    return ThreadDecision(ThreadDecisionState.UNKNOWN, reduction.reason)
 
-    if latest.role == "user":
-        if continuation_message and latest.text.strip() == continuation_message.strip():
-            return ThreadDecision(
-                ThreadDecisionState.DUPLICATE_PENDING,
-                "the continuation prompt is already the latest user turn",
-            )
-        return ThreadDecision(
-            ThreadDecisionState.AWAITING_ASSISTANT,
-            "latest meaningful turn is a user message",
-        )
-    if latest.role != "assistant":
-        return ThreadDecision(
-            ThreadDecisionState.UNKNOWN,
-            f"latest meaningful turn has unsupported role {latest.role or '<empty>'}",
-        )
-
-    if snapshot.canonical:
-        if not snapshot.state_verified:
-            return ThreadDecision(ThreadDecisionState.UNKNOWN, "canonical state was not verified")
-        if not snapshot.current_node:
-            return ThreadDecision(ThreadDecisionState.UNKNOWN, "canonical current_node is missing")
-        if latest.key != snapshot.current_node:
-            return ThreadDecision(
-                ThreadDecisionState.UNKNOWN,
-                "latest active-branch message does not match current_node",
-            )
-        if not status:
-            return ThreadDecision(ThreadDecisionState.UNKNOWN, "latest assistant status is missing")
-        if latest.end_turn is None:
-            return ThreadDecision(ThreadDecisionState.UNKNOWN, "latest assistant end_turn is missing")
-        if status in TERMINAL_SUCCESS_MESSAGE_STATUSES and latest.end_turn is not True:
-            return ThreadDecision(
-                ThreadDecisionState.UNKNOWN,
-                "terminal-success status conflicts with end_turn",
-            )
-        if status in RUNNING_MESSAGE_STATUSES and latest.end_turn is True:
-            return ThreadDecision(
-                ThreadDecisionState.UNKNOWN,
-                "running status conflicts with end_turn",
-            )
-        known_statuses = (
-            RUNNING_MESSAGE_STATUSES
-            | TERMINAL_SUCCESS_MESSAGE_STATUSES
-            | TERMINAL_FAILURE_MESSAGE_STATUSES
-        )
-        if status not in known_statuses:
-            return ThreadDecision(
-                ThreadDecisionState.UNKNOWN,
-                f"latest assistant status is unknown: {status}",
-            )
-
-    terminal_success = status in TERMINAL_SUCCESS_MESSAGE_STATUSES or (
-        not snapshot.canonical and not status
-    )
-    terminal_failure = status in TERMINAL_FAILURE_MESSAGE_STATUSES
-    terminal_end = latest.end_turn is True or (not snapshot.canonical and latest.end_turn is None)
-
-    if marker_present and terminal_success and terminal_end:
-        return ThreadDecision(
-            ThreadDecisionState.COMPLETED,
-            completion_turn=latest,
-        )
-    if marker_present:
-        return ThreadDecision(
-            ThreadDecisionState.UNKNOWN,
-            "completion marker is present on a non-terminal assistant turn",
-        )
-    if (terminal_success or terminal_failure) and terminal_end:
-        return ThreadDecision(
-            ThreadDecisionState.STOPPED_INCOMPLETE,
-            "latest assistant turn is terminal without the completion marker",
-            can_continue=True,
-        )
-    return ThreadDecision(
-        ThreadDecisionState.UNKNOWN,
-        "latest assistant turn is neither running nor terminal",
-    )
 
 
 class ChatAdapter(Protocol):
@@ -765,39 +714,62 @@ class ChatWatchdogQueue:
 
 
 class WatchdogStateStore:
-    def __init__(self, path: Path):
+    """Compatibility facade backed authoritatively by ``DurableLedger``.
+
+    The JSON path remains a read-only compatibility mirror for the dashboard
+    and existing operators. Existing JSON content is imported once when a
+    conversation has no SQLite state yet; all later reads and writes use the
+    shared ledger.
+    """
+
+    def __init__(self, path: Path, ledger: DurableLedger):
         self.path = path.expanduser().resolve()
+        self.ledger = ledger
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            _atomic_write(self.path, "{}\n")
+        with self._lock:
+            for conversation_id, state in self._load_legacy_unlocked().items():
+                if not self.ledger.watchdog_state(conversation_id):
+                    self.ledger.put_watchdog_state(conversation_id, state)
+            self._mirror_unlocked()
 
-    def _load_unlocked(self) -> dict[str, dict[str, Any]]:
+    def _load_legacy_unlocked(self) -> dict[str, dict[str, Any]]:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
-        return payload if isinstance(payload, dict) else {}
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            str(conversation_id): dict(state)
+            for conversation_id, state in payload.items()
+            if isinstance(state, dict)
+        }
+
+    def _mirror_unlocked(self) -> None:
+        payload = self.ledger.watchdog_states()
+        _atomic_write(
+            self.path,
+            json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        )
 
     def get(self, conversation_id: str) -> dict[str, Any]:
         with self._lock:
-            return dict(self._load_unlocked().get(conversation_id, {}))
+            return self.ledger.watchdog_state(conversation_id)
 
     def update(self, conversation_id: str, **values: Any) -> dict[str, Any]:
         with self._lock:
-            payload = self._load_unlocked()
-            current = dict(payload.get(conversation_id, {}))
+            current = self.ledger.watchdog_state(conversation_id)
             current.update(values)
             current["updated_at"] = _utc_now()
-            payload[conversation_id] = current
-            _atomic_write(self.path, json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+            self.ledger.put_watchdog_state(conversation_id, current)
+            self._mirror_unlocked()
             return dict(current)
 
     def start_task(self, link: ChatLink, *, source: str) -> dict[str, Any]:
         """Create a fresh task generation for one conversation URL."""
         with self._lock:
-            payload = self._load_unlocked()
-            previous = dict(payload.get(link.conversation_id, {}))
+            previous = self.ledger.watchdog_state(link.conversation_id)
             generation = int(previous.get("task_generation", 0) or 0) + 1
             current = {
                 "url": link.url,
@@ -826,30 +798,36 @@ class WatchdogStateStore:
                 "completion_turn_key": "",
                 "last_error": "",
                 "previous_task_id": previous.get("task_id", ""),
-                "previous_completion_turn_key": previous.get("completion_turn_key", ""),
+                "previous_completion_turn_key": previous.get(
+                    "completion_turn_key", ""
+                ),
                 "updated_at": _utc_now(),
             }
-            payload[link.conversation_id] = current
-            _atomic_write(self.path, json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+            self.ledger.put_watchdog_state(link.conversation_id, current)
+            self._mirror_unlocked()
             return dict(current)
 
-    def mark_not_queued(self, conversation_id: str, *, status: str = "removed") -> dict[str, Any]:
+    def mark_not_queued(
+        self,
+        conversation_id: str,
+        *,
+        status: str = "removed",
+    ) -> dict[str, Any]:
         with self._lock:
-            payload = self._load_unlocked()
-            current = dict(payload.get(conversation_id, {}))
+            current = self.ledger.watchdog_state(conversation_id)
             if not current:
                 return {}
             current["queued"] = False
             if current.get("status") != "completed":
                 current["status"] = status
             current["updated_at"] = _utc_now()
-            payload[conversation_id] = current
-            _atomic_write(self.path, json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+            self.ledger.put_watchdog_state(conversation_id, current)
+            self._mirror_unlocked()
             return dict(current)
 
     def all(self) -> dict[str, dict[str, Any]]:
         with self._lock:
-            return self._load_unlocked()
+            return self.ledger.watchdog_states()
 
 
 def select_cdp_target(
@@ -912,6 +890,7 @@ class CodexInternalChatAdapter:
             thinking_effort=self.thinking_effort,
             require_high_reasoning=require_high_reasoning,
         )
+        self._gateway = ConversationGateway(self._client_context)
         self._health: dict[str, Any] = {}
 
     async def __aenter__(self) -> "CodexInternalChatAdapter":
@@ -920,6 +899,11 @@ class CodexInternalChatAdapter:
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         await self._client.close()
+
+    @asynccontextmanager
+    async def _client_context(self):
+        """Yield the adapter-owned connected client without reconnecting it."""
+        yield self._client
 
     async def current_conversation_id(self) -> str | None:
         # Internal operations do not depend on or alter the visible conversation.
@@ -950,7 +934,7 @@ class CodexInternalChatAdapter:
         )
 
     async def inspect(self, link: ChatLink) -> ThreadSnapshot:
-        payload = await self._client.get_thread(link.conversation_id)
+        payload = await self._gateway.read(link.conversation_id)
         if not payload.get("found"):
             return ThreadSnapshot(
                 found=False,
@@ -1004,23 +988,28 @@ class CodexInternalChatAdapter:
         *,
         expected_current_node: str = "",
     ) -> SendResult:
-        payload = await self._client.continue_thread(
+        delivery = await self._gateway.send(
             link.conversation_id,
             message,
             expected_current_node=expected_current_node,
+            wait_for_completion=True,
         )
+        clicked = delivery.state in {
+            DeliveryState.DELIVERED,
+            DeliveryState.SENT_UNCONFIRMED,
+        }
         return SendResult(
-            clicked=bool(payload.get("sent")),
-            observed=bool(payload.get("observed")),
-            running=bool(payload.get("running")),
-            reason=str(payload.get("reason") or ""),
+            clicked=clicked,
+            observed=delivery.state is DeliveryState.DELIVERED,
+            running=delivery.running,
+            reason=delivery.reason,
             quality_verified=True,
             quality_label=self.thinking_effort,
-            request_id=str(payload.get("request_id") or ""),
-            user_message_id=str(payload.get("user_message_id") or ""),
-            final_message_id=str(payload.get("final_message_id") or ""),
-            final_status=str(payload.get("final_status") or ""),
-            parent_message_id=str(payload.get("parent_message_id") or expected_current_node),
+            request_id=delivery.request_id,
+            user_message_id=delivery.user_message_id,
+            final_message_id=delivery.final_message_id,
+            final_status=delivery.final_status,
+            parent_message_id=delivery.parent_message_id or expected_current_node,
         )
 
     async def restore(self, conversation_id: str) -> bool:
@@ -1053,6 +1042,7 @@ class ChatWatchdogConfig:
     stale_generation_seconds: int = 600
     max_continue_attempts: int = 20
     pre_send_confirmation_seconds: float = 1.25
+    ledger_path: Path | None = None
 
     @classmethod
     def from_env(cls) -> "ChatWatchdogConfig":
@@ -1106,6 +1096,12 @@ class ChatWatchdogConfig:
             pre_send_confirmation_seconds=max(
                 0.0, float(os.environ.get("MCP_CHAT_WATCHDOG_PRE_SEND_CONFIRM_SECONDS", "1.25"))
             ),
+            ledger_path=Path(
+                os.environ.get(
+                    "MCP_CHAT_AGENT_DB",
+                    "~/.GPT/chat-agent-orchestrator.db",
+                )
+            ).expanduser(),
         )
 
 
@@ -1119,7 +1115,9 @@ class ChatWatchdog:
     ):
         self.config = config
         self.queue = ChatWatchdogQueue(config.queue_path, config.completed_path)
-        self.state = WatchdogStateStore(config.state_path)
+        ledger_path = config.ledger_path or config.state_path.with_suffix(".sqlite")
+        self.ledger = DurableLedger(ledger_path)
+        self.state = WatchdogStateStore(config.state_path, self.ledger)
         self._uses_managed_runtime = (
             adapter_factory is None and config.adapter_mode == CODEX_INTERNAL_ADAPTER_NAME
         )
