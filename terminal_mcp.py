@@ -30,7 +30,15 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from gpt_thread_store import GPTThreadStore
 from usage_dashboard import install_usage_dashboard
-from chat_watchdog import ChatWatchdog, ChatWatchdogConfig, install_chat_watchdog_lifespan
+from chat_watchdog import ChatWatchdog, ChatWatchdogConfig, install_chat_watchdog_lifespan, parse_chat_link
+from chat_internal_client import DEFAULT_CODEX_CDP_ENDPOINT, InternalChatClient, sanitize_runtime_error
+from chat_agent_orchestrator import (
+    DEFAULT_AGENT_COMPLETION_MARKER,
+    ChatAgentCoordinator,
+    ChatAgentService,
+    CoordinatorConfig,
+    install_chat_agent_lifespan,
+)
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -54,6 +62,77 @@ TOKEN_ACCOUNTING_MAX_CHARS = int(os.environ.get("MCP_TOKEN_ACCOUNTING_MAX_CHARS"
 GOAL_REMINDER_SECONDS = int(os.environ.get("MCP_GOAL_REMINDER_SECONDS", "900"))
 NODE_REPL_MCP_SERVER = os.environ.get("MCP_NODE_REPL_SERVER", "node_repl")
 GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
+CHAT_AGENT_DB_PATH = Path(
+    os.environ.get("MCP_CHAT_AGENT_DB", "~/.GPT/chat-agent-orchestrator.db")
+).expanduser().resolve()
+CHAT_AGENT_ENABLED = os.environ.get("MCP_CHAT_AGENT_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+CHAT_AGENT_SYNC_SECONDS = max(1.0, float(os.environ.get("MCP_CHAT_AGENT_SYNC_SECONDS", "15")))
+CHAT_AGENT_CONTEXT_MAX_EVENTS = max(1, int(os.environ.get("MCP_CHAT_AGENT_CONTEXT_MAX_EVENTS", "60")))
+CHAT_AGENT_CONTEXT_MAX_CHARS = max(1000, int(os.environ.get("MCP_CHAT_AGENT_CONTEXT_MAX_CHARS", "12000")))
+CHAT_AGENT_TAIL_LINES = max(1, int(os.environ.get("MCP_CHAT_AGENT_TAIL_LINES", "60")))
+CHAT_AGENT_TAIL_MAX_CHARS = max(1000, int(os.environ.get("MCP_CHAT_AGENT_TAIL_MAX_CHARS", "12000")))
+CHAT_AGENT_MAX_CONTINUE_ATTEMPTS = max(
+    1, int(os.environ.get("MCP_CHAT_AGENT_MAX_CONTINUE_ATTEMPTS", "20"))
+)
+CHAT_AGENT_STALE_SECONDS = max(
+    60.0, float(os.environ.get("MCP_CHAT_AGENT_STALE_SECONDS", "600"))
+)
+_CHAT_AGENT_COORDINATOR: ChatAgentCoordinator | None = None
+_CHAT_AGENT_SERVICE: ChatAgentService | None = None
+_CHAT_AGENT_RUNTIME_ENSURE: Callable[[], Awaitable[Any]] | None = None
+
+
+def set_chat_agent_runtime_ensure(
+    callback: Callable[[], Awaitable[Any]] | None,
+) -> None:
+    global _CHAT_AGENT_RUNTIME_ENSURE
+    _CHAT_AGENT_RUNTIME_ENSURE = callback
+
+
+@contextlib.asynccontextmanager
+async def _chat_agent_runtime_factory():
+    if _CHAT_AGENT_RUNTIME_ENSURE is not None:
+        await _CHAT_AGENT_RUNTIME_ENSURE()
+    async with InternalChatClient(
+        os.environ.get("MCP_CHAT_WATCHDOG_CDP", DEFAULT_CODEX_CDP_ENDPOINT),
+        timeout=float(os.environ.get("MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS", "10")),
+        stream_timeout_seconds=max(30, int(os.environ.get("MCP_CHAT_WATCHDOG_STREAM_TIMEOUT_SECONDS", "3600"))),
+        preferred_model=os.environ.get("MCP_CHAT_WATCHDOG_MODEL", ""),
+        thinking_effort=os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
+        require_high_reasoning=os.environ.get("MCP_CHAT_WATCHDOG_REQUIRE_HIGH", "1").strip().lower() not in {"0", "false", "no", "off"},
+    ) as runtime:
+        yield runtime
+
+
+def get_chat_agent_coordinator() -> ChatAgentCoordinator:
+    global _CHAT_AGENT_COORDINATOR
+    if _CHAT_AGENT_COORDINATOR is None:
+        _CHAT_AGENT_COORDINATOR = ChatAgentCoordinator(
+            CoordinatorConfig(
+                CHAT_AGENT_DB_PATH,
+                context_max_events=CHAT_AGENT_CONTEXT_MAX_EVENTS,
+                context_max_chars=CHAT_AGENT_CONTEXT_MAX_CHARS,
+                tail_lines=CHAT_AGENT_TAIL_LINES,
+                tail_max_chars=CHAT_AGENT_TAIL_MAX_CHARS,
+                max_continue_attempts=CHAT_AGENT_MAX_CONTINUE_ATTEMPTS,
+                stale_after_seconds=CHAT_AGENT_STALE_SECONDS,
+            ),
+            _chat_agent_runtime_factory,
+        )
+    return _CHAT_AGENT_COORDINATOR
+
+
+def get_chat_agent_service() -> ChatAgentService:
+    global _CHAT_AGENT_SERVICE
+    if _CHAT_AGENT_SERVICE is None:
+        _CHAT_AGENT_SERVICE = ChatAgentService(
+            get_chat_agent_coordinator(),
+            enabled=CHAT_AGENT_ENABLED,
+            interval_seconds=CHAT_AGENT_SYNC_SECONDS,
+        )
+    return _CHAT_AGENT_SERVICE
 
 
 def _format_goal_context(goal: dict[str, Any], *, reminder: bool = False) -> str:
@@ -3425,6 +3504,377 @@ def _install_dynamic_initialization() -> None:
 
 # Keep discovery deterministic and intentionally small. The recovery/bootstrap
 # tools are deliberately first so they are visible before any gated work.
+
+async def _chat_agent_gate(session_id: str, cwd: str | None) -> str | None:
+    session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    return _require_project_context(session, run_cwd)
+
+
+async def _chat_agent_working_directory(
+    value: str,
+    session_id: str,
+    cwd: str | None,
+    *,
+    default_to_operation_cwd: bool,
+) -> str | None:
+    session = await _get_session(session_id)
+    run_cwd = _operation_cwd(session, cwd)
+    if value.strip():
+        return str(_resolve_cwd(value.strip(), run_cwd))
+    return str(run_cwd) if default_to_operation_cwd else None
+
+
+def _chat_agent_json(value: Any) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _chat_agent_error(exc: BaseException) -> str:
+    return f"Error: {sanitize_runtime_error(f'{type(exc).__name__}: {exc}') or type(exc).__name__}"
+
+
+def _conversation_id_input(value: str) -> str:
+    value = value.strip()
+    if value.startswith("http://") or value.startswith("https://"):
+        return parse_chat_link(value).conversation_id
+    if not value:
+        raise ValueError("chat_id is required")
+    return value
+
+
+@mcp.tool()
+async def agent_projects_list(
+    limit: int = 20,
+    cursor: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """List writable/readable ChatGPT Projects for explicit child-agent placement."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            await get_chat_agent_coordinator().list_projects(
+                limit=limit, cursor=cursor or None
+            )
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_project_get(
+    project_id: str,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Read one ChatGPT Project's safe metadata and permissions."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(await get_chat_agent_coordinator().get_project(project_id))
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_project_threads(
+    project_id: str,
+    limit: int = 20,
+    cursor: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """List normal ChatGPT conversations currently assigned to a project."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            await get_chat_agent_coordinator().list_project_threads(
+                project_id, limit=limit, cursor=cursor or None
+            )
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_register_parent(
+    chat_id: str,
+    project_id: str = "",
+    working_directory: str = "",
+    title: str = "",
+    notification_policy: str = "notify_only",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Register an existing ChatGPT conversation as a root orchestration agent."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        resolved_working_directory = await _chat_agent_working_directory(
+            working_directory,
+            session_id,
+            cwd,
+            default_to_operation_cwd=True,
+        )
+        result = await get_chat_agent_coordinator().register_parent(
+            _conversation_id_input(chat_id),
+            project_id=project_id or None,
+            working_directory=resolved_working_directory,
+            title=title,
+            notification_policy=notification_policy,
+        )
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_spawn(
+    parent_agent_id: str,
+    prompt: str,
+    project_policy: str = "inherit_parent",
+    project_id: str = "",
+    working_directory: str = "",
+    title: str = "",
+    completion_marker: str = DEFAULT_AGENT_COMPLETION_MARKER,
+    notification_policy: str = "auto_resume",
+    idempotency_key: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Create, register, and monitor a child normal-ChatGPT thread."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        coordinator = get_chat_agent_coordinator()
+        resolved_working_directory = await _chat_agent_working_directory(
+            working_directory,
+            session_id,
+            cwd,
+            default_to_operation_cwd=False,
+        )
+        result = await coordinator.spawn(
+            parent_agent_id,
+            prompt,
+            project_policy=project_policy,
+            project_id=project_id or None,
+            working_directory=resolved_working_directory,
+            title=title,
+            completion_marker=completion_marker,
+            notification_policy=notification_policy,
+            idempotency_key=idempotency_key or None,
+        )
+        get_chat_agent_service().wake()
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_status(
+    agent_id: str,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Return one agent's durable task, runtime state, and mailbox counts."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(await get_chat_agent_coordinator().status(agent_id))
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_context(
+    agent_id: str,
+    since_cursor: str = "",
+    max_events: int = CHAT_AGENT_CONTEXT_MAX_EVENTS,
+    max_chars: int = CHAT_AGENT_CONTEXT_MAX_CHARS,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Return a compact safe child-execution delta: progress, tools, recap, and final output."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            await get_chat_agent_coordinator().context(
+                agent_id,
+                since_cursor=since_cursor or None,
+                max_events=max_events,
+                max_chars=max_chars,
+            )
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_tail(
+    agent_id: str,
+    lines: int = CHAT_AGENT_TAIL_LINES,
+    max_chars: int = CHAT_AGENT_TAIL_MAX_CHARS,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Return recent visible child messages and summarized tool activity."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            await get_chat_agent_coordinator().tail(
+                agent_id, lines=lines, max_chars=max_chars
+            )
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_send(
+    from_agent_id: str,
+    to_agent_id: str,
+    message: str,
+    interrupt_policy: str = "queue",
+    idempotency_key: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Queue an ordered parent/child follow-up; active turns are not interrupted by default."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        result = await get_chat_agent_coordinator().send(
+            from_agent_id,
+            to_agent_id,
+            message,
+            interrupt_policy=interrupt_policy,
+            idempotency_key=idempotency_key or None,
+        )
+        get_chat_agent_service().wake()
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_wait(
+    agent_id: str,
+    after_event_seq: int = 0,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Poll durable state and child events after a previously observed event sequence."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            await get_chat_agent_coordinator().wait(
+                agent_id, after_event_seq=after_event_seq
+            )
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_sync(
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Run one explicit sequential orchestration sync and perform at most one ChatGPT write."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(await get_chat_agent_service().sync_now())
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_children(
+    parent_agent_id: str,
+    recursive: bool = False,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """List direct children or the complete persistent orchestration subtree."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            await get_chat_agent_coordinator().children(
+                parent_agent_id, recursive=recursive
+            )
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_subscribe(
+    parent_agent_id: str,
+    child_agent_id: str,
+    notification_policy: str = "notify_only",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Choose notify-only or terminal-safe parent auto-resume for one child."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        result = await get_chat_agent_coordinator().subscribe(
+            parent_agent_id, child_agent_id, notification_policy
+        )
+        get_chat_agent_service().wake()
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_ack(
+    parent_agent_id: str,
+    child_agent_id: str,
+    event_seq: int,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Acknowledge child events through an event sequence for durable delivery cursors."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            await get_chat_agent_coordinator().ack(
+                parent_agent_id, child_agent_id, event_seq
+            )
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_cancel(
+    agent_id: str,
+    interrupt: bool = False,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Cancel an orchestration agent and optionally interrupt its active owned stream."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        result = await get_chat_agent_coordinator().cancel(
+            agent_id, interrupt=interrupt
+        )
+        get_chat_agent_service().wake()
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
 PUBLIC_TOOL_ORDER = (
     "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
     "thread_goal", "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
@@ -3433,6 +3883,10 @@ PUBLIC_TOOL_ORDER = (
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
     "run_agy_yolo", "start_agy_yolo",
+    "agent_projects_list", "agent_project_get", "agent_project_threads",
+    "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
+    "agent_tail", "agent_send", "agent_wait", "agent_sync", "agent_children",
+    "agent_subscribe", "agent_ack", "agent_cancel",
 )
 mcp._tool_manager._tools = {name: mcp._tool_manager._tools[name] for name in PUBLIC_TOOL_ORDER}
 _set_startup_instructions()
@@ -3452,8 +3906,10 @@ def main() -> None:
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
         chat_watchdog = ChatWatchdog(watchdog_config)
+        set_chat_agent_runtime_ensure(chat_watchdog.ensure_background_runtime)
         install_usage_dashboard(app, GPT_STORE, chat_watchdog)
         install_chat_watchdog_lifespan(app, chat_watchdog)
+        install_chat_agent_lifespan(app, get_chat_agent_service())
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
         if bearer_token:
             app.add_middleware(BearerAuthMiddleware, token=bearer_token)

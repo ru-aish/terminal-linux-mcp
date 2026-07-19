@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import inspect
 from pathlib import Path
 import sys
@@ -291,7 +292,9 @@ def test_stream_start_promise_is_not_treated_as_completion():
     source = inspect.getsource(InternalChatClient.continue_thread)
     assert "streamRequestId" in source
     assert "finish('promise')" not in source
-    assert "if (!settled) handles.set(conversationId, handle)" in source
+    assert "if (!streamFinished) handles.set(conversationId, handle)" in source
+    assert "const waitForCompletion" in source
+    assert "finishDispatch" in source
 
 
 def test_runtime_errors_are_sanitized():
@@ -303,3 +306,328 @@ def test_runtime_errors_are_sanitized():
     assert "private" not in text
     assert "abc.def" not in text
     assert "[redacted]" in text
+
+
+def test_project_normalization_exposes_safe_selection_metadata():
+    from chat_internal_client import normalize_project_list, normalize_project_threads
+
+    raw = {
+        "cursor": "next",
+        "items": [
+            {
+                "gizmo": {
+                    "gizmo": {
+                        "id": "g-p-project",
+                        "display": {"name": "PrivacyAI", "description": "Private project"},
+                        "current_user_permission": {"can_read": True, "can_write": True},
+                        "updated_at": "2026-07-19T00:00:00Z",
+                    }
+                },
+                "conversations": {"items": [{"id": "chat-a"}]},
+            }
+        ],
+    }
+    normalized = normalize_project_list(raw)
+    assert normalized["cursor"] == "next"
+    assert normalized["items"] == [
+        {
+            "id": "g-p-project",
+            "name": "PrivacyAI",
+            "description": "Private project",
+            "archived": False,
+            "updated_at": "2026-07-19T00:00:00Z",
+            "permissions": {"can_read": True, "can_write": True, "can_delete": False},
+            "conversation_count": 1,
+        }
+    ]
+
+    threads = normalize_project_threads(
+        {"items": [{"id": "chat-a", "title": "Agent", "current_node": "node"}]},
+        "g-p-project",
+    )
+    assert threads["items"][0]["project_id"] == "g-p-project"
+    assert threads["items"][0]["conversation_id"] == "chat-a"
+
+
+def test_context_digest_includes_tools_and_recap_but_not_hidden_reasoning():
+    from chat_internal_client import build_thread_context, build_thread_tail
+
+    def node(parent, item):
+        return {"parent": parent, "message": item}
+
+    def raw_message(
+        mid,
+        role,
+        text,
+        *,
+        content_type="text",
+        recipient="all",
+        name="",
+        hidden=False,
+        preamble=False,
+        end_turn=None,
+    ):
+        content = {"content_type": content_type}
+        if content_type == "reasoning_recap":
+            content["content"] = text
+        else:
+            content["parts"] = [text]
+        return {
+            "id": mid,
+            "author": {"role": role, "name": name},
+            "content": content,
+            "recipient": recipient,
+            "status": "finished_successfully",
+            "end_turn": end_turn,
+            "metadata": {
+                "is_visually_hidden_from_conversation": hidden,
+                "is_thinking_preamble_message": preamble,
+            },
+        }
+
+    raw = {
+        "id": "chat",
+        "current_node": "final",
+        "mapping": {
+            "user": node(None, raw_message("user", "user", "do work")),
+            "secret": node("user", raw_message("secret", "assistant", "private hidden thought", hidden=True, end_turn=False)),
+            "progress": node("secret", raw_message("progress", "assistant", "Inspecting tests", hidden=True, preamble=True, end_turn=False)),
+            "call": node("progress", raw_message("call", "assistant", '{"token":"secret"}', content_type="code", recipient="terminal.run")),
+            "result": node(
+                "call",
+                raw_message(
+                    "result",
+                    "tool",
+                    "Authorization: abc token=private session_id=s123 70 tests passed",
+                    name="terminal.run",
+                ),
+            ),
+            "recap": node("result", raw_message("recap", "assistant", "The stream contract is fixed.", content_type="reasoning_recap", end_turn=False)),
+            "final": node("recap", raw_message("final", "assistant", "Completed", end_turn=True)),
+        },
+    }
+    digest = build_thread_context(raw, "chat")
+    kinds = [event["kind"] for event in digest["events"]]
+    assert kinds == ["progress", "tool_call", "tool_result", "reasoning_recap", "final"]
+    rendered = json.dumps(digest)
+    assert "private hidden thought" not in rendered
+    assert '"token":"secret"' not in rendered
+    assert "abc" not in rendered
+    assert "private" not in rendered
+    assert "s123" not in rendered
+    assert "[redacted]" in rendered
+
+    cursor = digest["events"][1]["cursor"]
+    delta = build_thread_context(raw, "chat", since_cursor=cursor)
+    assert [event["kind"] for event in delta["events"]] == [
+        "tool_result",
+        "reasoning_recap",
+        "final",
+    ]
+    tail = build_thread_tail(raw, "chat", lines=10)
+    assert "private hidden thought" not in tail["text"]
+    assert "tool_call: terminal.run" in tail["text"]
+    assert "reasoning_recap: The stream contract is fixed." in tail["text"]
+    assert "Completed" in tail["text"]
+
+
+def test_create_thread_uses_project_mode_and_verifies_persistence(monkeypatch):
+    async def run():
+        client = InternalChatClient("http://127.0.0.1:9996")
+        captured = ""
+        after_raw = {
+            "id": "conversation-new",
+            "current_node": "assistant-node",
+            "gizmo_id": "g-p-project",
+            "mapping": {
+                "user-node": {
+                    "parent": None,
+                    "message": message("user-message", "user", "start task"),
+                },
+                "assistant-node": {
+                    "parent": "user-node",
+                    "message": message(
+                        "assistant-message",
+                        "assistant",
+                        "working",
+                        status="in_progress",
+                        end_turn=False,
+                    ),
+                },
+            },
+        }
+
+        async def fake_evaluate(body):
+            nonlocal captured
+            captured = body
+            return {
+                "sent": True,
+                "observed": True,
+                "running": True,
+                "conversation_id": "conversation-new",
+                "user_message_id": "user-message",
+                "project_id": "g-p-project",
+                "after_raw": after_raw,
+            }
+
+        monkeypatch.setattr(client, "_evaluate", fake_evaluate)
+        result = await client.create_thread(
+            "start task", project_id="g-p-project", title="Child"
+        )
+        assert "startCompletionStream" in captured
+        assert "gizmo_interaction" in captured
+        assert "conversation_mode" in captured
+        assert "parent_message_id" not in captured
+        assert result["observed"] is True
+        assert result["conversation_id"] == "conversation-new"
+        assert result["chat_url"].endswith("/g/g-p-project/c/conversation-new")
+        assert result["current_node"] == "assistant-node"
+
+    asyncio.run(run())
+
+
+def test_new_thread_late_handle_cannot_restore_completed_stream_marker():
+    source = inspect.getsource(InternalChatClient.create_thread)
+    assert "streamFinished = false" in source
+    assert "streamFinished = true; observe(value)" in source
+    assert "conversationId && !streamFinished" in source
+    assert "streams.delete(conversationId); handles.delete(conversationId)" in source
+    assert "ownedStream = streams.has(conversationId) && !streamFinished" in source
+
+
+def test_create_thread_reports_terminal_readback_without_owned_stream(monkeypatch):
+    async def run():
+        client = InternalChatClient("http://127.0.0.1:9995")
+        after_raw = {
+            "id": "conversation-done",
+            "current_node": "assistant-node",
+            "mapping": {
+                "user-node": {
+                    "parent": None,
+                    "message": message("user-message", "user", "quick task"),
+                },
+                "assistant-node": {
+                    "parent": "user-node",
+                    "message": message(
+                        "assistant-message",
+                        "assistant",
+                        "done",
+                        status="finished_successfully",
+                        end_turn=True,
+                    ),
+                },
+            },
+        }
+
+        async def fake_evaluate(_body):
+            return {
+                "sent": True,
+                "observed": True,
+                "running": True,
+                "owned_stream": False,
+                "conversation_id": "conversation-done",
+                "user_message_id": "user-message",
+                "after_raw": after_raw,
+            }
+
+        monkeypatch.setattr(client, "_evaluate", fake_evaluate)
+        result = await client.create_thread("quick task")
+        assert result["observed"] is True
+        assert result["running"] is False
+        assert result["current_node"] == "assistant-node"
+
+    asyncio.run(run())
+
+
+def test_orchestration_dispatch_mode_is_encoded_without_terminal_wait():
+    source = inspect.getsource(InternalChatClient.continue_thread)
+    assert "wait_for_completion: bool = True" in source
+    assert "waitForCompletion ?" in source
+    assert "after.currentNode !== expectedNode" in source
+    assert "completion stream did not start before the dispatch timeout" in source
+
+
+def test_context_cursor_detects_same_node_progress_update():
+    from chat_internal_client import build_thread_context
+
+    def payload(text):
+        return {
+            "id": "chat",
+            "current_node": "assistant-node",
+            "mapping": {
+                "user-node": {
+                    "parent": None,
+                    "message": message("user-message", "user", "task"),
+                },
+                "assistant-node": {
+                    "parent": "user-node",
+                    "message": {
+                        **message(
+                            "assistant-message",
+                            "assistant",
+                            text,
+                            status="in_progress",
+                            end_turn=False,
+                        ),
+                        "metadata": {
+                            "is_thinking_preamble_message": True,
+                            "is_visually_hidden_from_conversation": True,
+                        },
+                    },
+                },
+            },
+        }
+
+    first = build_thread_context(payload("working"), "chat")
+    cursor = first["next_cursor"]
+    second = build_thread_context(
+        payload("working with more detail"),
+        "chat",
+        since_cursor=cursor,
+    )
+    assert second["cursor_reset"] is False
+    assert second["cursor_updated"] is True
+    assert len(second["events"]) == 1
+    assert second["events"][0]["summary"] == "working with more detail"
+    assert second["next_cursor"] != cursor
+
+
+def test_truncated_context_event_cursor_does_not_repeat_forever():
+    from chat_internal_client import build_thread_context
+
+    raw = {
+        "id": "chat",
+        "current_node": "assistant-node",
+        "mapping": {
+            "user-node": {
+                "parent": None,
+                "message": message("user-message", "user", "task"),
+            },
+            "assistant-node": {
+                "parent": "user-node",
+                "message": {
+                    **message(
+                        "assistant-message",
+                        "assistant",
+                        "x" * 3000,
+                        status="in_progress",
+                        end_turn=False,
+                    ),
+                    "metadata": {
+                        "is_thinking_preamble_message": True,
+                        "is_visually_hidden_from_conversation": True,
+                    },
+                },
+            },
+        },
+    }
+    first = build_thread_context(raw, "chat", max_chars=300)
+    assert len(first["events"]) == 1
+    second = build_thread_context(
+        raw,
+        "chat",
+        since_cursor=first["next_cursor"],
+        max_chars=300,
+    )
+    assert second["events"] == []
+    assert second["next_cursor"] == first["next_cursor"]

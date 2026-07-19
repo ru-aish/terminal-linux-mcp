@@ -1452,6 +1452,41 @@ def test_running_conversation_does_not_starve_later_candidate(tmp_path):
             for entry in result["queue"]["entries"]
         }
         assert states[first.conversation_id] == ThreadDecisionState.RUNNING_CANONICAL.value
-        assert states[second.conversation_id] == "queued"
+        assert states[second.conversation_id] == "continue_sent"
+
+    asyncio.run(run())
+
+
+def test_public_runtime_ensure_serializes_concurrent_launch_attempts(tmp_path, monkeypatch):
+    async def run():
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "q",
+                tmp_path / "s",
+                tmp_path / "d",
+            )
+        )
+        active = 0
+        maximum = 0
+        calls = 0
+
+        async def fake_ensure():
+            nonlocal active, maximum, calls
+            calls += 1
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            return True
+
+        monkeypatch.setattr(watchdog, "_ensure_background_runtime", fake_ensure)
+        results = await asyncio.gather(
+            watchdog.ensure_background_runtime(),
+            watchdog.ensure_background_runtime(),
+        )
+        assert results == [True, True]
+        assert calls == 2
+        assert maximum == 1
 
     asyncio.run(run())
