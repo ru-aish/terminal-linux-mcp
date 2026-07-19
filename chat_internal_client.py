@@ -240,6 +240,20 @@ def normalize_conversation_payload(
         cursor = str(node.get("parent") or "")
 
     active_branch = list(reversed(reverse))
+    # Keep branch-wide IDs separately from the active transcript.  A send can
+    # create a sibling branch while the user (or the app) moves current_node;
+    # reconciliation must be able to prove that exact generated message without
+    # treating the side branch as canonical for task classification.
+    branch_message_ids = {
+        str(message.get("id") or node_id)
+        for node_id, node in mapping.items()
+        if isinstance(node, dict)
+        and isinstance((message := node.get("message")), dict)
+        and not (
+            isinstance(message.get("metadata"), dict)
+            and message["metadata"].get("is_visually_hidden_from_conversation")
+        )
+    }
     visible_turns = [turn for turn in active_branch if turn["role"] in {"user", "assistant"}]
     latest = active_branch[-1] if active_branch else None
     status = str(latest.get("status") or "").casefold() if latest else ""
@@ -264,6 +278,8 @@ def normalize_conversation_payload(
         "active_stream": owned_stream,
         "running": owned_stream or canonical_running,
         "turns": visible_turns,
+        "branch_message_ids": sorted(branch_message_ids),
+        "all_message_ids": sorted(branch_message_ids),
     }
 
 
@@ -1253,7 +1269,14 @@ class InternalChatClient:
         if payload.get("after_raw") is not None:
             after = normalize_conversation_payload(payload.pop("after_raw"), conversation_id)
             user_id = str(payload.get("user_message_id") or "")
-            persisted = any(turn.get("key") == user_id for turn in after.get("turns", []))
+            verified = bool(
+                after.get("found")
+                and after.get("canonical")
+                and after.get("state_verified")
+            )
+            persisted = verified and any(
+                turn.get("key") == user_id for turn in after.get("turns", [])
+            )
             payload["observed"] = persisted
             payload["running"] = bool(payload.get("running")) or bool(after.get("running"))
             if not persisted and not payload.get("reason"):

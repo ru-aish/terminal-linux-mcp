@@ -360,18 +360,29 @@ Actions:
 
 The refactor is not complete until all gates pass:
 
-- [ ] Pure reducer decision matrix tests.
-- [ ] Ledger migration, concurrency, crash-recovery, ordering, and idempotency tests.
-- [ ] Gateway target-selection, app lifecycle, branch-aware confirmation, uncertain reconciliation, and cancellation tests.
-- [ ] Existing watchdog and agent public-tool behavior remains compatible unless intentionally documented.
-- [ ] Full test suite passes.
-- [ ] Static syntax/compile checks pass.
-- [ ] `git diff --check` passes.
-- [ ] Independent code review finds no high-confidence correctness defects.
+- [x] Pure reducer decision matrix tests.
+- [x] Ledger migration, concurrency, crash-recovery, ordering, and idempotency tests.
+- [x] Gateway target-selection, app lifecycle, branch-aware confirmation, uncertain reconciliation, and cancellation tests.
+- [x] Existing watchdog and agent public-tool behavior remains compatible unless intentionally documented.
+- [x] Full test suite passes (146 tests).
+- [x] Static syntax/compile checks pass.
+- [x] `git diff --check` passes.
+- [x] Independent code review finds no high-confidence correctness defects.
 - [ ] Live canary: create/read/send/follow-up on a disposable conversation.
 - [ ] Live canary: app closed/reopened recovery.
 - [ ] Live canary: parent sends a follow-up to a child.
 - [ ] Live canary: child completion automatically reaches parent.
 - [ ] Live canary: branch change after submission reconciles without duplicate send.
+
+## Implementation verification status
+
+Automated verification completed in the isolated worktree:
+
+- **Conversation Gateway:** read/create/send/cancel classification, target-node changes, active streams, app/runtime unavailable states, JavaScript protocol failures, timeout boundaries, post-dispatch uncertainty, verified branch-wide reconciliation, and invalid-input failures.
+- **Durable Ledger:** schema versions 1–7, legacy notification-purpose migration, legacy watchdog JSON import, shared watchdog/agent database coexistence, WAL/foreign-key configuration, crash recovery, send-evidence persistence, strict same-target ordering, idempotency, completion supersession, and active-task removal.
+- **State Reducer:** exact completion-marker matrix, terminal failure/incomplete states, contradictory canonical metadata, missing transcripts, stale generation handling, parent-instruction priority, blocking question/answer behavior, and fail-closed read errors.
+- **Integrated workflows:** parent-to-child delivery, child questions, parent answers, restart recovery, interrupt cancellation recovery, multi-child fairness, uncertain progress followed by completion, oversized event histories, duplicate-final prevention, terminal-parent handling, and background reconciliation liveness.
+
+The five live canaries below remain intentionally unchecked. They require deploying/restarting this branch against the authenticated desktop runtime; unit and integration tests do not substitute for that deployment validation. The existing live Terminal MCP service was not restarted or modified during this work.
 
 Live tests that require the authenticated desktop runtime must report environmental blockers honestly; they must not be replaced by claims based only on fakes.

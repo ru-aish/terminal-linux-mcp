@@ -1,0 +1,268 @@
+"""The durable SQLite ledger used by the three-building-block workflow.
+
+This module owns the database connection, schema, migrations, transactions and
+ledger queries.  The old ``AgentRepository`` name is re-exported by the
+orchestrator for source compatibility; it is an alias, not a second store.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any, Iterator
+
+
+COMMAND_STATES = frozenset({
+    "queued", "waiting_after_cancel", "cancel_in_flight", "delivery_in_flight",
+    "delivery_uncertain", "delivered", "acknowledged", "cancelled", "superseded",
+})
+COMMAND_PURPOSES = frozenset({
+    "instruction", "answer", "question", "progress", "completion",
+})
+TASK_STATES = frozenset({
+    "creating_thread", "creation_in_flight", "running", "continuation_in_flight",
+    "continuation_uncertain", "waiting_after_continue", "completed", "failed",
+    "cancelled", "unknown", "waiting_for_parent",
+})
+
+
+def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row is not None else None
+
+
+class DurableLedger:
+    """Transactional repository for actors, tasks, commands and cursors."""
+
+    SCHEMA_VERSION = 7
+
+    def __init__(self, path: Path):
+        self.path = Path(path).expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migrate()
+
+    def connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=30)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=30000")
+        return db
+
+    def _migrate(self) -> None:
+        with self.connect() as db:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS orchestrations(
+                    orchestration_id TEXT PRIMARY KEY, root_agent_id TEXT,
+                    notification_policy TEXT NOT NULL, created_at REAL NOT NULL, closed_at REAL
+                );
+                CREATE TABLE IF NOT EXISTS agents(
+                    agent_id TEXT PRIMARY KEY,
+                    orchestration_id TEXT NOT NULL REFERENCES orchestrations(orchestration_id) ON DELETE CASCADE,
+                    parent_agent_id TEXT REFERENCES agents(agent_id), root_agent_id TEXT NOT NULL,
+                    chat_id TEXT UNIQUE, project_id TEXT, working_directory TEXT,
+                    title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                    notification_policy TEXT NOT NULL, context_cursor TEXT, current_node TEXT,
+                    last_progress_at REAL, progress_signature TEXT, last_error TEXT NOT NULL DEFAULT '',
+                    spawn_idempotency_key TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS agents_parent_spawn_key
+                    ON agents(parent_agent_id, spawn_idempotency_key)
+                    WHERE spawn_idempotency_key IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS tasks(
+                    task_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL UNIQUE REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    prompt TEXT NOT NULL, completion_marker TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                    continue_attempts INTEGER NOT NULL DEFAULT 0, last_continue_node TEXT,
+                    last_continue_at REAL, created_at REAL NOT NULL, completed_at REAL
+                );
+                CREATE TABLE IF NOT EXISTS commands(
+                    command_id TEXT PRIMARY KEY, from_agent_id TEXT REFERENCES agents(agent_id),
+                    to_agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    sequence_no INTEGER NOT NULL, message TEXT NOT NULL, interrupt_policy TEXT NOT NULL,
+                    status TEXT NOT NULL, idempotency_key TEXT, ack_event_seq INTEGER,
+                    request_id TEXT, user_message_id TEXT, parent_message_id TEXT,
+                    created_at REAL NOT NULL, delivered_at REAL, last_error TEXT NOT NULL DEFAULT '',
+                    purpose TEXT NOT NULL DEFAULT 'instruction'
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS commands_sender_key
+                    ON commands(from_agent_id, to_agent_id, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS commands_target_sequence ON commands(to_agent_id, sequence_no);
+                CREATE TABLE IF NOT EXISTS events(
+                    event_seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+                    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    task_id TEXT REFERENCES tasks(task_id) ON DELETE SET NULL, kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL, source_cursor TEXT, created_at REAL NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS events_agent_source
+                    ON events(agent_id, source_cursor, kind) WHERE source_cursor IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS subscriptions(
+                    parent_agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    child_agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    notification_policy TEXT NOT NULL, last_acked_event_seq INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL, PRIMARY KEY(parent_agent_id, child_agent_id)
+                );
+                CREATE TABLE IF NOT EXISTS watchdog_tasks(
+                    conversation_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                """
+            )
+            for table, column, definition in (
+                ("tasks", "continue_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("tasks", "last_continue_node", "TEXT"),
+                ("tasks", "last_continue_at", "REAL"),
+                ("commands", "ack_event_seq", "INTEGER"),
+                ("commands", "request_id", "TEXT"),
+                ("commands", "user_message_id", "TEXT"),
+                ("commands", "parent_message_id", "TEXT"),
+                ("commands", "purpose", "TEXT NOT NULL DEFAULT 'instruction'"),
+                ("agents", "last_progress_at", "REAL"),
+                ("agents", "working_directory", "TEXT"),
+                ("agents", "progress_signature", "TEXT"),
+            ):
+                self._ensure_column(db, table, column, definition)
+            # Rows created before schema v6 had no purpose column. Notification
+            # commands are identifiable by their event cursor and must not be
+            # mistaken for parent instructions after migration.
+            db.execute(
+                "UPDATE commands SET purpose=CASE "
+                "WHEN message LIKE '%\"kind\":\"completed\"%' "
+                "OR message LIKE '%\"kind\":\"completion\"%' THEN 'completion' "
+                "ELSE 'progress' END "
+                "WHERE ack_event_seq IS NOT NULL AND purpose='instruction'"
+            )
+            db.execute(
+                "INSERT INTO schema_meta(key,value) VALUES('version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(self.SCHEMA_VERSION),),
+            )
+
+    @staticmethod
+    def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        db = self.connect()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def agent(self, agent_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            return _row(db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone())
+
+    def agent_by_chat(self, chat_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            return _row(db.execute("SELECT * FROM agents WHERE chat_id=?", (chat_id,)).fetchone())
+
+    def task_for_agent(self, agent_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            return _row(db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)).fetchone())
+
+    def children(self, parent_agent_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM agents WHERE parent_agent_id=? ORDER BY created_at,agent_id", (parent_agent_id,)
+            )]
+
+    def active_agents(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM agents WHERE chat_id IS NOT NULL AND status NOT IN "
+                "('cancelled','failed','completed') ORDER BY created_at,agent_id"
+            )]
+
+    def queued_commands(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT c.* FROM commands c "
+                    "WHERE c.status IN ('queued','waiting_after_cancel') "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM commands prior "
+                    "  WHERE prior.to_agent_id=c.to_agent_id "
+                    "  AND prior.sequence_no<c.sequence_no "
+                    "  AND prior.status NOT IN "
+                    "      ('delivered','acknowledged','cancelled','superseded')"
+                    ") "
+                    "ORDER BY c.created_at,c.sequence_no,c.command_id"
+                )
+            ]
+
+    def uncertain_commands(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM commands WHERE status='delivery_uncertain' ORDER BY created_at,sequence_no,command_id"
+            )]
+
+    def events_after(self, agent_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            result = []
+            for row in db.execute("SELECT * FROM events WHERE agent_id=? AND event_seq>? ORDER BY event_seq", (agent_id, after_seq)):
+                item = dict(row)
+                item["payload"] = json.loads(item.pop("payload_json"))
+                result.append(item)
+            return result
+    def watchdog_state(self, conversation_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT state_json FROM watchdog_tasks WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            return {}
+        payload = json.loads(str(row["state_json"]))
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def watchdog_states(self) -> dict[str, dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT conversation_id,state_json FROM watchdog_tasks "
+                "ORDER BY conversation_id"
+            ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            payload = json.loads(str(row["state_json"]))
+            if isinstance(payload, dict):
+                result[str(row["conversation_id"])] = dict(payload)
+        return result
+
+    def put_watchdog_state(
+        self,
+        conversation_id: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(state)
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO watchdog_tasks(conversation_id,state_json,updated_at) "
+                "VALUES(?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET "
+                "state_json=excluded.state_json,updated_at=excluded.updated_at",
+                (conversation_id, encoded, time.time()),
+            )
+        return normalized
+
+
+__all__ = ["COMMAND_PURPOSES", "COMMAND_STATES", "TASK_STATES", "DurableLedger"]

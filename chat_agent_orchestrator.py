@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import contextlib
 import hashlib
@@ -11,10 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncContextManager, Callable, Protocol
 
+from conversation_gateway import ConversationGateway, DeliveryResult, DeliveryState
+from durable_ledger import COMMAND_PURPOSES, DurableLedger
+from state_reducer import ActionType, ReducedState, reduce_snapshot
 
-TERMINAL_ASSISTANT_STATUSES = frozenset(
-    {"finished_successfully", "finished_error", "failed", "cancelled", "canceled", "interrupted", "incomplete"}
-)
+
 PROJECT_POLICIES = frozenset({"explicit", "inherit_parent", "none"})
 NOTIFICATION_POLICIES = frozenset({"notify_only", "auto_resume"})
 INTERRUPT_POLICIES = frozenset({"queue", "interrupt"})
@@ -46,24 +46,6 @@ def _safe_error(error: BaseException) -> str:
         if index >= 0:
             text = text[:index] + f"{needle}=[redacted]"
     return text[:500]
-
-
-def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return dict(row) if row is not None else None
-
-
-def _is_terminal_snapshot(snapshot: dict[str, Any]) -> bool:
-    if snapshot.get("running") or snapshot.get("active_stream"):
-        return False
-    turns = snapshot.get("turns")
-    if not isinstance(turns, list) or not turns:
-        return False
-    latest = turns[-1]
-    return bool(
-        latest.get("role") == "assistant"
-        and str(latest.get("status") or "").casefold() in TERMINAL_ASSISTANT_STATUSES
-        and latest.get("end_turn") is True
-    )
 
 
 class AgentRuntime(Protocol):
@@ -127,210 +109,8 @@ class CoordinatorConfig:
     stale_after_seconds: float = 600.0
 
 
-class AgentRepository:
-    SCHEMA_VERSION = 5
-
-    def __init__(self, path: Path):
-        self.path = path.expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._migrate()
-
-    def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
-
-    def _migrate(self) -> None:
-        with self.connect() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS schema_meta(
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS orchestrations(
-                    orchestration_id TEXT PRIMARY KEY,
-                    root_agent_id TEXT,
-                    notification_policy TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    closed_at REAL
-                );
-                CREATE TABLE IF NOT EXISTS agents(
-                    agent_id TEXT PRIMARY KEY,
-                    orchestration_id TEXT NOT NULL REFERENCES orchestrations(orchestration_id) ON DELETE CASCADE,
-                    parent_agent_id TEXT REFERENCES agents(agent_id),
-                    root_agent_id TEXT NOT NULL,
-                    chat_id TEXT UNIQUE,
-                    project_id TEXT,
-                    working_directory TEXT,
-                    title TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL,
-                    notification_policy TEXT NOT NULL,
-                    context_cursor TEXT,
-                    current_node TEXT,
-                    last_progress_at REAL,
-                    progress_signature TEXT,
-                    last_error TEXT NOT NULL DEFAULT '',
-                    spawn_idempotency_key TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS agents_parent_spawn_key
-                    ON agents(parent_agent_id, spawn_idempotency_key)
-                    WHERE spawn_idempotency_key IS NOT NULL;
-                CREATE TABLE IF NOT EXISTS tasks(
-                    task_id TEXT PRIMARY KEY,
-                    agent_id TEXT NOT NULL UNIQUE REFERENCES agents(agent_id) ON DELETE CASCADE,
-                    prompt TEXT NOT NULL,
-                    completion_marker TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL,
-                    continue_attempts INTEGER NOT NULL DEFAULT 0,
-                    last_continue_node TEXT,
-                    last_continue_at REAL,
-                    created_at REAL NOT NULL,
-                    completed_at REAL
-                );
-                CREATE TABLE IF NOT EXISTS commands(
-                    command_id TEXT PRIMARY KEY,
-                    from_agent_id TEXT REFERENCES agents(agent_id),
-                    to_agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-                    sequence_no INTEGER NOT NULL,
-                    message TEXT NOT NULL,
-                    interrupt_policy TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    idempotency_key TEXT,
-                    ack_event_seq INTEGER,
-                    created_at REAL NOT NULL,
-                    delivered_at REAL,
-                    last_error TEXT NOT NULL DEFAULT ''
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS commands_sender_key
-                    ON commands(from_agent_id, to_agent_id, idempotency_key)
-                    WHERE idempotency_key IS NOT NULL;
-                CREATE UNIQUE INDEX IF NOT EXISTS commands_target_sequence
-                    ON commands(to_agent_id, sequence_no);
-                CREATE TABLE IF NOT EXISTS events(
-                    event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-                    task_id TEXT REFERENCES tasks(task_id) ON DELETE SET NULL,
-                    kind TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    source_cursor TEXT,
-                    created_at REAL NOT NULL
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS events_agent_source
-                    ON events(agent_id, source_cursor, kind)
-                    WHERE source_cursor IS NOT NULL;
-                CREATE TABLE IF NOT EXISTS subscriptions(
-                    parent_agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-                    child_agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
-                    notification_policy TEXT NOT NULL,
-                    last_acked_event_seq INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY(parent_agent_id, child_agent_id)
-                );
-                """
-            )
-            self._ensure_column(
-                db, "tasks", "continue_attempts", "INTEGER NOT NULL DEFAULT 0"
-            )
-            self._ensure_column(db, "tasks", "last_continue_node", "TEXT")
-            self._ensure_column(db, "tasks", "last_continue_at", "REAL")
-            self._ensure_column(db, "commands", "ack_event_seq", "INTEGER")
-            self._ensure_column(db, "agents", "last_progress_at", "REAL")
-            self._ensure_column(db, "agents", "working_directory", "TEXT")
-            self._ensure_column(db, "agents", "progress_signature", "TEXT")
-            db.execute(
-                "INSERT INTO schema_meta(key,value) VALUES('version',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(self.SCHEMA_VERSION),),
-            )
-
-    @staticmethod
-    def _ensure_column(
-        db: sqlite3.Connection,
-        table: str,
-        column: str,
-        definition: str,
-    ) -> None:
-        columns = {
-            str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")
-        }
-        if column not in columns:
-            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-    @contextlib.contextmanager
-    def transaction(self):
-        db = self.connect()
-        try:
-            db.execute("BEGIN IMMEDIATE")
-            yield db
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
-
-    def agent(self, agent_id: str) -> dict[str, Any] | None:
-        with self.connect() as db:
-            return _row(db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone())
-
-    def agent_by_chat(self, chat_id: str) -> dict[str, Any] | None:
-        with self.connect() as db:
-            return _row(db.execute("SELECT * FROM agents WHERE chat_id=?", (chat_id,)).fetchone())
-
-    def task_for_agent(self, agent_id: str) -> dict[str, Any] | None:
-        with self.connect() as db:
-            return _row(db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)).fetchone())
-
-    def children(self, parent_agent_id: str) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            return [
-                dict(row)
-                for row in db.execute(
-                    "SELECT * FROM agents WHERE parent_agent_id=? ORDER BY created_at,agent_id",
-                    (parent_agent_id,),
-                )
-            ]
-
-    def active_agents(self) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            return [
-                dict(row)
-                for row in db.execute(
-                    "SELECT * FROM agents WHERE chat_id IS NOT NULL AND status NOT IN "
-                    "('cancelled','failed','completed') ORDER BY created_at,agent_id"
-                )
-            ]
-
-    def queued_commands(self) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            return [
-                dict(row)
-                for row in db.execute(
-                    "SELECT * FROM commands WHERE status IN ('queued','waiting_after_cancel') "
-                    "ORDER BY created_at,sequence_no,command_id"
-                )
-            ]
-
-    def events_after(self, agent_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            rows = db.execute(
-                "SELECT * FROM events WHERE agent_id=? AND event_seq>? ORDER BY event_seq",
-                (agent_id, after_seq),
-            )
-            result = []
-            for row in rows:
-                item = dict(row)
-                item["payload"] = json.loads(item.pop("payload_json"))
-                result.append(item)
-            return result
-
+# Compatibility name retained for existing integrations and tests.
+AgentRepository = DurableLedger
 
 class ChatAgentCoordinator:
     def __init__(self, config: CoordinatorConfig, runtime_factory: RuntimeFactory):
@@ -345,8 +125,16 @@ class ChatAgentCoordinator:
         with self.repository.transaction() as db:
             db.execute(
                 "UPDATE commands SET status='delivery_uncertain',last_error=? "
-                "WHERE status IN ('delivery_in_flight','cancel_in_flight')",
+                "WHERE status='delivery_in_flight'",
                 ("Terminal MCP stopped during an external ChatGPT operation",),
+            )
+            db.execute(
+                "UPDATE commands SET status='waiting_after_cancel',last_error=? "
+                "WHERE status='cancel_in_flight'",
+                (
+                    "Terminal MCP stopped while cancellation was in flight; "
+                    "waiting for a verified terminal target before message delivery",
+                ),
             )
 
             continuation_rows = [
@@ -451,7 +239,8 @@ class ChatAgentCoordinator:
             row = db.execute(
                 "SELECT "
                 "EXISTS(SELECT 1 FROM tasks WHERE status NOT IN ('completed','failed','cancelled')) "
-                "OR EXISTS(SELECT 1 FROM commands WHERE status IN ('queued','waiting_after_cancel')) "
+                "OR EXISTS(SELECT 1 FROM commands WHERE status IN "
+                "('queued','waiting_after_cancel','delivery_uncertain')) "
                 "OR EXISTS("
                 "  SELECT 1 FROM subscriptions s JOIN events e ON e.agent_id=s.child_agent_id "
                 "  WHERE s.notification_policy='auto_resume' AND e.kind!='started' "
@@ -628,7 +417,10 @@ class ChatAgentCoordinator:
             "agent_context, or agent_children. Do not invent replacement IDs. "
             "To spawn a grandchild, pass your own agent_id as parent_agent_id. "
             "To message your parent, pass your own agent_id as from_agent_id and "
-            "parent_agent_id as to_agent_id.\n"
+            "parent_agent_id as to_agent_id. Use purpose='question' only for a "
+            "blocking question that requires the direct parent's answer; this pauses "
+            "generic continuation. The parent replies with purpose='answer'. Use the "
+            "default purpose for non-blocking updates.\n"
             + (
                 "Before terminal work, call bootstrap_thread with thread_id equal to "
                 f"your agent_id and cwd={working_directory!r}. Reuse agent_id as "
@@ -969,9 +761,14 @@ class ChatAgentCoordinator:
         *,
         interrupt_policy: str = "queue",
         idempotency_key: str | None = None,
+        purpose: str = "instruction",
     ) -> dict[str, Any]:
         if interrupt_policy not in INTERRUPT_POLICIES:
             raise ValueError("interrupt_policy must be queue or interrupt")
+        if purpose not in COMMAND_PURPOSES:
+            raise ValueError(
+                "purpose must be instruction, answer, question, progress, or completion"
+            )
         message = message.strip()
         if not message:
             raise ValueError("message is required")
@@ -981,6 +778,15 @@ class ChatAgentCoordinator:
             raise ValueError("sender or target agent was not found")
         if sender["orchestration_id"] != target["orchestration_id"]:
             raise ValueError("agents belong to different orchestrations")
+        if purpose == "question" and sender.get("parent_agent_id") != to_agent_id:
+            raise ValueError("a question must be sent from a child to its direct parent")
+        if purpose == "answer" and target.get("parent_agent_id") != from_agent_id:
+            raise ValueError("an answer must be sent from a parent to its direct child")
+        if purpose == "instruction" and sender.get("parent_agent_id") == to_agent_id:
+            # The default downward message is an instruction. The same default
+            # used upward is a non-blocking child update, so persist it as
+            # progress; final completion may then supersede uncertain progress.
+            purpose = "progress"
         terminal_statuses = {"cancelled", "failed", "completed"}
         if str(sender.get("status") or "") in terminal_statuses:
             raise ValueError("sender agent is terminal and cannot send new messages")
@@ -1005,8 +811,8 @@ class ChatAgentCoordinator:
                 )
                 command_id = _id("cmd")
                 db.execute(
-                    "INSERT INTO commands(command_id,from_agent_id,to_agent_id,sequence_no,message,interrupt_policy,status,idempotency_key,created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO commands(command_id,from_agent_id,to_agent_id,sequence_no,message,interrupt_policy,status,idempotency_key,purpose,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (
                         command_id,
                         from_agent_id,
@@ -1016,9 +822,20 @@ class ChatAgentCoordinator:
                         interrupt_policy,
                         "queued",
                         key,
+                        purpose,
                         _now(),
                     ),
                 )
+                if purpose == "question":
+                    db.execute(
+                        "UPDATE agents SET status='waiting_for_parent',updated_at=? "
+                        "WHERE agent_id=?",
+                        (_now(), from_agent_id),
+                    )
+                    db.execute(
+                        "UPDATE tasks SET status='waiting_for_parent' WHERE agent_id=?",
+                        (from_agent_id,),
+                    )
         except sqlite3.IntegrityError:
             if key:
                 with self.repository.connect() as db:
@@ -1053,9 +870,24 @@ class ChatAgentCoordinator:
                             max_events=self.config.context_max_events,
                             max_chars=self.config.context_max_chars,
                         )
-                        status = self._status_from_snapshot(snapshot)
                         task = self.repository.task_for_agent(agent["agent_id"])
-                        marker = str(task.get("completion_marker") or "") if task else ""
+                        with self.repository.connect() as db:
+                            pending = [dict(row) for row in db.execute(
+                                "SELECT * FROM commands WHERE to_agent_id=? AND status IN "
+                                "('queued','waiting_after_cancel','delivery_uncertain') ORDER BY sequence_no",
+                                (agent["agent_id"],),
+                            )]
+                        reduction = reduce_snapshot(task or {}, snapshot, pending)
+                        status = {
+                            ReducedState.RUNNING: "running",
+                            ReducedState.AWAITING_ASSISTANT: "waiting_assistant",
+                            ReducedState.STOPPED_INCOMPLETE: "idle",
+                            ReducedState.WAITING_FOR_PARENT: "waiting_for_parent",
+                            ReducedState.COMPLETED: "completed",
+                            ReducedState.STALE: "stale",
+                            ReducedState.FAILED: "failed",
+                            ReducedState.CANCELLED: "cancelled",
+                        }.get(reduction.state, "unknown")
                         current_node = str(snapshot.get("current_node") or "")
                         observed_at = _now()
                         progress_signature = self._progress_signature(snapshot)
@@ -1074,9 +906,6 @@ class ChatAgentCoordinator:
                             if progress_signature != stored_progress_signature
                             else previous_progress_at
                         )
-                        if marker and self._marker_present(snapshot, marker):
-                            status = "completed"
-
                         stale = bool(
                             status in {"running", "waiting_assistant", "unknown"}
                             and current_node
@@ -1191,9 +1020,15 @@ class ChatAgentCoordinator:
                                         (_now(), task["task_id"]),
                                     )
                                 else:
+                                    durable_task_status = display_status
+                                    if (
+                                        str(task.get("status") or "") == "waiting_for_parent"
+                                        and display_status in {"running", "idle", "waiting_assistant"}
+                                    ):
+                                        durable_task_status = "waiting_for_parent"
                                     db.execute(
                                         "UPDATE tasks SET status=? WHERE task_id=?",
-                                        (display_status, task["task_id"]),
+                                        (durable_task_status, task["task_id"]),
                                     )
                         inspected.append(
                             {"agent_id": agent["agent_id"], "status": display_status}
@@ -1216,6 +1051,8 @@ class ChatAgentCoordinator:
                 self._queue_parent_notifications()
                 write_count = await self._recover_one_creation(runtime)
                 if write_count == 0:
+                    write_count = await self._reconcile_uncertain_commands(runtime)
+                if write_count == 0:
                     write_count = await self._deliver_one_command(runtime)
                 if write_count == 0:
                     write_count = await self._continue_one_task(
@@ -1228,6 +1065,63 @@ class ChatAgentCoordinator:
                 "new_event_ids": new_events,
             }
 
+    async def _reconcile_uncertain_commands(self, runtime: AgentRuntime) -> int:
+        """Confirm an earlier submission from durable generated-message evidence.
+
+        An uncertain command is never resent merely because the process restarted.
+        If the generated user ID is visible on any normalized branch, it is
+        delivered and its event cursor advances normally.
+        """
+        for command in self.repository.uncertain_commands():
+            target = self.repository.agent(command["to_agent_id"])
+            message_id = str(command.get("user_message_id") or "")
+            if not target or not target.get("chat_id"):
+                continue
+            try:
+                snapshot = await runtime.get_thread(target["chat_id"])
+            except Exception as exc:
+                with self.repository.transaction() as db:
+                    db.execute(
+                        "UPDATE commands SET last_error=? WHERE command_id=?",
+                        (_safe_error(exc), command["command_id"]),
+                    )
+                continue
+            reconciliation = ConversationGateway.reconcile(
+                DeliveryResult(
+                    state=DeliveryState.SENT_UNCONFIRMED,
+                    reason=str(command.get("last_error") or ""),
+                    request_id=str(command.get("request_id") or ""),
+                    user_message_id=message_id,
+                    parent_message_id=str(command.get("parent_message_id") or ""),
+                    message=str(command.get("message") or ""),
+                ),
+                snapshot,
+            )
+            if not reconciliation.delivered:
+                continue
+            with self.repository.transaction() as db:
+                db.execute(
+                    "UPDATE commands SET status='delivered',delivered_at=?,last_error='' WHERE command_id=?",
+                    (_now(), command["command_id"]),
+                )
+                self._ack_command_cursor(db, command)
+            return 1
+        return 0
+
+    @staticmethod
+    def _ack_command_cursor(db: sqlite3.Connection, command: dict[str, Any]) -> None:
+        if not command.get("ack_event_seq"):
+            return
+        db.execute(
+            "UPDATE subscriptions SET last_acked_event_seq="
+            "CASE WHEN last_acked_event_seq<? THEN ? ELSE last_acked_event_seq END "
+            "WHERE parent_agent_id=? AND child_agent_id=?",
+            (
+                int(command["ack_event_seq"]), int(command["ack_event_seq"]),
+                command["to_agent_id"], command["from_agent_id"],
+            ),
+        )
+
     async def _deliver_one_command(self, runtime: AgentRuntime) -> int:
         for command in self.repository.queued_commands():
             target = self.repository.agent(command["to_agent_id"])
@@ -1239,13 +1133,48 @@ class ChatAgentCoordinator:
                 "completed",
             }:
                 with self.repository.transaction() as db:
+                    terminal_reason = "target agent became terminal before delivery"
                     db.execute(
                         "UPDATE commands SET status='cancelled',last_error=? WHERE command_id=?",
-                        (
-                            "target agent became terminal before delivery",
-                            command["command_id"],
-                        ),
+                        (terminal_reason, command["command_id"]),
                     )
+                    if command.get("purpose") == "question" and command.get("from_agent_id"):
+                        sender = self.repository.agent(str(command["from_agent_id"]))
+                        sender_task = self.repository.task_for_agent(
+                            str(command["from_agent_id"])
+                        )
+                        if sender and sender.get("parent_agent_id") == command["to_agent_id"]:
+                            blocked_reason = (
+                                "blocking question could not reach its terminal parent"
+                            )
+                            db.execute(
+                                "UPDATE agents SET status='failed',last_error=?,updated_at=? "
+                                "WHERE agent_id=? AND status NOT IN "
+                                "('completed','failed','cancelled')",
+                                (
+                                    blocked_reason,
+                                    _now(),
+                                    command["from_agent_id"],
+                                ),
+                            )
+                            if sender_task:
+                                db.execute(
+                                    "UPDATE tasks SET status='failed',"
+                                    "completed_at=COALESCE(completed_at,?) "
+                                    "WHERE task_id=? AND status NOT IN "
+                                    "('completed','failed','cancelled')",
+                                    (_now(), sender_task["task_id"]),
+                                )
+                                self._insert_event(
+                                    db,
+                                    str(command["from_agent_id"]),
+                                    sender_task["task_id"],
+                                    "blocked",
+                                    {"reason": blocked_reason},
+                                    source_cursor=(
+                                        f"question-target-terminal:{command['command_id']}"
+                                    ),
+                                )
                     if command.get("ack_event_seq"):
                         db.execute(
                             "UPDATE subscriptions SET last_acked_event_seq="
@@ -1299,7 +1228,16 @@ class ChatAgentCoordinator:
                     )
                 return 1
 
-            if not _is_terminal_snapshot(snapshot):
+            target_task = self.repository.task_for_agent(target["agent_id"])
+            decision = reduce_snapshot(target_task or {}, snapshot, (command,))
+            if decision.state is ReducedState.COMPLETED and command.get("purpose") != "completion":
+                with self.repository.transaction() as db:
+                    db.execute(
+                        "UPDATE commands SET status='cancelled',last_error=? WHERE command_id=?",
+                        ("target completed before obsolete command delivery", command["command_id"]),
+                    )
+                continue
+            if decision.state not in {ReducedState.STOPPED_INCOMPLETE, ReducedState.COMPLETED}:
                 continue
             with self.repository.transaction() as db:
                 db.execute(
@@ -1314,31 +1252,60 @@ class ChatAgentCoordinator:
                     wait_for_completion=False,
                 )
             except Exception as exc:
+                delivery = ConversationGateway.classify_send_exception(
+                    exc,
+                    message=str(command.get("message") or ""),
+                    submission_started=True,
+                )
+                command_status = (
+                    "cancelled"
+                    if delivery.state is DeliveryState.PERMANENT_FAILURE
+                    else "delivery_uncertain"
+                )
                 with self.repository.transaction() as db:
                     db.execute(
-                        "UPDATE commands SET status='delivery_uncertain',last_error=? WHERE command_id=?",
-                        (_safe_error(exc), command["command_id"]),
+                        "UPDATE commands SET status=?,last_error=? WHERE command_id=?",
+                        (command_status, delivery.reason, command["command_id"]),
                     )
                 return 1
 
-            sent = bool(result.get("sent"))
-            observed = bool(result.get("observed"))
-            if sent and observed:
-                command_status = "delivered"
-            elif sent:
-                command_status = "delivery_uncertain"
-            else:
-                command_status = "queued"
+            delivery = ConversationGateway.classify_send_result(
+                result,
+                message=str(command.get("message") or ""),
+            )
+            command_status = {
+                DeliveryState.DELIVERED: "delivered",
+                DeliveryState.SENT_UNCONFIRMED: "delivery_uncertain",
+                DeliveryState.DEFERRED_RUNNING: "queued",
+                DeliveryState.TARGET_CHANGED: "queued",
+                DeliveryState.NOT_SENT: "queued",
+                DeliveryState.TEMPORARILY_UNREADABLE: "queued",
+                DeliveryState.PERMANENT_FAILURE: "cancelled",
+            }[delivery.state]
             with self.repository.transaction() as db:
                 db.execute(
-                    "UPDATE commands SET status=?,delivered_at=?,last_error=? WHERE command_id=?",
+                    "UPDATE commands SET status=?,delivered_at=?,last_error=?,request_id=?,user_message_id=?,parent_message_id=? WHERE command_id=?",
                     (
                         command_status,
                         _now() if command_status == "delivered" else None,
                         str(result.get("reason") or ""),
+                        str(result.get("request_id") or ""),
+                        str(result.get("user_message_id") or ""),
+                        str(result.get("parent_message_id") or ""),
                         command["command_id"],
                     ),
                 )
+                if command_status == "delivered" and command.get("purpose") == "answer":
+                    db.execute(
+                        "UPDATE agents SET status='waiting_assistant',updated_at=? "
+                        "WHERE agent_id=? AND status NOT IN ('completed','failed','cancelled')",
+                        (_now(), command["to_agent_id"]),
+                    )
+                    db.execute(
+                        "UPDATE tasks SET status='waiting_assistant' "
+                        "WHERE agent_id=? AND status='waiting_for_parent'",
+                        (command["to_agent_id"],),
+                    )
                 if command_status == "delivered" and command.get("ack_event_seq"):
                     db.execute(
                         "UPDATE subscriptions SET last_acked_event_seq="
@@ -1385,10 +1352,17 @@ class ChatAgentCoordinator:
                 continue
             current_node = str(confirmation.get("current_node") or "")
             marker = str(task.get("completion_marker") or "")
+            with self.repository.connect() as db:
+                pending_for_target = [dict(row) for row in db.execute(
+                    "SELECT * FROM commands WHERE to_agent_id=? AND status IN "
+                    "('queued','waiting_after_cancel','delivery_uncertain') ORDER BY sequence_no",
+                    (agent["agent_id"],),
+                )]
+            reduction = reduce_snapshot(task, confirmation, pending_for_target)
             if (
                 current_node != str(candidate["snapshot"].get("current_node") or "")
-                or not _is_terminal_snapshot(confirmation)
-                or (marker and self._marker_present(confirmation, marker))
+                or reduction.state is not ReducedState.STOPPED_INCOMPLETE
+                or ActionType.SEND_CONTINUATION not in reduction.actions
                 or str(task.get("last_continue_node") or "") == current_node
             ):
                 continue
@@ -1670,17 +1644,17 @@ class ChatAgentCoordinator:
             if subscription["notification_policy"] != "auto_resume":
                 continue
             with self.repository.connect() as db:
-                pending = db.execute(
-                    "SELECT 1 FROM commands WHERE from_agent_id=? AND to_agent_id=? "
-                    "AND ack_event_seq>? AND status IN ('queued','waiting_after_cancel','delivery_uncertain') LIMIT 1",
-                    (
-                        subscription["child_agent_id"],
-                        subscription["parent_agent_id"],
-                        int(subscription["last_acked_event_seq"]),
-                    ),
-                ).fetchone()
-            if pending:
-                continue
+                pending_rows = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT purpose FROM commands WHERE from_agent_id=? "
+                        "AND to_agent_id=? AND status IN ('queued','waiting_after_cancel')",
+                        (
+                            subscription["child_agent_id"],
+                            subscription["parent_agent_id"],
+                        ),
+                    )
+                ]
             events = [
                 event
                 for event in self.repository.events_after(
@@ -1692,8 +1666,30 @@ class ChatAgentCoordinator:
             if not events:
                 continue
 
+            completion_event = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event["kind"] in {"completed", "completion"}
+                ),
+                None,
+            )
+            if pending_rows and (
+                completion_event is None
+                or any(
+                    row.get("purpose") not in {"progress", "question"}
+                    for row in pending_rows
+                )
+            ):
+                continue
+            event_source = events
+            if completion_event is not None:
+                completion_index = events.index(completion_event)
+                event_source = events[: completion_index + 1]
+
             selected: list[dict[str, Any]] = []
-            for event in events:
+            iterable = reversed(event_source) if completion_event is not None else iter(event_source)
+            for event in iterable:
                 compact = {
                     "event_seq": int(event["event_seq"]),
                     "event_id": event["event_id"],
@@ -1701,10 +1697,17 @@ class ChatAgentCoordinator:
                     "kind": event["kind"],
                     "payload": event["payload"],
                 }
-                candidate = [*selected, compact]
+                candidate = (
+                    [compact, *selected]
+                    if completion_event is not None
+                    else [*selected, compact]
+                )
                 if selected and len(_json(candidate)) > self.config.context_max_chars:
                     break
-                selected.append(compact)
+                if completion_event is not None:
+                    selected.insert(0, compact)
+                else:
+                    selected.append(compact)
                 if len(_json(selected)) >= self.config.context_max_chars:
                     break
             if not selected:
@@ -1720,6 +1723,7 @@ class ChatAgentCoordinator:
 
             first_seq = int(selected[0]["event_seq"] )
             last_seq = int(selected[-1]["event_seq"] )
+            is_completion = completion_event is not None
             message = (
                 "[SUBAGENT UPDATE]\n"
                 f"agent_id: {subscription['child_agent_id']}\n"
@@ -1735,7 +1739,19 @@ class ChatAgentCoordinator:
                     message,
                     key,
                     ack_event_seq=last_seq,
+                    purpose="completion" if is_completion else "progress",
                 )
+                if is_completion:
+                    with self.repository.transaction() as db:
+                        db.execute(
+                            "UPDATE commands SET status='superseded',last_error=? WHERE "
+                            "from_agent_id=? AND to_agent_id=? "
+                            "AND purpose IN ('progress','question') "
+                            "AND status IN ('queued','waiting_after_cancel','delivery_uncertain') "
+                            "AND (ack_event_seq IS NULL OR ack_event_seq<?)",
+                            ("superseded by final completion envelope", subscription["child_agent_id"],
+                             subscription["parent_agent_id"], last_seq),
+                        )
             except sqlite3.IntegrityError:
                 pass
 
@@ -1747,6 +1763,7 @@ class ChatAgentCoordinator:
         idempotency_key: str,
         *,
         ack_event_seq: int,
+        purpose: str = "progress",
     ) -> None:
         with self.repository.transaction() as db:
             sequence = int(
@@ -1756,8 +1773,8 @@ class ChatAgentCoordinator:
                 ).fetchone()[0]
             )
             db.execute(
-                "INSERT INTO commands(command_id,from_agent_id,to_agent_id,sequence_no,message,interrupt_policy,status,idempotency_key,ack_event_seq,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO commands(command_id,from_agent_id,to_agent_id,sequence_no,message,interrupt_policy,status,idempotency_key,ack_event_seq,purpose,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     _id("cmd"),
                     from_agent_id,
@@ -1768,37 +1785,10 @@ class ChatAgentCoordinator:
                     "queued",
                     idempotency_key,
                     int(ack_event_seq),
+                    purpose,
                     _now(),
                 ),
             )
-
-    @staticmethod
-    def _status_from_snapshot(snapshot: dict[str, Any]) -> str:
-        if snapshot.get("running") or snapshot.get("active_stream"):
-            return "running"
-        if not snapshot.get("state_verified"):
-            return "unknown"
-        turns = snapshot.get("turns")
-        if not isinstance(turns, list) or not turns:
-            return "unknown"
-        latest = turns[-1]
-        if latest.get("role") == "user":
-            return "waiting_assistant"
-        if _is_terminal_snapshot(snapshot):
-            return "idle"
-        return "unknown"
-
-    @staticmethod
-    def _marker_present(snapshot: dict[str, Any], marker: str) -> bool:
-        turns = snapshot.get("turns")
-        if not isinstance(turns, list) or not turns:
-            return False
-        latest = turns[-1]
-        return bool(
-            latest.get("role") == "assistant"
-            and _is_terminal_snapshot(snapshot)
-            and any(line.strip() == marker for line in str(latest.get("text") or "").splitlines())
-        )
 
     def _require_chat_agent(self, agent_id: str) -> dict[str, Any]:
         agent = self.repository.agent(agent_id)
