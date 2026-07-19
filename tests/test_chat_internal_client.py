@@ -631,3 +631,40 @@ def test_truncated_context_event_cursor_does_not_repeat_forever():
     )
     assert second["events"] == []
     assert second["next_cursor"] == first["next_cursor"]
+
+
+def test_continue_result_does_not_confirm_from_unverified_cyclic_state(monkeypatch):
+    async def run():
+        client = InternalChatClient("http://127.0.0.1:9994")
+        after_raw = {
+            "current_node": "user-node",
+            "mapping": {
+                "user-node": {
+                    "parent": "user-node",
+                    "message": message("user-message", "user", "continue"),
+                }
+            },
+        }
+
+        async def fake_evaluate(_body):
+            return {
+                "sent": True,
+                "observed": True,
+                "running": False,
+                "user_message_id": "user-message",
+                "parent_message_id": "parent-node",
+                "after_raw": after_raw,
+            }
+
+        monkeypatch.setattr(client, "_evaluate", fake_evaluate)
+        result = await client.continue_thread(
+            "conversation",
+            "continue",
+            expected_current_node="parent-node",
+            wait_for_completion=False,
+        )
+        assert result["sent"] is True
+        assert result["observed"] is False
+        assert "not found" in result["reason"]
+
+    asyncio.run(run())

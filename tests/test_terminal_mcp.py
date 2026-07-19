@@ -754,3 +754,20 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
         session_id=session_id, cwd=str(project)
     )))
     assert synced["write_count"] == 0
+
+
+def test_agent_send_preserves_legacy_positional_parameter_order():
+    import inspect
+    import terminal_mcp
+
+    parameters = list(inspect.signature(terminal_mcp.agent_send).parameters)
+    assert parameters[:7] == [
+        "from_agent_id",
+        "to_agent_id",
+        "message",
+        "interrupt_policy",
+        "idempotency_key",
+        "session_id",
+        "cwd",
+    ]
+    assert parameters[7] == "purpose"
