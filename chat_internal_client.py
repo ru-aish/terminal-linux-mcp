@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -254,6 +255,7 @@ def normalize_conversation_payload(
             conversation.get("id") or conversation.get("conversation_id") or conversation_id
         ),
         "title": str(conversation.get("title") or ""),
+        "project_id": str(conversation.get("gizmo_id") or "") or None,
         "current_node": current_node,
         "canonical": True,
         "state_verified": valid and bool(active_branch),
@@ -262,6 +264,352 @@ def normalize_conversation_payload(
         "active_stream": owned_stream,
         "running": owned_stream or canonical_running,
         "turns": visible_turns,
+    }
+
+
+def _sanitize_context_text(value: Any, *, limit: int = 2000) -> str:
+    text = _part_text(value) if not isinstance(value, str) else value
+    text = str(text or "")
+    text = re.sub(r"Bearer\s+\S+", "Bearer [redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?i)(authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|session(?:[_-]?id)?|token|secret|password)\s*[:=]\s*[^\s,;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: max(0, limit)]
+
+
+def _project_payload(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    candidate = raw
+    for key in ("resource", "project", "gizmo"):
+        nested = candidate.get(key)
+        if isinstance(nested, dict):
+            candidate = nested
+    nested = candidate.get("gizmo")
+    if isinstance(nested, dict):
+        candidate = nested
+    return candidate if isinstance(candidate, dict) else {}
+
+
+def normalize_project(raw: Any) -> dict[str, Any]:
+    project = _project_payload(raw)
+    display = project.get("display") if isinstance(project.get("display"), dict) else {}
+    permissions = (
+        project.get("current_user_permission")
+        if isinstance(project.get("current_user_permission"), dict)
+        else {}
+    )
+    project_id = str(project.get("id") or project.get("gizmo_id") or "")
+    return {
+        "id": project_id,
+        "name": str(display.get("name") or project.get("name") or ""),
+        "description": str(display.get("description") or project.get("description") or ""),
+        "archived": bool(project.get("is_archived") or project.get("archived_at")),
+        "updated_at": str(project.get("updated_at") or ""),
+        "permissions": {
+            "can_read": bool(permissions.get("can_read", True if project_id else False)),
+            "can_write": bool(permissions.get("can_write", False)),
+            "can_delete": bool(permissions.get("can_delete", False)),
+        },
+    }
+
+
+def normalize_project_list(raw: Any) -> dict[str, Any]:
+    payload = raw if isinstance(raw, dict) else {}
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    normalized = []
+    for item in items:
+        project = normalize_project(item)
+        if not project["id"]:
+            continue
+        conversations = item.get("conversations") if isinstance(item, dict) else None
+        conversation_items = (
+            conversations.get("items")
+            if isinstance(conversations, dict) and isinstance(conversations.get("items"), list)
+            else []
+        )
+        project["conversation_count"] = len(conversation_items)
+        normalized.append(project)
+    return {"items": normalized, "cursor": payload.get("cursor")}
+
+
+def normalize_project_threads(raw: Any, project_id: str) -> dict[str, Any]:
+    payload = raw if isinstance(raw, dict) else {}
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        conversation_id = str(item.get("id") or item.get("conversation_id") or "")
+        if not conversation_id:
+            continue
+        result.append(
+            {
+                "conversation_id": conversation_id,
+                "title": str(item.get("title") or ""),
+                "project_id": str(item.get("gizmo_id") or project_id),
+                "current_node": str(item.get("current_node") or ""),
+                "update_time": item.get("update_time")
+                if isinstance(item.get("update_time"), (int, float))
+                else None,
+                "archived": bool(item.get("is_archived")),
+            }
+        )
+    return {"items": result, "cursor": payload.get("cursor")}
+
+
+def _raw_active_branch(raw: Any, conversation_id: str) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    conversation = _plain_conversation(raw)
+    mapping = conversation.get("mapping")
+    if not isinstance(mapping, dict):
+        return conversation, [], False
+    current_node = str(conversation.get("current_node") or conversation.get("currentNode") or "")
+    if not current_node or current_node not in mapping:
+        return conversation, [], False
+    reverse: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    cursor = current_node
+    valid = True
+    while cursor:
+        if cursor in seen or len(reverse) >= 10_000:
+            valid = False
+            break
+        seen.add(cursor)
+        node = mapping.get(cursor)
+        if not isinstance(node, dict):
+            valid = False
+            break
+        message = node.get("message")
+        if isinstance(message, dict):
+            author = message.get("author") if isinstance(message.get("author"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), dict) else {}
+            metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+            text = _message_text(message)
+            if not text and isinstance(content.get("content"), str):
+                text = content["content"]
+            reverse.append(
+                {
+                    "node_id": cursor,
+                    "message_id": str(message.get("id") or cursor),
+                    "parent_id": str(node.get("parent") or ""),
+                    "role": str(author.get("role") or ""),
+                    "author_name": str(author.get("name") or ""),
+                    "recipient": str(message.get("recipient") or "all"),
+                    "content_type": str(content.get("content_type") or ""),
+                    "text": text,
+                    "status": str(message.get("status") or ""),
+                    "end_turn": message.get("end_turn")
+                    if isinstance(message.get("end_turn"), bool)
+                    else None,
+                    "hidden": bool(metadata.get("is_visually_hidden_from_conversation")),
+                    "thinking_preamble": bool(metadata.get("is_thinking_preamble_message")),
+                    "create_time": message.get("create_time")
+                    if isinstance(message.get("create_time"), (int, float))
+                    else None,
+                }
+            )
+        cursor = str(node.get("parent") or "")
+    return conversation, list(reversed(reverse)), valid
+
+
+def _context_event_cursor(item: dict[str, Any], event: dict[str, Any]) -> str:
+    digest = hashlib.sha256(
+        json.dumps(
+            {
+                "node_id": item["node_id"],
+                "message_id": item["message_id"],
+                "kind": event.get("kind"),
+                "tool": event.get("tool"),
+                "status": event.get("status"),
+                "summary": event.get("summary"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{item['node_id']}:{digest}"
+
+
+def build_thread_context(
+    raw: Any,
+    conversation_id: str,
+    *,
+    since_cursor: str | None = None,
+    max_events: int = 60,
+    max_chars: int = 12000,
+) -> dict[str, Any]:
+    conversation, branch, valid = _raw_active_branch(raw, conversation_id)
+    events: list[dict[str, Any]] = []
+    for item in branch:
+        role = item["role"]
+        content_type = item["content_type"]
+        recipient = item["recipient"]
+        event: dict[str, Any] | None = None
+        if content_type == "reasoning_recap" and role == "assistant":
+            event = {
+                "kind": "reasoning_recap",
+                "summary": _sanitize_context_text(item["text"], limit=1600),
+            }
+        elif role == "assistant" and recipient not in {"", "all"}:
+            event = {
+                "kind": "tool_call",
+                "tool": recipient,
+                "status": item["status"],
+            }
+        elif role == "tool":
+            event = {
+                "kind": "tool_result",
+                "tool": item["author_name"] or recipient,
+                "status": item["status"],
+                "summary": _sanitize_context_text(item["text"], limit=1200),
+            }
+        elif role == "assistant" and content_type in {"text", "multimodal_text"}:
+            if item["end_turn"] is True:
+                event = {
+                    "kind": "final",
+                    "summary": _sanitize_context_text(item["text"], limit=2400),
+                    "status": item["status"],
+                }
+            elif item["text"] and (
+                not item["hidden"] or item["thinking_preamble"]
+            ):
+                event = {
+                    "kind": "progress",
+                    "summary": _sanitize_context_text(item["text"], limit=1600),
+                    "status": item["status"],
+                }
+        if event is None:
+            continue
+        event.update(
+            {
+                "node_id": item["node_id"],
+                "message_id": item["message_id"],
+                "create_time": item["create_time"],
+            }
+        )
+        event["cursor"] = _context_event_cursor(item, event)
+        events.append(event)
+
+    event_limit = min(max(max_events, 1), 200)
+    cursor_reset = False
+    cursor_updated = False
+    selected: list[dict[str, Any]]
+    if since_cursor:
+        exact_index = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event["cursor"] == since_cursor
+            ),
+            None,
+        )
+        if exact_index is not None:
+            selected = events[exact_index + 1 : exact_index + 1 + event_limit]
+        else:
+            node_hint = since_cursor.split(":", 1)[0]
+            node_index = next(
+                (
+                    index
+                    for index, event in enumerate(events)
+                    if event["node_id"] == node_hint
+                ),
+                None,
+            )
+            if node_index is not None:
+                cursor_updated = True
+                selected = events[node_index : node_index + event_limit]
+            else:
+                cursor_reset = True
+                selected = events[-event_limit:]
+    else:
+        selected = events[-event_limit:]
+
+    bounded: list[dict[str, Any]] = []
+    used = 0
+    for event in selected:
+        encoded = json.dumps(event, ensure_ascii=False, sort_keys=True)
+        if bounded and used + len(encoded) > max_chars:
+            break
+        if not bounded and len(encoded) > max_chars:
+            event = {
+                **event,
+                "summary": str(event.get("summary") or "")[
+                    : max(0, max_chars // 2)
+                ],
+            }
+            encoded = json.dumps(event, ensure_ascii=False, sort_keys=True)
+        bounded.append(event)
+        used += len(encoded)
+
+    current_node = str(
+        conversation.get("current_node") or conversation.get("currentNode") or ""
+    )
+    latest = branch[-1] if branch else {}
+    latest_status = str(latest.get("status") or "").casefold()
+    running = bool(
+        latest.get("role") == "assistant"
+        and (
+            latest_status in _RUNNING_STATUSES
+            or latest.get("end_turn") is False
+        )
+    )
+    next_cursor = (
+        bounded[-1]["cursor"]
+        if bounded
+        else (since_cursor or current_node)
+    )
+    return {
+        "conversation_id": str(conversation.get("id") or conversation_id),
+        "title": str(conversation.get("title") or ""),
+        "project_id": str(conversation.get("gizmo_id") or "") or None,
+        "current_node": current_node,
+        "state_verified": valid and bool(branch),
+        "running": running,
+        "latest_status": latest_status,
+        "events": bounded,
+        "since_cursor": since_cursor,
+        "next_cursor": next_cursor,
+        "cursor_reset": cursor_reset,
+        "cursor_updated": cursor_updated,
+    }
+
+
+def build_thread_tail(
+    raw: Any, conversation_id: str, *, lines: int = 60, max_chars: int = 12000
+) -> dict[str, Any]:
+    conversation, branch, valid = _raw_active_branch(raw, conversation_id)
+    rendered: list[str] = []
+    for item in branch:
+        role = item["role"]
+        if item["content_type"] == "reasoning_recap" and role == "assistant":
+            recap = _sanitize_context_text(item["text"], limit=1600)
+            if recap:
+                rendered.append(f"reasoning_recap: {recap}")
+        elif role in {"user", "assistant"} and item["recipient"] in {"", "all"}:
+            if item["hidden"] and not item["thinking_preamble"]:
+                continue
+            text = _sanitize_context_text(item["text"], limit=2400)
+            if text:
+                rendered.append(f"{role}: {text}")
+        elif role == "assistant" and item["recipient"] not in {"", "all"}:
+            rendered.append(f"tool_call: {item['recipient']} [{item['status']}]" )
+        elif role == "tool":
+            summary = _sanitize_context_text(item["text"], limit=1000)
+            rendered.append(f"tool_result: {item['author_name'] or item['recipient']} [{item['status']}] {summary}".strip())
+    rendered = rendered[-min(max(lines, 1), 200) :]
+    while rendered and len("\n".join(rendered)) > max_chars:
+        rendered.pop(0)
+    return {
+        "conversation_id": str(conversation.get("id") or conversation_id),
+        "title": str(conversation.get("title") or ""),
+        "state_verified": valid and bool(branch),
+        "current_node": str(conversation.get("current_node") or ""),
+        "lines": rendered,
+        "text": "\n".join(rendered),
     }
 
 
@@ -609,6 +957,195 @@ class InternalChatClient:
             raise RuntimeProtocolError("model catalogue returned an invalid result")
         return {"models": payload.get("models") if isinstance(payload.get("models"), list) else [], "default_slug": str(payload.get("default_slug") or "")}
 
+    async def list_projects(
+        self,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        owned_only: bool = True,
+    ) -> dict[str, Any]:
+        limit = min(max(int(limit), 1), 50)
+        payload = await self._evaluate(
+            "const resolved = await resolveClient(); "
+            f"return plain(await resolved.client.listProjects({{limit:{limit},cursor:{json.dumps(cursor)},ownedOnly:{json.dumps(bool(owned_only))},conversationsPerProject:0}}));"
+        )
+        return normalize_project_list(payload)
+
+    async def get_project(self, project_id: str) -> dict[str, Any]:
+        project_id = project_id.strip()
+        if not project_id:
+            raise ValueError("project_id is required")
+        payload = await self._evaluate(
+            f"const resolved = await resolveClient(); return plain(await resolved.client.getProject({json.dumps(project_id)}));"
+        )
+        return normalize_project(payload)
+
+    async def list_project_threads(
+        self,
+        project_id: str,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+        owned_only: bool = True,
+    ) -> dict[str, Any]:
+        project_id = project_id.strip()
+        if not project_id:
+            raise ValueError("project_id is required")
+        limit = min(max(int(limit), 1), 50)
+        payload = await self._evaluate(
+            "const resolved = await resolveClient(); "
+            f"return plain(await resolved.client.listProjectConversations({{projectId:{json.dumps(project_id)},limit:{limit},cursor:{json.dumps(cursor)},ownedOnly:{json.dumps(bool(owned_only))}}}));"
+        )
+        return normalize_project_threads(payload, project_id)
+
+    async def _get_thread_raw(self, conversation_id: str) -> Any:
+        return await self._evaluate(
+            f"const resolved = await resolveClient(); return plain(await resolved.client.get({json.dumps(conversation_id)}));"
+        )
+
+    async def create_thread(
+        self,
+        prompt: str,
+        *,
+        project_id: str | None = None,
+        title: str | None = None,
+    ) -> dict[str, Any]:
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("prompt is required")
+        project = project_id.strip() if project_id else ""
+        body = f"""
+        const resolved = await resolveClient();
+        const client = resolved.client;
+        const text = {json.dumps(prompt)};
+        const projectId = {json.dumps(project)};
+        const model = chooseModel(await client.models(), {json.dumps(self.preferred_model)}, '', {json.dumps(self.thinking_effort)}, {json.dumps(self.require_high_reasoning)});
+        const userMessageId = crypto.randomUUID();
+        const request = {{
+          action:'next', model:model.slug,
+          messages:[{{id:userMessageId,author:{{role:'user'}},content:{{content_type:'text',parts:[text]}},create_time:Date.now()/1000,end_turn:null,metadata:{{}},recipient:'all',status:'finished_successfully',weight:1}}],
+          supported_encodings:['v1'],
+          timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,
+          timezone_offset_min:new Date().getTimezoneOffset(),
+        }};
+        if (model.effort) request.thinking_effort = model.effort;
+        if (projectId) {{
+          request.gizmo_id = projectId;
+          request.conversation_mode = {{kind:'gizmo_interaction',gizmo_id:projectId}};
+        }}
+        let conversationId = '', requestId = '', terminalEvent = '', finalMessageId = '', finalStatus = '';
+        let handle = null, timedOut = false, streamFinished = false;
+        const started = await new Promise((resolvePromise, rejectPromise) => {{
+          let settled = false;
+          const finishStart = () => {{ if (!settled && conversationId) {{ settled = true; clearTimeout(timer); resolvePromise(true); }} }};
+          const fail = (error) => {{
+            streamFinished = true;
+            if (conversationId) {{ streams.delete(conversationId); handles.delete(conversationId); }}
+            clearTimeout(timer);
+            if (settled) return;
+            settled = true;
+            rejectPromise(error instanceof Error ? error : new Error(String(error)));
+          }};
+          const timer = setTimeout(() => {{
+            if (settled) return;
+            settled = true;
+            timedOut = true;
+            streamFinished = true;
+            try {{
+              if (handle && typeof handle.cancel === 'function') Promise.resolve(handle.cancel()).catch(() => {{}});
+            }} catch {{}}
+            resolvePromise(false);
+          }}, Math.min({self.stream_timeout_seconds * 1000}, 30000));
+          const observe = (value) => {{
+            const candidate = value && (value.message || value.data || value);
+            const possibleId = value && (value.conversation_id || value.conversationId) || candidate && (candidate.conversation_id || candidate.conversationId);
+            if (possibleId) conversationId = String(possibleId);
+            if (candidate && candidate.id) finalMessageId = String(candidate.id);
+            if (candidate && candidate.status) finalStatus = String(candidate.status);
+            if (value && value.request_id) requestId = String(value.request_id);
+            if (value && value.streamRequestId) requestId = String(value.streamRequestId);
+            const eventType = String(value && (value.type || value.event_type || value.event) || '');
+            if (eventType === 'message_stream_complete') terminalEvent = eventType;
+            if (conversationId) {{
+              if (!streamFinished) {{
+                streams.set(conversationId, {{started_at:Date.now(),user_message_id:userMessageId}});
+                if (handle) handles.set(conversationId, handle);
+              }}
+              finishStart();
+            }}
+          }};
+          const complete = (value) => {{ streamFinished = true; observe(value); terminalEvent = terminalEvent || 'onComplete'; if (conversationId) {{ streams.delete(conversationId); handles.delete(conversationId); }} finishStart(); }};
+          try {{
+            const starting = client.startCompletionStream({{request,onEvent:observe,onUpdate:observe,onComplete:complete,onError:fail,onRecoverableError:()=>{{}}}});
+            if (starting && typeof starting.then === 'function') {{
+              starting.then((value) => {{ handle = value; observe(value); if (conversationId && !streamFinished) handles.set(conversationId,value); }}, fail);
+            }} else {{ handle = starting; observe(starting); }}
+          }} catch (error) {{ fail(error); }}
+        }});
+        if (!conversationId) return {{sent:true,observed:false,running:true,reason:timedOut?'new conversation id was not observed before timeout':'new conversation id was not observed',request_id:requestId,user_message_id:userMessageId,project_id:projectId||null,terminal_event:terminalEvent}};
+        let afterRaw = null;
+        for (let attempt = 0; attempt < 20; attempt += 1) {{
+          try {{ afterRaw = await client.get(conversationId); }} catch {{}}
+          const after = summary(afterRaw);
+          if (after.valid) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }}
+        const finalSummary = summary(afterRaw);
+        const ownedStream = streams.has(conversationId) && !streamFinished;
+        return {{sent:true,observed:!!afterRaw,running:ownedStream||finalSummary.running,owned_stream:ownedStream,reason:afterRaw?'':'created conversation could not be read back',conversation_id:conversationId,request_id:requestId,user_message_id:userMessageId,final_message_id:finalMessageId,final_status:finalStatus,project_id:projectId||null,terminal_event:terminalEvent,after_raw:afterRaw?plain(afterRaw):null,title_requested:{json.dumps(title or '')}}};
+        """
+        payload = await self._evaluate(body)
+        if not isinstance(payload, dict):
+            raise RuntimeProtocolError("new conversation creation returned an invalid result")
+        conversation_id = str(payload.get("conversation_id") or "")
+        after_raw = payload.pop("after_raw", None)
+        if after_raw is not None and conversation_id:
+            after = normalize_conversation_payload(
+                after_raw,
+                conversation_id,
+                owned_stream=bool(payload.get("owned_stream")),
+            )
+            user_id = str(payload.get("user_message_id") or "")
+            payload["observed"] = any(turn.get("key") == user_id for turn in after.get("turns", []))
+            payload["current_node"] = str(after.get("current_node") or "")
+            payload["running"] = bool(after.get("running", True))
+            if not payload["observed"] and not payload.get("reason"):
+                payload["reason"] = "created user message was not found in canonical conversation state"
+        if conversation_id:
+            payload["chat_url"] = (
+                f"https://chatgpt.com/g/{project}/c/{conversation_id}"
+                if project
+                else f"https://chatgpt.com/c/{conversation_id}"
+            )
+        return payload
+
+    async def thread_context(
+        self,
+        conversation_id: str,
+        *,
+        since_cursor: str | None = None,
+        max_events: int = 60,
+        max_chars: int = 12000,
+    ) -> dict[str, Any]:
+        raw = await self._get_thread_raw(conversation_id)
+        return build_thread_context(
+            raw,
+            conversation_id,
+            since_cursor=since_cursor,
+            max_events=max_events,
+            max_chars=max_chars,
+        )
+
+    async def thread_tail(
+        self,
+        conversation_id: str,
+        *,
+        lines: int = 60,
+        max_chars: int = 12000,
+    ) -> dict[str, Any]:
+        raw = await self._get_thread_raw(conversation_id)
+        return build_thread_tail(raw, conversation_id, lines=lines, max_chars=max_chars)
+
     async def get_thread(self, conversation_id: str) -> dict[str, Any]:
         payload = await self._evaluate(
             f"const resolved = await resolveClient(); const raw = await resolved.client.get({json.dumps(conversation_id)}); return {{raw:plain(raw), owned_stream:streams.has({json.dumps(conversation_id)})}};"
@@ -623,6 +1160,7 @@ class InternalChatClient:
         message: str,
         *,
         expected_current_node: str,
+        wait_for_completion: bool = True,
     ) -> dict[str, Any]:
         if not expected_current_node:
             raise ValueError("expected_current_node is required")
@@ -632,6 +1170,7 @@ class InternalChatClient:
         const conversationId = {json.dumps(conversation_id)};
         const expectedNode = {json.dumps(expected_current_node)};
         const text = {json.dumps(message)};
+        const waitForCompletion = {json.dumps(bool(wait_for_completion))};
         const beforeRaw = await client.get(conversationId);
         const before = summary(beforeRaw);
         if (!before.valid || before.currentNode !== expectedNode) return {{sent:false, running:false, reason:'canonical current_node changed before send'}};
@@ -652,14 +1191,21 @@ class InternalChatClient:
         if (model.effort) request.thinking_effort = model.effort;
         if (before.conversation.gizmo_id) request.gizmo_id = before.conversation.gizmo_id;
         let requestId = '', finalMessageId = '', finalStatus = '', terminalEvent = '';
-        let timedOut = false;
+        let timedOut = false, streamFinished = false;
         streams.set(conversationId, {{started_at:Date.now(), user_message_id:userMessageId}});
         await new Promise((resolvePromise, rejectPromise) => {{
           let settled = false;
-          const cleanup = () => {{ streams.delete(conversationId); handles.delete(conversationId); clearTimeout(timer); }};
+          const cleanup = () => {{ streamFinished = true; streams.delete(conversationId); handles.delete(conversationId); clearTimeout(timer); }};
           const finish = (eventType='') => {{ cleanup(); if (settled) return; settled = true; terminalEvent = eventType || terminalEvent; resolvePromise(); }};
+          const finishDispatch = () => {{
+            if (waitForCompletion || settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolvePromise();
+          }};
           const fail = (error) => {{ cleanup(); if (settled) return; settled = true; rejectPromise(error instanceof Error ? error : new Error(String(error))); }};
-          const timer = setTimeout(() => {{ if (settled) return; settled = true; timedOut = true; resolvePromise(); }}, {self.stream_timeout_seconds * 1000});
+          const timeoutMs = waitForCompletion ? {self.stream_timeout_seconds * 1000} : Math.min({self.stream_timeout_seconds * 1000}, 10000);
+          const timer = setTimeout(() => {{ if (settled) return; settled = true; timedOut = true; resolvePromise(); }}, timeoutMs);
           const observe = (value) => {{
             const candidate = value && (value.message || value.data || value);
             if (candidate && candidate.id) finalMessageId = String(candidate.id);
@@ -668,25 +1214,38 @@ class InternalChatClient:
             if (value && value.streamRequestId) requestId = String(value.streamRequestId);
             const eventType = String(value && (value.type || value.event_type || value.event) || '');
             if (eventType === 'message_stream_complete') finish(eventType);
+            else finishDispatch();
           }};
           try {{
             const starting = client.startCompletionStream({{request, onEvent:observe, onUpdate:observe, onComplete:(value) => {{ observe(value); finish('onComplete'); }}, onError:fail, onRecoverableError:() => {{}}}});
             handles.set(conversationId, starting);
             if (starting && typeof starting.then === 'function') {{
-              starting.then((handle) => {{ observe(handle); if (!settled) handles.set(conversationId, handle); }}, fail);
+              starting.then((handle) => {{
+                if (!streamFinished) handles.set(conversationId, handle);
+                observe(handle);
+                finishDispatch();
+              }}, fail);
             }} else {{
+              if (!streamFinished) handles.set(conversationId, starting);
               observe(starting);
-              if (!settled) handles.set(conversationId, starting);
+              finishDispatch();
             }}
           }} catch (error) {{ fail(error); }}
         }});
-        if (timedOut) {{
-          let afterRaw = null;
+        let afterRaw = null;
+        const attempts = waitForCompletion ? 1 : 20;
+        for (let attempt = 0; attempt < attempts; attempt += 1) {{
           try {{ afterRaw = await client.get(conversationId); }} catch {{}}
-          return {{sent:true, observed:false, running:true, reason:'completion stream exceeded the configured timeout', request_id:requestId, user_message_id:userMessageId, final_message_id:finalMessageId, final_status:finalStatus, parent_message_id:expectedNode, terminal_event:terminalEvent, after_raw:afterRaw ? plain(afterRaw) : null}};
+          const after = summary(afterRaw);
+          if (after.valid && (waitForCompletion || after.currentNode !== expectedNode)) break;
+          if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, 100));
         }}
-        const afterRaw = await client.get(conversationId);
-        return {{sent:true, observed:true, running:false, reason:'', request_id:requestId, user_message_id:userMessageId, final_message_id:finalMessageId, final_status:finalStatus, parent_message_id:expectedNode, terminal_event:terminalEvent, after_raw:plain(afterRaw)}};
+        const afterSummary = summary(afterRaw);
+        const running = streams.has(conversationId) || afterSummary.running;
+        if (timedOut) {{
+          return {{sent:true, observed:false, running:true, reason:waitForCompletion?'completion stream exceeded the configured timeout':'completion stream did not start before the dispatch timeout', request_id:requestId, user_message_id:userMessageId, final_message_id:finalMessageId, final_status:finalStatus, parent_message_id:expectedNode, terminal_event:terminalEvent, after_raw:afterRaw ? plain(afterRaw) : null}};
+        }}
+        return {{sent:true, observed:!!afterRaw, running:running, reason:afterRaw?'':'submitted conversation could not be read back', request_id:requestId, user_message_id:userMessageId, final_message_id:finalMessageId, final_status:finalStatus, parent_message_id:expectedNode, terminal_event:terminalEvent, after_raw:afterRaw ? plain(afterRaw) : null}};
         """
         payload = await self._evaluate(body)
         if not isinstance(payload, dict):

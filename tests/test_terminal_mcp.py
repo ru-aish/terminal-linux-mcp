@@ -19,6 +19,10 @@ EXPECTED_TOOLS = [
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
     "run_agy_yolo", "start_agy_yolo",
+    "agent_projects_list", "agent_project_get", "agent_project_threads",
+    "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
+    "agent_tail", "agent_send", "agent_wait", "agent_sync", "agent_children",
+    "agent_subscribe", "agent_ack", "agent_cancel",
 ]
 
 def run(coro):
@@ -685,3 +689,68 @@ def test_proxy_records_tool_call_output_and_tool_result_input_with_o200k(tmp_pat
     assert all(event["output_tokens"] > 0 for event in events)
     assert all(event["input_tokens"] > 0 for event in events)
     assert all(event["metadata"]["input"]["tokenizer"] == "o200k_base" for event in events)
+
+
+
+def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "agent-tools-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    session_id = "agent-tools-thread"
+    run(terminal_mcp.bootstrap_thread(session_id, str(project), max_chars=100000))
+
+    class FakeCoordinator:
+        async def list_projects(self, *, limit=20, cursor=None):
+            return {"items": [{"id": "g-p-one", "name": "One"}], "cursor": None}
+
+        async def register_parent(self, chat_id, **kwargs):
+            return {"agent_id": "agent-root", "chat_id": chat_id, **kwargs}
+
+        async def spawn(self, parent_agent_id, prompt, **kwargs):
+            return {"agent": {"agent_id": "agent-child", "parent_agent_id": parent_agent_id}, "prompt": prompt, "options": kwargs}
+
+        async def status(self, agent_id):
+            return {"agent": {"agent_id": agent_id, "status": "running"}}
+
+    class FakeService:
+        def __init__(self):
+            self.wakes = 0
+
+        def wake(self):
+            self.wakes += 1
+
+        async def sync_now(self):
+            return {"status": "ok", "write_count": 0}
+
+    coordinator = FakeCoordinator()
+    service = FakeService()
+    monkeypatch.setattr(terminal_mcp, "get_chat_agent_coordinator", lambda: coordinator)
+    monkeypatch.setattr(terminal_mcp, "get_chat_agent_service", lambda: service)
+
+    projects = json.loads(run(terminal_mcp.agent_projects_list(
+        session_id=session_id, cwd=str(project)
+    )))
+    assert projects["items"][0]["id"] == "g-p-one"
+
+    parent = json.loads(run(terminal_mcp.agent_register_parent(
+        "https://chatgpt.com/c/11111111-1111-1111-1111-111111111111",
+        session_id=session_id,
+        cwd=str(project),
+    )))
+    assert parent["agent_id"] == "agent-root"
+
+    child = json.loads(run(terminal_mcp.agent_spawn(
+        "agent-root",
+        "do work",
+        project_policy="none",
+        session_id=session_id,
+        cwd=str(project),
+    )))
+    assert child["agent"]["agent_id"] == "agent-child"
+    assert service.wakes == 1
+
+    synced = json.loads(run(terminal_mcp.agent_sync(
+        session_id=session_id, cwd=str(project)
+    )))
+    assert synced["write_count"] == 0

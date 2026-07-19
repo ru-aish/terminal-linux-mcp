@@ -329,6 +329,7 @@ OpenAI does not store the MCP `authorization` value in the Response object, so p
 | Session environment | `set_session_env` |
 | Files and images | `read_file`, `watch_image`, `write_file`, `replace_in_file`, `apply_patch`, `list_dir`, `stat_path`, `make_dir`, `copy_path`, `move_path` |
 | Delegated agents | `run_codex_yolo`, `start_codex_yolo`, `run_agy_yolo`, `start_agy_yolo` |
+| ChatGPT agent orchestration | `agent_projects_list`, `agent_project_get`, `agent_project_threads`, `agent_register_parent`, `agent_spawn`, `agent_status`, `agent_context`, `agent_tail`, `agent_send`, `agent_wait`, `agent_sync`, `agent_children`, `agent_subscribe`, `agent_ack`, `agent_cancel` |
 
 ## Persistent downstream MCP proxy
 
@@ -437,6 +438,15 @@ Copy `.env.example` to `.env`. Important values:
 | `MCP_CHAT_WATCHDOG_STALE_GENERATION_SECONDS` | `600` | Age after which an in-progress canonical state is reported as stale and never auto-continued |
 | `MCP_CHAT_WATCHDOG_MAX_CONTINUE_ATTEMPTS` | `20` | Hard per-task continuation-attempt ceiling |
 | `MCP_CHAT_WATCHDOG_PRE_SEND_CONFIRM_SECONDS` | `1.25` | Delay before the canonical pre-send refetch |
+| `MCP_CHAT_AGENT_ENABLED` | `1` | Enable the restart-safe parent/child orchestration sync loop for SSE/Streamable HTTP |
+| `MCP_CHAT_AGENT_DB` | `~/.GPT/chat-agent-orchestrator.db` | SQLite registry, task, mailbox, event, subscription, and cursor store |
+| `MCP_CHAT_AGENT_SYNC_SECONDS` | `15` | Background orchestration sync interval |
+| `MCP_CHAT_AGENT_CONTEXT_MAX_EVENTS` | `60` | Maximum compact execution events returned or journaled per delta |
+| `MCP_CHAT_AGENT_CONTEXT_MAX_CHARS` | `12000` | Maximum serialized compact execution context |
+| `MCP_CHAT_AGENT_TAIL_LINES` | `60` | Default recent visible/tool-summary lines |
+| `MCP_CHAT_AGENT_TAIL_MAX_CHARS` | `12000` | Maximum recent-tail text size |
+| `MCP_CHAT_AGENT_MAX_CONTINUE_ATTEMPTS` | `20` | Hard ceiling for automatic child-task continuation attempts |
+| `MCP_CHAT_AGENT_STALE_SECONDS` | `600` | Unchanged canonical-node age before an active/waiting child is marked stale and its parent is notified |
 
 The launcher refuses to start when the selected port is already occupied. It never kills or replaces an existing service.
 
@@ -451,6 +461,24 @@ Task completion is turn-bounded. A re-added task uses the prior generation's rec
 A stopped incomplete task receives the configured continuation only after a second canonical `get` immediately before sending. A new completion marker, a changed transcript or `current_node`, an active stream, an existing continuation as the latest user turn, a duplicate parent node, cooldown, or the attempt ceiling cancels the send. The app's live model catalogue merges duplicate picker entries by backend slug. It uses an explicitly configured model strictly, otherwise reuses the thread model only when it satisfies the requested effort, and falls back to another verified high-reasoning model rather than silently downgrading. Watchdog operations share one global scan lock and one endpoint-wide internal-client lock, so only one watchdog operation or completion stream is initiated at a time while normal app use remains independent.
 
 The authenticated dashboard exposes `/dashboard/watchdog` plus task edit/add/remove and manual-scan controls. The textarea edits the same `threads.txt` file used by the daemon, and active rows show their task generation. Saves include an optimistic file version, so a browser tab cannot overwrite URLs changed directly on disk. Mutating requests require same-origin context and the `x-mcp-dashboard-csrf: chat-watchdog` header; the existing dashboard token/cookie boundary still applies.
+
+### Persistent ChatGPT sub-agent orchestration
+
+The orchestration tools use the same app-owned normal-chat client and the same lock-protected Codex start/reopen path as the watchdog. They do not navigate the visible UI. The background loop stays idle when no task, mailbox command, or undelivered auto-resume event exists. A root conversation is registered once with `agent_register_parent`; registration reads its canonical conversation state, discovers its actual ChatGPT Project, and binds a real terminal `working_directory`. The returned `agent_id` is the stable identity used for child and grandchild relationships.
+
+`agent_projects_list` exposes safe project-selection metadata. `agent_spawn` requires one project policy: `explicit` with a project ID, `inherit_parent`, or `none`; project names are never guessed. Terminal workspace placement is separate: a child inherits its parent’s `working_directory` unless another existing directory is supplied. Its initial prompt contains `agent_id`, `task_id`, parent/root/orchestration IDs, project ID, working directory, and the exact `bootstrap_thread`/`session_id` contract needed for terminal work and nested spawning.
+
+Every child receives an exact completion-marker contract and defaults to `notification_policy=auto_resume`. A canonically terminal child without the marker is continued automatically, one write per sync, up to `MCP_CHAT_AGENT_MAX_CONTINUE_ATTEMPTS`. Completion, failure, cancellation, progress, and blocked states are journaled durably. If an active or waiting conversation’s canonical node does not change for `MCP_CHAT_AGENT_STALE_SECONDS`, it is marked `stale` and emits one blocked event; the coordinator does not guess or resend into that uncertain state.
+
+Each agent has a durable SQLite task, parent/root link, context cursor, ordered mailbox, event journal, subscription, working directory, continuation counters, and structural-progress timestamp. `agent_send` queues normal follow-ups while a target turn is active and delivers them in sequence after a canonical terminal state. `interrupt_policy=interrupt` is explicit and uses one sync cycle to cancel before a later cycle delivers the message. Every sync inspects all active agents sequentially and performs at most one app-owned write, so one long-running or unreadable child cannot starve its siblings. Backend generations may continue concurrently after dispatch.
+
+Write uncertainty fails closed. A send that may have reached ChatGPT but cannot be confirmed is stored as `delivery_uncertain` and is not retried automatically. Read failures are recorded per command and do not block unrelated mailboxes. Spawn and send idempotency keys remain effective under concurrent MCP retries. Parent notifications batch bounded child events; their delivery cursor advances only after confirmed insertion into the parent conversation. A manual `agent_ack` cancels any queued auto-resume message covering the acknowledged events.
+
+`agent_context` returns a cursor-based compact execution delta containing visible progress, tool names, sanitized compact tool results, a dedicated reasoning recap when present, and final output. It excludes raw hidden chain-of-thought and large metadata blobs. `agent_tail` returns recent visible conversation lines, reasoning recaps, and tool summaries. `agent_wait` polls durable events after an event sequence.
+
+`notification_policy=notify_only` records child events without writing to the parent. `auto_resume` ignores the synchronous `started` acknowledgement, batches later meaningful events, and delivers one structured message only when the parent conversation is canonically terminal. Manual acknowledgement can be used instead. The orchestration loop is installed for SSE/Streamable HTTP startup and does not run in stdio mode. Code/config changes require a Terminal MCP process restart before the running service exposes these tools.
+
+A supplied spawn `title` is an orchestration label. The normal ChatGPT title may still be generated by ChatGPT; no visible rename action is used.
 
 ## Security guidance
 
