@@ -417,8 +417,40 @@ Copy `.env.example` to `.env`. Important values:
 | `NGROK_URL` | random URL | Reserved ngrok URL/domain |
 | `NGROK_TRAFFIC_POLICY_FILE` | empty | Optional ngrok Traffic Policy |
 | `MCP_ALLOW_UNAUTHENTICATED_PUBLIC` | `0` | Dangerous public-tunnel override |
+| `MCP_CHAT_WATCHDOG_ENABLED` | `1` | Enable the five-minute ChatGPT task watchdog for SSE/Streamable HTTP |
+| `MCP_CHAT_WATCHDOG_ADAPTER` | `codex-internal` | Use the Codex desktop app's internal normal-chat client; no UI fallback is enabled |
+| `MCP_CHAT_WATCHDOG_QUEUE` | `~/.GPT/chat-watchdog/threads.txt` | Editable one-active-task-URL-per-line source of truth |
+| `MCP_CHAT_WATCHDOG_STATE` | `~/.GPT/chat-watchdog/state.json` | Per-conversation task-generation state |
+| `MCP_CHAT_WATCHDOG_COMPLETED` | `~/.GPT/chat-watchdog/completed.jsonl` | Append-only task completion history |
+| `MCP_CHAT_WATCHDOG_CDP` | `http://127.0.0.1:9222` | Codex desktop CDP endpoint |
+| `MCP_CHAT_WATCHDOG_INTERVAL_SECONDS` | `300` | Scheduled scan interval |
+| `MCP_CHAT_WATCHDOG_RETRY_SECONDS` | `300` | Duplicate-send cooldown |
+| `MCP_CHAT_WATCHDOG_DRY_RUN` | `0` | Inspect and report without sending |
+| `MCP_CHAT_WATCHDOG_AUTO_START_APP` | `1` | Start the desktop host when offline, or reopen its primary renderer when CDP is up but the internal client is not ready |
+| `MCP_CHAT_WATCHDOG_APP_COMMAND` | `/usr/bin/codex-desktop` | Installed Codex desktop launch command |
+| `MCP_CHAT_WATCHDOG_APP_START_TIMEOUT_SECONDS` | `30` | Maximum time to wait for a usable primary renderer after starting or reopening the desktop host |
+| `MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS` | `10` | Timeout for CDP attachment and internal reads |
+| `MCP_CHAT_WATCHDOG_REQUIRE_HIGH` | `1` | Refuse to silently lower the requested reasoning level |
+| `MCP_CHAT_WATCHDOG_MODEL` | empty | Preferred live model slug; otherwise reuse the thread model or live default |
+| `MCP_CHAT_WATCHDOG_THINKING_EFFORT` | `extended` | Requested live reasoning effort |
+| `MCP_CHAT_WATCHDOG_STREAM_TIMEOUT_SECONDS` | `3600` | Maximum time to wait for a watchdog-owned completion stream |
+| `MCP_CHAT_WATCHDOG_STALE_GENERATION_SECONDS` | `600` | Age after which an in-progress canonical state is reported as stale and never auto-continued |
+| `MCP_CHAT_WATCHDOG_MAX_CONTINUE_ATTEMPTS` | `20` | Hard per-task continuation-attempt ceiling |
+| `MCP_CHAT_WATCHDOG_PRE_SEND_CONFIRM_SECONDS` | `1.25` | Delay before the canonical pre-send refetch |
 
 The launcher refuses to start when the selected port is already occupied. It never kills or replaces an existing service.
+
+### ChatGPT task watchdog
+
+When enabled, the SSE and Streamable HTTP app scans every five minutes. Each URL line is one active task instance in an ordinary saved ChatGPT conversation, not a permanent thread watch or Work task. Completion removes that task URL; adding the same URL again creates a fresh task ID and increments its task generation, resetting hashes, cooldowns, attempts, completion state, and user-turn baseline. Direct file removal and later reappearance are reconciled the same way.
+
+The default `codex-internal` adapter attaches to the installed desktop host at `127.0.0.1:9222` and calls its app-owned client for ordinary saved ChatGPT conversations directly. It does not launch Chrome, navigate conversations, read rendered transcript DOM, focus controls, type, or click, and there is no UI fallback. The desktop host must already be signed in once with the ChatGPT account that owns the queued conversations. If it is closed, the watchdog may start `/usr/bin/codex-desktop`. If CDP is up but no usable primary renderer exists, the watchdog sends the launcher's supported `--new-chat` warm-start action and waits for the internal runtime to become ready; failure remains non-destructive and sends nothing. The current build's `mcpAppSandboxDevtools=1` primary renderer is supported.
+
+Task completion is turn-bounded. A re-added task uses the prior generation's recorded completion turn as its boundary and waits for a later user turn, so an old `DONE_I_HAVE_COMPLETED_ALL_THE_STEPS` marker cannot complete a new task. Completion is accepted only when the latest meaningful turn is an assistant turn after the current task's user baseline and contains the marker as an exact standalone line. The durable completion record includes task ID, generation, baseline turn, and completion turn before the URL is removed.
+
+A stopped incomplete task receives the configured continuation only after a second canonical `get` immediately before sending. A new completion marker, a changed transcript or `current_node`, an active stream, an existing continuation as the latest user turn, a duplicate parent node, cooldown, or the attempt ceiling cancels the send. The app's live model catalogue merges duplicate picker entries by backend slug. It uses an explicitly configured model strictly, otherwise reuses the thread model only when it satisfies the requested effort, and falls back to another verified high-reasoning model rather than silently downgrading. Watchdog operations share one global scan lock and one endpoint-wide internal-client lock, so only one watchdog operation or completion stream is initiated at a time while normal app use remains independent.
+
+The authenticated dashboard exposes `/dashboard/watchdog` plus task edit/add/remove and manual-scan controls. The textarea edits the same `threads.txt` file used by the daemon, and active rows show their task generation. Saves include an optimistic file version, so a browser tab cannot overwrite URLs changed directly on disk. Mutating requests require same-origin context and the `x-mcp-dashboard-csrf: chat-watchdog` header; the existing dashboard token/cookie boundary still applies.
 
 ## Security guidance
 
