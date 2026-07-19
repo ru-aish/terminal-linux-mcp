@@ -1142,6 +1142,7 @@ class ChatWatchdog:
         self.clock = clock
         self._task: asyncio.Task[None] | None = None
         self._scan_lock = asyncio.Lock()
+        self._runtime_launch_lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._stop = asyncio.Event()
         self._runtime: dict[str, Any] = {
@@ -1225,6 +1226,11 @@ class ChatWatchdog:
                 probe.target,
             )
         return probe
+
+    async def ensure_background_runtime(self) -> bool:
+        """Ensure one usable internal runtime, serializing start/reopen attempts."""
+        async with self._runtime_launch_lock:
+            return await self._ensure_background_runtime()
 
     async def _ensure_background_runtime(self) -> bool:
         """Ensure the internal ChatGPT client has a live primary renderer."""
@@ -1464,7 +1470,7 @@ class ChatWatchdog:
             restore_needed = False
             try:
                 if self._uses_managed_runtime:
-                    await self._ensure_background_runtime()
+                    await self.ensure_background_runtime()
                 async with self.adapter_factory() as adapter:
                     original_conversation_id = await adapter.current_conversation_id()
                     try:
