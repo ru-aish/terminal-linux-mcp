@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
 import sys
@@ -31,6 +32,8 @@ from chat_watchdog import (
     install_chat_watchdog_lifespan,
     parse_chat_link,
 )
+from durable_ledger import DurableLedger
+
 from chat_internal_client import (
     RuntimeNotReadyError,
     RuntimeProbe,
@@ -1490,3 +1493,129 @@ def test_public_runtime_ensure_serializes_concurrent_launch_attempts(tmp_path, m
         assert maximum == 1
 
     asyncio.run(run())
+
+
+def test_empty_latest_user_turn_is_awaiting_without_adapter_crash():
+    snapshot = ThreadSnapshot(
+        found=True,
+        conversation_id=link().conversation_id,
+        turns=(
+            ConversationTurn(
+                key="u-empty",
+                role="user",
+                text="",
+                status="finished_successfully",
+                end_turn=True,
+            ),
+        ),
+        current_node="u-empty",
+        canonical=True,
+        state_verified=True,
+    )
+    decision = classify_thread_state(
+        snapshot,
+        task_start_index=-1,
+        completion_marker="DONE",
+        continuation_message=DEFAULT_CONTINUE_MESSAGE,
+    )
+    assert decision.state is ThreadDecisionState.AWAITING_ASSISTANT
+
+
+def test_empty_noncanonical_snapshot_is_never_continuation_eligible():
+    snapshot = ThreadSnapshot(
+        found=True,
+        conversation_id=link().conversation_id,
+        canonical=False,
+        state_verified=False,
+    )
+    decision = classify_thread_state(
+        snapshot,
+        task_start_index=-1,
+        completion_marker="DONE",
+    )
+    assert decision.state is ThreadDecisionState.UNKNOWN
+    assert decision.can_continue is False
+
+
+def test_legacy_watchdog_json_imports_once_into_durable_ledger(tmp_path):
+    conversation_id = link().conversation_id
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                conversation_id: {
+                    "status": "legacy-running",
+                    "task_generation": 3,
+                    "queued": True,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "shared.db"
+    watchdog = ChatWatchdog(
+        ChatWatchdogConfig(
+            True,
+            tmp_path / "threads.txt",
+            state_path,
+            tmp_path / "done.jsonl",
+            ledger_path=ledger_path,
+        ),
+        adapter_factory=lambda: FakeAdapter(ThreadSnapshot(False, conversation_id)),
+    )
+    assert watchdog.state.get(conversation_id)["task_generation"] == 3
+    assert DurableLedger(ledger_path).watchdog_state(conversation_id)["status"] == (
+        "legacy-running"
+    )
+
+    # Later edits to the compatibility mirror cannot overwrite authoritative
+    # SQLite state on restart.
+    state_path.write_text(
+        json.dumps({conversation_id: {"status": "stale-file", "task_generation": 99}}),
+        encoding="utf-8",
+    )
+    restarted = ChatWatchdog(
+        ChatWatchdogConfig(
+            True,
+            tmp_path / "threads.txt",
+            state_path,
+            tmp_path / "done.jsonl",
+            ledger_path=ledger_path,
+        ),
+        adapter_factory=lambda: FakeAdapter(ThreadSnapshot(False, conversation_id)),
+    )
+    assert restarted.state.get(conversation_id)["status"] == "legacy-running"
+    mirrored = json.loads(state_path.read_text(encoding="utf-8"))
+    assert mirrored[conversation_id]["task_generation"] == 3
+
+
+def test_watchdog_and_agent_orchestration_share_one_sqlite_ledger(tmp_path):
+    shared = tmp_path / "orchestration.db"
+    item = link()
+    watchdog = ChatWatchdog(
+        ChatWatchdogConfig(
+            True,
+            tmp_path / "threads.txt",
+            tmp_path / "state.json",
+            tmp_path / "done.jsonl",
+            ledger_path=shared,
+        ),
+        adapter_factory=lambda: FakeAdapter(ThreadSnapshot(False, item.conversation_id)),
+    )
+    watchdog.state.start_task(item, source="test")
+
+    from chat_agent_orchestrator import ChatAgentCoordinator, CoordinatorConfig
+
+    runtime = FakeAdapter(ThreadSnapshot(False, item.conversation_id))
+    # Constructing the coordinator against the same file must preserve the
+    # generic watchdog task family and initialize the agent tables safely.
+    coordinator = ChatAgentCoordinator(CoordinatorConfig(shared), lambda: runtime)
+    assert coordinator.repository.watchdog_state(item.conversation_id)["queued"] is True
+    with coordinator.repository.connect() as db:
+        tables = {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert {"watchdog_tasks", "agents", "tasks", "commands"} <= tables

@@ -32,6 +32,7 @@ def terminal_snapshot(
         "title": chat_id,
         "current_node": f"a-{chat_id}",
         "state_verified": True,
+        "canonical": True,
         "running": running,
         "active_stream": False,
         "turns": [
@@ -1062,5 +1063,618 @@ def test_cancelling_parent_drops_and_acks_queued_child_notifications(tmp_path):
             ).fetchone()[0]
         assert int(acked) == last_seq
         assert service.has_pending_work() is False
+
+    asyncio.run(run())
+
+
+def test_uncertain_parent_notification_reconciles_from_side_branch(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(
+            tmp_path, runtime, notification_policy="auto_resume"
+        )
+        child_id = child["agent"]["agent_id"]
+        runtime.context_events["child-chat-1"] = [
+            {"cursor": "progress-1", "kind": "progress", "summary": "working"}
+        ]
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        runtime.continue_results["parent-chat"] = {
+            "sent": True,
+            "observed": False,
+            "running": True,
+            "reason": "active branch changed before confirmation",
+            "request_id": "request-parent",
+            "user_message_id": "generated-parent-message",
+            "parent_message_id": "a-parent-chat",
+        }
+
+        first = await service.sync_once()
+        assert first["write_count"] == 1
+        with service.repository.connect() as db:
+            command = dict(
+                db.execute(
+                    "SELECT * FROM commands WHERE from_agent_id=? AND to_agent_id=? "
+                    "AND purpose='progress'",
+                    (child_id, parent["agent_id"]),
+                ).fetchone()
+            )
+        assert command["status"] == "delivery_uncertain"
+        assert command["user_message_id"] == "generated-parent-message"
+
+        parent_snapshot = terminal_snapshot("parent-chat")
+        parent_snapshot["all_message_ids"] = ["generated-parent-message"]
+        runtime.snapshots["parent-chat"] = parent_snapshot
+        second = await service.sync_once()
+        assert second["write_count"] == 1
+
+        with service.repository.connect() as db:
+            status = db.execute(
+                "SELECT status FROM commands WHERE command_id=?",
+                (command["command_id"],),
+            ).fetchone()[0]
+            acked = db.execute(
+                "SELECT last_acked_event_seq FROM subscriptions "
+                "WHERE parent_agent_id=? AND child_agent_id=?",
+                (parent["agent_id"], child_id),
+            ).fetchone()[0]
+        assert status == "delivered"
+        assert int(acked) == int(command["ack_event_seq"])
+        assert len(runtime.continue_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_restart_preserves_send_evidence_and_reconciles_without_resend(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        command = await service.send(parent["agent_id"], child_id, "follow-up")
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='delivery_in_flight',request_id=?,"
+                "user_message_id=?,parent_message_id=? WHERE command_id=?",
+                ("request-1", "persisted-user-message", "a-child-chat-1", command["command_id"]),
+            )
+
+        child_snapshot = terminal_snapshot("child-chat-1")
+        child_snapshot["all_message_ids"] = ["persisted-user-message"]
+        runtime.snapshots["child-chat-1"] = child_snapshot
+        restarted = coordinator(tmp_path, runtime)
+        with restarted.repository.connect() as db:
+            recovered = dict(
+                db.execute(
+                    "SELECT * FROM commands WHERE command_id=?",
+                    (command["command_id"],),
+                ).fetchone()
+            )
+        assert recovered["status"] == "delivery_uncertain"
+        assert recovered["request_id"] == "request-1"
+        assert recovered["user_message_id"] == "persisted-user-message"
+
+        result = await restarted.sync_once()
+        assert result["write_count"] == 1
+        with restarted.repository.connect() as db:
+            final_status = db.execute(
+                "SELECT status FROM commands WHERE command_id=?",
+                (command["command_id"],),
+            ).fetchone()[0]
+        assert final_status == "delivered"
+        assert runtime.continue_calls == []
+
+    asyncio.run(run())
+
+
+def test_completion_supersedes_uncertain_progress_and_drains_cursor(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+            notification_policy="auto_resume",
+            completion_marker="DONE",
+        )
+        child_id = child["agent"]["agent_id"]
+        runtime.context_events["child-chat-1"] = [
+            {"cursor": "progress-1", "kind": "progress", "summary": "working"}
+        ]
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        runtime.continue_results["parent-chat"] = {
+            "sent": True,
+            "observed": False,
+            "running": True,
+            "reason": "confirmation timed out",
+            "user_message_id": "uncertain-progress-message",
+            "parent_message_id": "a-parent-chat",
+        }
+        await service.sync_once()
+
+        with service.repository.connect() as db:
+            progress = dict(
+                db.execute(
+                    "SELECT * FROM commands WHERE from_agent_id=? AND to_agent_id=? "
+                    "AND purpose='progress'",
+                    (child_id, parent["agent_id"]),
+                ).fetchone()
+            )
+        assert progress["status"] == "delivery_uncertain"
+
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        runtime.snapshots["child-chat-1"] = terminal_snapshot(
+            "child-chat-1", marker="final result\nDONE"
+        )
+        runtime.continue_results["parent-chat"] = {
+            "sent": True,
+            "observed": True,
+            "running": True,
+            "reason": "",
+            "user_message_id": "completion-message",
+            "parent_message_id": "a-parent-chat",
+        }
+        second = await service.sync_once()
+        assert second["write_count"] == 1
+
+        with service.repository.connect() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT * FROM commands WHERE from_agent_id=? AND to_agent_id=? "
+                    "ORDER BY sequence_no",
+                    (child_id, parent["agent_id"]),
+                )
+            ]
+            acked = int(
+                db.execute(
+                    "SELECT last_acked_event_seq FROM subscriptions "
+                    "WHERE parent_agent_id=? AND child_agent_id=?",
+                    (parent["agent_id"], child_id),
+                ).fetchone()[0]
+            )
+        assert [row["purpose"] for row in rows] == ["progress", "completion"]
+        assert rows[0]["status"] == "superseded"
+        assert rows[1]["status"] == "delivered"
+        assert acked == int(rows[1]["ack_event_seq"])
+        assert '"kind":"completed"' in rows[1]["message"]
+
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        third = await service.sync_once()
+        assert third["write_count"] == 0
+        with service.repository.connect() as db:
+            completion_count = db.execute(
+                "SELECT COUNT(*) FROM commands WHERE from_agent_id=? AND to_agent_id=? "
+                "AND purpose='completion'",
+                (child_id, parent["agent_id"]),
+            ).fetchone()[0]
+        assert completion_count == 1
+        assert len(runtime.continue_calls) == 2
+
+    asyncio.run(run())
+
+
+def test_completion_envelope_is_selected_even_after_oversized_progress_history(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service = ChatAgentCoordinator(
+            CoordinatorConfig(
+                tmp_path / "agents.db",
+                context_max_events=60,
+                context_max_chars=500,
+            ),
+            lambda: runtime,
+        )
+        parent = await service.register_parent("parent-chat")
+        child = await service.spawn(
+            parent["agent_id"],
+            "long child task",
+            notification_policy="auto_resume",
+        )
+        child_id = child["agent"]["agent_id"]
+        task_id = child["task"]["task_id"]
+        for index in range(10):
+            service._emit_event(
+                child_id,
+                task_id,
+                "progress",
+                {"summary": f"{index}:" + "x" * 300},
+                source_cursor=f"large-progress-{index}",
+            )
+        completion_id = service._emit_event(
+            child_id,
+            task_id,
+            "completed",
+            {"summary": "final"},
+            source_cursor="large-completed",
+        )
+        assert completion_id is not None
+
+        service._queue_parent_notifications()
+        with service.repository.connect() as db:
+            commands = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT * FROM commands WHERE from_agent_id=? AND to_agent_id=?",
+                    (child_id, parent["agent_id"]),
+                )
+            ]
+            completion_seq = int(
+                db.execute(
+                    "SELECT event_seq FROM events WHERE event_id=?",
+                    (completion_id,),
+                ).fetchone()[0]
+            )
+        assert len(commands) == 1
+        assert commands[0]["purpose"] == "completion"
+        assert int(commands[0]["ack_event_seq"]) == completion_seq
+        assert '"kind":"completed"' in commands[0]["message"]
+
+    asyncio.run(run())
+
+
+def test_blocking_question_pauses_child_until_parent_answer(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+
+        question = await service.send(
+            child_id,
+            parent["agent_id"],
+            "Which migration strategy should I use?",
+            purpose="question",
+            idempotency_key="blocking-question-1",
+        )
+        assert question["purpose"] == "question"
+        child_status = await service.status(child_id)
+        assert child_status["agent"]["status"] == "waiting_for_parent"
+        assert child_status["task"]["status"] == "waiting_for_parent"
+
+        first = await service.sync_once()
+        assert first["write_count"] == 1
+        assert runtime.continue_calls[-1][0] == "parent-chat"
+        assert runtime.continue_calls[-1][1] == "Which migration strategy should I use?"
+        child_status = await service.status(child_id)
+        assert child_status["task"]["status"] == "waiting_for_parent"
+        assert all(
+            not (call[0] == "child-chat-1" and "Continue working" in call[1])
+            for call in runtime.continue_calls
+        )
+
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        answer = await service.send(
+            parent["agent_id"],
+            child_id,
+            "Use the backward-compatible two-step migration.",
+            purpose="answer",
+            idempotency_key="answer-1",
+        )
+        assert answer["purpose"] == "answer"
+
+        second = await service.sync_once()
+        assert second["write_count"] == 1
+        assert runtime.continue_calls[-1][0] == "child-chat-1"
+        assert runtime.continue_calls[-1][1] == (
+            "Use the backward-compatible two-step migration."
+        )
+        child_status = await service.status(child_id)
+        assert child_status["agent"]["status"] == "waiting_assistant"
+        assert child_status["task"]["status"] == "waiting_assistant"
+        assert len(
+            [call for call in runtime.continue_calls if call[0] == "child-chat-1"]
+        ) == 1
+
+    asyncio.run(run())
+
+
+def test_question_and_answer_require_direct_parent_child_direction(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+
+        with pytest.raises(ValueError, match="question must be sent"):
+            await service.send(
+                parent["agent_id"], child_id, "wrong direction", purpose="question"
+            )
+        with pytest.raises(ValueError, match="answer must be sent"):
+            await service.send(
+                child_id, parent["agent_id"], "wrong direction", purpose="answer"
+            )
+        with pytest.raises(ValueError, match="purpose must be"):
+            await service.send(
+                parent["agent_id"], child_id, "unknown", purpose="unsupported"
+            )
+
+    asyncio.run(run())
+
+
+def test_blocking_question_and_answer_survive_coordinator_restart(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        question = await service.send(
+            child_id,
+            parent["agent_id"],
+            "Need a decision",
+            purpose="question",
+            idempotency_key="restart-question",
+        )
+
+        restarted = coordinator(tmp_path, runtime)
+        assert (await restarted.status(child_id))["task"]["status"] == (
+            "waiting_for_parent"
+        )
+        assert (await restarted.sync_once())["write_count"] == 1
+        assert runtime.continue_calls[-1][1] == "Need a decision"
+
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        answer = await restarted.send(
+            parent["agent_id"],
+            child_id,
+            "Proceed with option A",
+            purpose="answer",
+            idempotency_key="restart-answer",
+        )
+        again = coordinator(tmp_path, runtime)
+        assert (await again.sync_once())["write_count"] == 1
+        assert runtime.continue_calls[-1][1] == "Proceed with option A"
+        with again.repository.connect() as db:
+            statuses = {
+                row["command_id"]: row["status"]
+                for row in db.execute(
+                    "SELECT command_id,status FROM commands WHERE command_id IN (?,?)",
+                    (question["command_id"], answer["command_id"]),
+                )
+            }
+        assert statuses == {
+            question["command_id"]: "delivered",
+            answer["command_id"]: "delivered",
+        }
+
+    asyncio.run(run())
+
+
+def test_cancel_in_flight_command_recovers_without_repeating_cancel(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        command = await service.send(
+            parent["agent_id"],
+            child_id,
+            "urgent correction",
+            interrupt_policy="interrupt",
+        )
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='cancel_in_flight' WHERE command_id=?",
+                (command["command_id"],),
+            )
+
+        runtime.snapshots["child-chat-1"] = terminal_snapshot(
+            "child-chat-1", running=True
+        )
+        restarted = coordinator(tmp_path, runtime)
+        with restarted.repository.connect() as db:
+            recovered = dict(
+                db.execute(
+                    "SELECT status,last_error FROM commands WHERE command_id=?",
+                    (command["command_id"],),
+                ).fetchone()
+            )
+        assert recovered["status"] == "waiting_after_cancel"
+        assert "waiting for a verified terminal target" in recovered["last_error"]
+
+        assert (await restarted.sync_once())["write_count"] == 0
+        assert runtime.cancel_calls == []
+        assert runtime.continue_calls == []
+
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        assert (await restarted.sync_once())["write_count"] == 1
+        assert runtime.cancel_calls == []
+        assert runtime.continue_calls[-1][1] == "urgent correction"
+
+    asyncio.run(run())
+
+
+def test_uncertain_command_blocks_later_command_for_same_target(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        first = await service.send(
+            parent["agent_id"], child_id, "first", idempotency_key="ordered-first"
+        )
+        second = await service.send(
+            parent["agent_id"], child_id, "second", idempotency_key="ordered-second"
+        )
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='delivery_uncertain' WHERE command_id=?",
+                (first["command_id"],),
+            )
+
+        result = await service.sync_once()
+        assert result["write_count"] == 0
+        assert runtime.continue_calls == []
+
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='cancelled' WHERE command_id=?",
+                (first["command_id"],),
+            )
+        assert (await service.sync_once())["write_count"] == 1
+        assert runtime.continue_calls == [
+            ("child-chat-1", "second", "a-child-chat-1")
+        ]
+        with service.repository.connect() as db:
+            status = db.execute(
+                "SELECT status FROM commands WHERE command_id=?",
+                (second["command_id"],),
+            ).fetchone()[0]
+        assert status == "delivered"
+
+    asyncio.run(run())
+
+
+def test_default_child_update_is_progress_and_completion_supersedes_it(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+            notification_policy="auto_resume",
+            completion_marker="DONE",
+        )
+        child_id = child["agent"]["agent_id"]
+        update = await service.send(
+            child_id,
+            parent["agent_id"],
+            "non-blocking child update",
+            idempotency_key="child-update",
+        )
+        assert update["purpose"] == "progress"
+
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        runtime.snapshots["child-chat-1"] = terminal_snapshot(
+            "child-chat-1", marker="finished\nDONE"
+        )
+        result = await service.sync_once()
+        assert result["write_count"] == 1
+
+        with service.repository.connect() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT purpose,status,message FROM commands "
+                    "WHERE from_agent_id=? AND to_agent_id=? ORDER BY sequence_no",
+                    (child_id, parent["agent_id"]),
+                )
+            ]
+        assert rows[0]["purpose"] == "progress"
+        assert rows[0]["status"] == "superseded"
+        assert rows[1]["purpose"] == "completion"
+        assert rows[1]["status"] == "delivered"
+        assert runtime.continue_calls[-1][1].startswith("[SUBAGENT UPDATE]")
+        assert all(call[1] != "non-blocking child update" for call in runtime.continue_calls)
+
+    asyncio.run(run())
+
+
+def test_completion_supersedes_undelivered_blocking_question(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+            notification_policy="auto_resume",
+            completion_marker="DONE",
+        )
+        child_id = child["agent"]["agent_id"]
+        question = await service.send(
+            child_id,
+            parent["agent_id"],
+            "This question became obsolete",
+            purpose="question",
+            idempotency_key="obsolete-question",
+        )
+        assert question["purpose"] == "question"
+
+        runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
+        runtime.snapshots["child-chat-1"] = terminal_snapshot(
+            "child-chat-1", marker="resolved independently\nDONE"
+        )
+        assert (await service.sync_once())["write_count"] == 1
+        with service.repository.connect() as db:
+            statuses = [
+                tuple(row)
+                for row in db.execute(
+                    "SELECT purpose,status FROM commands WHERE from_agent_id=? "
+                    "AND to_agent_id=? ORDER BY sequence_no",
+                    (child_id, parent["agent_id"]),
+                )
+            ]
+        assert statuses == [
+            ("question", "superseded"),
+            ("completion", "delivered"),
+        ]
+        assert all(
+            call[1] != "This question became obsolete"
+            for call in runtime.continue_calls
+        )
+
+    asyncio.run(run())
+
+
+def test_delivery_uncertainty_keeps_background_reconciliation_awake(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(
+            tmp_path, runtime, notification_policy="notify_only"
+        )
+        command = await service.send(
+            parent["agent_id"], child["agent"]["agent_id"], "message"
+        )
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='delivery_uncertain' WHERE command_id=?",
+                (command["command_id"],),
+            )
+            db.execute(
+                "UPDATE agents SET status='completed' WHERE agent_id IN (?,?)",
+                (parent["agent_id"], child["agent"]["agent_id"]),
+            )
+            db.execute(
+                "UPDATE tasks SET status='completed',completed_at=1 WHERE agent_id=?",
+                (child["agent"]["agent_id"],),
+            )
+        assert service.has_pending_work() is True
+
+    asyncio.run(run())
+
+
+def test_terminal_parent_cancels_question_and_fails_waiting_child(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(
+            tmp_path, runtime, notification_policy="notify_only"
+        )
+        child_id = child["agent"]["agent_id"]
+        question = await service.send(
+            child_id,
+            parent["agent_id"],
+            "I cannot continue without this answer",
+            purpose="question",
+        )
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE agents SET status='completed' WHERE agent_id=?",
+                (parent["agent_id"],),
+            )
+
+        await service.sync_once()
+        status = await service.status(child_id)
+        assert status["agent"]["status"] == "failed"
+        assert status["task"]["status"] == "failed"
+        assert "terminal parent" in status["agent"]["last_error"]
+        with service.repository.connect() as db:
+            command_status = db.execute(
+                "SELECT status FROM commands WHERE command_id=?",
+                (question["command_id"],),
+            ).fetchone()[0]
+        assert command_status == "cancelled"
+        events = (await service.wait(child_id))["events"]
+        assert any(
+            event["kind"] == "blocked"
+            and "terminal parent" in event["payload"]["reason"]
+            for event in events
+        )
 
     asyncio.run(run())
