@@ -112,6 +112,17 @@ h2 { margin: 0; font-family: var(--display); font-size: clamp(1.45rem, 6vw, 2.45
 .thread-metrics b { color: var(--ink); font-weight: 500; }
 
 .method { padding-bottom: 42px; }
+.watchdog-section { padding: 30px 0; border-bottom: 1px solid var(--ink); }
+.watchdog-editor { display: grid; gap: 12px; margin-top: 16px; }
+.watchdog-editor textarea { width: 100%; border: 1px solid var(--rule); border-radius: 10px; padding: 12px; background: #fff; font: .72rem/1.5 var(--mono); }
+.watchdog-actions { display: flex; flex-wrap: wrap; gap: 9px; }
+.watchdog-actions input { flex: 1 1 260px; min-width: 0; border: 1px solid var(--rule); border-radius: 10px; padding: 10px; }
+.watchdog-actions button, .watchdog-section .section-heading > button, .watchdog-entry button { border: 0; border-radius: 10px; background: var(--ink); color: white; padding: 10px 14px; cursor: pointer; }
+.watchdog-entries { display: grid; gap: 8px; margin-top: 16px; }
+.watchdog-entry { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--rule); padding-top: 9px; font: .68rem var(--mono); }
+.watchdog-entry span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.watchdog-entry small { color: var(--muted); }
+.watchdog-entry button { background: transparent; color: var(--ink); border: 1px solid var(--rule); padding: 5px 8px; }
 .method h2 { max-width: 700px; }
 .method-grid { margin-top: 22px; display: grid; gap: 14px; color: var(--muted); font-size: .78rem; }
 .method-grid p { margin: 0; padding-top: 12px; border-top: 1px solid var(--rule); }

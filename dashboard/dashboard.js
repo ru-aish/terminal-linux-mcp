@@ -8,6 +8,7 @@
     fallbackTimer: null,
     seenEventIds: new Set(),
     query: "",
+    watchdogEditorVersion: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -286,6 +287,47 @@
       beginFallback();
     });
   }
+
+  async function watchdogRequest(path, options = {}) {
+    const response = await fetch(path, { ...options, headers: { "x-mcp-dashboard-csrf": "chat-watchdog", ...(options.headers || {}) } });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `Watchdog request failed (${response.status})`);
+    return payload;
+  }
+
+  function renderWatchdog(snapshot) {
+    const watchdog = snapshot;
+    if (!watchdog || !watchdog.queue) return;
+    const runtime = watchdog.runtime || {};
+    $("watchdogStatus").textContent = `${watchdog.enabled ? "Enabled" : "Disabled"}${watchdog.dry_run ? " · dry run" : ""} · ${watchdog.queue.entries.length} active task${watchdog.queue.entries.length === 1 ? "" : "s"} · ${runtime.scanning ? "scanning" : `last scan ${relativeTime(runtime.last_scan_finished_at)}`}`;
+    const raw = $("watchdogRaw");
+    if (document.activeElement !== raw) {
+      raw.value = watchdog.queue.text || "";
+      state.watchdogEditorVersion = watchdog.queue.version || null;
+    }
+    $("watchdogEntries").innerHTML = watchdog.queue.entries.map((entry) => { const generation = entry.state?.task_generation ? ` · generation ${entry.state.task_generation}` : ""; return `<div class="watchdog-entry"><span title="${escapeHtml(entry.url)}">${escapeHtml(entry.url)}</span><small>${escapeHtml((entry.state?.status || "queued") + generation)}</small><button type="button" data-watchdog-remove="${escapeHtml(entry.conversation_id)}">Remove task</button></div>`; }).join("") || '<div class="empty-row">No active tasks.</div>';
+  }
+
+  async function fetchWatchdog() { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog")); } catch (error) { $("watchdogStatus").textContent = error.message; } }
+  $("watchdogSave").addEventListener("click", async () => {
+    try {
+      renderWatchdog(await watchdogRequest("/dashboard/watchdog/queue", {
+        method: "PUT",
+        headers: {
+          "content-type": "text/plain",
+          ...(state.watchdogEditorVersion ? { "x-watchdog-queue-version": state.watchdogEditorVersion } : {}),
+        },
+        body: $("watchdogRaw").value,
+      }));
+    } catch (error) {
+      $("watchdogStatus").textContent = error.message;
+    }
+  });
+  $("watchdogAddButton").addEventListener("click", async () => { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog/queue/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: $("watchdogAdd").value }) })); $("watchdogAdd").value = ""; } catch (error) { $("watchdogStatus").textContent = error.message; } });
+  $("watchdogScan").addEventListener("click", async () => { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog/scan", { method: "POST" })); } catch (error) { $("watchdogStatus").textContent = error.message; } });
+  $("watchdogEntries").addEventListener("click", async (event) => { const button = event.target.closest("[data-watchdog-remove]"); if (!button) return; try { renderWatchdog(await watchdogRequest(`/dashboard/watchdog/queue/${button.dataset.watchdogRemove}`, { method: "DELETE" })); } catch (error) { $("watchdogStatus").textContent = error.message; } });
+  fetchWatchdog();
+  window.setInterval(fetchWatchdog, 5000);
 
   document.querySelectorAll("[data-hours]").forEach((button) => {
     button.addEventListener("click", () => {
