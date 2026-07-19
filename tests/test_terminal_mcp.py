@@ -4,6 +4,7 @@ import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mcp
@@ -13,6 +14,7 @@ import terminal_mcp
 EXPECTED_TOOLS = [
     "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
     "thread_goal", "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
+    "node_repl_js", "node_repl_js_reset",
     "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
@@ -309,6 +311,26 @@ def test_bounded_command_capture_spills_large_output(tmp_path, monkeypatch):
     assert log and Path(log).read_text(encoding="utf-8").count("x") == 4096
 
 
+def test_run_command_preserves_original_exit_code(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "exit-code-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    (project / ".GPT").mkdir()
+    (project / ".GPT" / "AGENTS.md").write_text("rule", encoding="utf-8")
+    thread_id = "exit-code-thread"
+    run(terminal_mcp.bootstrap_thread(thread_id=thread_id, cwd=str(project), max_chars=100000))
+
+    result = run(terminal_mcp.run_command(
+        "python -c 'raise SystemExit(7)'",
+        session_id=thread_id,
+        cwd=str(project),
+    ))
+
+    assert "Exit Code: 7" in result
+    assert "Working Directory:" in result
+
+
 def test_workload_scope_prefix_is_optional_and_sanitized(monkeypatch):
     monkeypatch.setattr(terminal_mcp, "WORKLOAD_ISOLATION", "auto")
     monkeypatch.setattr(terminal_mcp.shutil, "which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
@@ -501,6 +523,7 @@ def test_filesystem_and_process_lifecycle(tmp_path, monkeypatch):
         )
 
     run(lifecycle())
+
 
 
 

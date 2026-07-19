@@ -67,6 +67,19 @@
         </article>
       </section>
 
+      <section class="watchdog-section" aria-labelledby="watchdogTitle">
+        <div class="section-heading">
+          <div><p class="eyebrow">ChatGPT task watchdog</p><h2 id="watchdogTitle">Active task queue</h2></div>
+          <button type="button" id="watchdogScan">Scan now</button>
+        </div>
+        <p id="watchdogStatus" class="hero-note">Loading watchdog status…</p>
+        <div class="watchdog-editor">
+          <textarea id="watchdogRaw" rows="5" spellcheck="false" aria-label="ChatGPT queue URLs"></textarea>
+          <div class="watchdog-actions"><button type="button" id="watchdogSave">Save queue</button><input id="watchdogAdd" type="url" placeholder="https://chatgpt.com/c/…" aria-label="Add ChatGPT URL"><button type="button" id="watchdogAddButton">Add URL</button></div>
+        </div>
+        <div id="watchdogEntries" class="watchdog-entries" aria-live="polite"></div>
+      </section>
+
       <section class="flow-section" aria-labelledby="flowTitle">
         <div class="section-heading">
           <div>

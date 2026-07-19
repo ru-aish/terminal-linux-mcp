@@ -15,6 +15,7 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Redire
 from starlette.routing import Route
 
 from gpt_thread_store import GPTThreadStore
+from chat_watchdog import ChatWatchdog, QueueConflictError, QueueValidationError
 
 
 ASSET_DIR = Path(__file__).resolve().parent / "dashboard"
@@ -97,7 +98,7 @@ def _parse_positive_int(value: str | None, default: int, maximum: int) -> int:
     return max(1, min(parsed, maximum))
 
 
-def install_usage_dashboard(app: Any, store: GPTThreadStore) -> None:
+def install_usage_dashboard(app: Any, store: GPTThreadStore, watchdog: ChatWatchdog | None = None) -> None:
     """Mount the live usage dashboard into an existing Starlette/FastMCP app."""
 
     existing_paths = {getattr(route, "path", "") for route in app.routes}
@@ -141,6 +142,77 @@ def install_usage_dashboard(app: Any, store: GPTThreadStore) -> None:
         limit = _parse_positive_int(request.query_params.get("limit"), 40, 100)
         snapshot = await asyncio.to_thread(store.dashboard_snapshot, hours, limit)
         return _security_headers(JSONResponse(snapshot))
+
+    def watchdog_mutation_allowed(request: Request) -> bool:
+        if not _authorized(request):
+            return False
+        origin = request.headers.get("origin", "")
+        if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
+            return False
+        referer = request.headers.get("referer", "")
+        if referer and not referer.startswith(str(request.base_url)):
+            return False
+        return secrets.compare_digest(request.headers.get("x-mcp-dashboard-csrf", ""), "chat-watchdog")
+
+    async def watchdog_api(request: Request) -> Response:
+        if watchdog is None or not _authorized(request):
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404 if watchdog is None else 401))
+        return _security_headers(JSONResponse(await asyncio.to_thread(watchdog.snapshot)))
+
+    async def watchdog_replace(request: Request) -> Response:
+        if watchdog is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not watchdog_mutation_allowed(request):
+            return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
+        body = await request.body()
+        if len(body) > 128 * 1024:
+            return _security_headers(JSONResponse({"error": "queue body too large"}, status_code=413))
+        expected_version = request.headers.get("x-watchdog-queue-version", "").strip() or None
+        try:
+            await asyncio.to_thread(
+                watchdog.replace_queue,
+                body.decode("utf-8"),
+                expected_version,
+            )
+        except QueueConflictError as exc:
+            current = await asyncio.to_thread(watchdog.snapshot)
+            return _security_headers(
+                JSONResponse({"error": str(exc), "watchdog": current}, status_code=409)
+            )
+        except (UnicodeDecodeError, ValueError, QueueValidationError) as exc:
+            return _security_headers(JSONResponse({"error": str(exc)}, status_code=400))
+        return _security_headers(JSONResponse(await asyncio.to_thread(watchdog.snapshot)))
+
+    async def watchdog_add(request: Request) -> Response:
+        if watchdog is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not watchdog_mutation_allowed(request):
+            return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
+        try:
+            payload = await request.json()
+            await asyncio.to_thread(watchdog.add_url, str(payload.get("url", "")))
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return _security_headers(JSONResponse({"error": str(exc)}, status_code=400))
+        return _security_headers(
+            JSONResponse(await asyncio.to_thread(watchdog.snapshot), status_code=201)
+        )
+
+    async def watchdog_remove(request: Request) -> Response:
+        if watchdog is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not watchdog_mutation_allowed(request):
+            return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
+        conversation_id = request.path_params["conversation_id"]
+        removed = await asyncio.to_thread(watchdog.remove_url, conversation_id)
+        snapshot = await asyncio.to_thread(watchdog.snapshot)
+        return _security_headers(JSONResponse({"removed": removed, **snapshot}))
+
+    async def watchdog_scan(request: Request) -> Response:
+        if watchdog is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not watchdog_mutation_allowed(request):
+            return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
+        return _security_headers(JSONResponse(await watchdog.scan_once(trigger="dashboard")))
 
     async def dashboard_events(request: Request) -> Response:
         if not _authorized(request):
@@ -201,6 +273,11 @@ def install_usage_dashboard(app: Any, store: GPTThreadStore) -> None:
             Route("/dashboard/login", dashboard_login, methods=["POST"]),
             Route("/dashboard/logout", dashboard_logout, methods=["POST"]),
             Route("/dashboard/api", dashboard_api, methods=["GET"]),
+            Route("/dashboard/watchdog", watchdog_api, methods=["GET"]),
+            Route("/dashboard/watchdog/queue", watchdog_replace, methods=["PUT", "POST"]),
+            Route("/dashboard/watchdog/queue/add", watchdog_add, methods=["POST"]),
+            Route("/dashboard/watchdog/queue/{conversation_id:str}", watchdog_remove, methods=["DELETE"]),
+            Route("/dashboard/watchdog/scan", watchdog_scan, methods=["POST"]),
             Route("/dashboard/events", dashboard_events, methods=["GET"]),
             Route("/dashboard/assets/{name:str}", dashboard_asset, methods=["GET"]),
         ]

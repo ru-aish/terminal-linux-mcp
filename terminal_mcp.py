@@ -21,7 +21,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from mcp import types as mcp_types
@@ -30,6 +30,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from gpt_thread_store import GPTThreadStore
 from usage_dashboard import install_usage_dashboard
+from chat_watchdog import ChatWatchdog, ChatWatchdogConfig, install_chat_watchdog_lifespan
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,6 +52,7 @@ DEFAULT_BOOTSTRAP_MAX_CHARS = int(os.environ.get("MCP_BOOTSTRAP_MAX_CHARS", "100
 WATCH_IMAGE_MAX_BYTES = int(os.environ.get("MCP_WATCH_IMAGE_MAX_BYTES", str(20 * 1024 * 1024)))
 TOKEN_ACCOUNTING_MAX_CHARS = int(os.environ.get("MCP_TOKEN_ACCOUNTING_MAX_CHARS", "1000000"))
 GOAL_REMINDER_SECONDS = int(os.environ.get("MCP_GOAL_REMINDER_SECONDS", "900"))
+NODE_REPL_MCP_SERVER = os.environ.get("MCP_NODE_REPL_SERVER", "node_repl")
 GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
 
 
@@ -282,6 +284,8 @@ class McpActorRequest:
     operation: str
     tool_name: str
     arguments: dict[str, Any] | None
+    meta: dict[str, Any] | None
+    elicitation_callback: Callable[[Any], Awaitable[Any]] | None
     future: asyncio.Future[Any]
 
 
@@ -346,6 +350,99 @@ class BearerAuthMiddleware:
             ],
         })
         await send({"type": "http.response.body", "body": body})
+
+
+class PrivacyCloneProxyMiddleware:
+    """Stream one dedicated public path to the offline privacy terminal."""
+
+    _HOP_BY_HOP_HEADERS = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+
+    def __init__(self, app: Any, path: str, upstream: str):
+        self.app = app
+        self.path = "/" + path.strip("/")
+        self.upstream = upstream.rstrip("/")
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        request_path = str(scope.get("path", "")).rstrip("/") or "/"
+        if scope.get("type") != "http" or request_path != self.path:
+            await self.app(scope, receive, send)
+            return
+
+        body_chunks: list[bytes] = []
+        while True:
+            message = await receive()
+            message_type = message.get("type")
+            if message_type == "http.disconnect":
+                return
+            if message_type != "http.request":
+                continue
+            body_chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        query = scope.get("query_string", b"").decode("latin-1")
+        upstream_url = self.upstream
+        if query:
+            upstream_url += ("&" if "?" in upstream_url else "?") + query
+
+        request_headers = [
+            (key.decode("latin-1"), value.decode("latin-1"))
+            for key, value in scope.get("headers", [])
+            if key.decode("latin-1").lower() not in self._HOP_BY_HOP_HEADERS | {"host", "content-length"}
+        ]
+
+        response_started = False
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=None, follow_redirects=False, trust_env=False) as client:
+                async with client.stream(
+                    str(scope.get("method", "GET")),
+                    upstream_url,
+                    headers=request_headers,
+                    content=b"".join(body_chunks),
+                ) as response:
+                    response_headers = [
+                        (key, value)
+                        for key, value in response.headers.raw
+                        if key.decode("latin-1").lower() not in self._HOP_BY_HOP_HEADERS | {"date", "server"}
+                    ]
+                    await send({
+                        "type": "http.response.start",
+                        "status": response.status_code,
+                        "headers": response_headers,
+                    })
+                    response_started = True
+                    async for chunk in response.aiter_raw():
+                        await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except Exception as exc:
+            if response_started:
+                with contextlib.suppress(Exception):
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                return
+            body = json.dumps({
+                "error": "privacy terminal unavailable",
+                "type": type(exc).__name__,
+            }).encode("utf-8")
+            await send({
+                "type": "http.response.start",
+                "status": 502,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
 
 
 def _hidden_tool() -> Any:
@@ -1216,6 +1313,123 @@ def _mcp_exclusive_resource(config: dict[str, Any]) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _forwardable_mcp_request_meta(
+    *,
+    fallback_session_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Copy per-call MCP metadata, optionally adding Node REPL turn identity.
+
+    Progress tokens belong to the current client/server hop. Forwarding one
+    without also bridging downstream progress notifications would be misleading.
+    Hosts that do not provide Codex turn metadata still need a scoped identity
+    for the Chrome bridge, so the Node REPL path can request a synthetic fallback.
+    """
+    request_meta: Any = None
+    try:
+        request_meta = mcp.get_context().request_context.meta
+    except (LookupError, ValueError):
+        pass
+
+    forwarded = (
+        request_meta.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if request_meta is not None
+        else {}
+    )
+    forwarded.pop("progressToken", None)
+    if fallback_session_id and "x-codex-turn-metadata" not in forwarded:
+        forwarded["x-codex-turn-metadata"] = {
+            "session_id": fallback_session_id,
+            "turn_id": f"terminal-mcp-{uuid.uuid4().hex}",
+            "thread_id": fallback_session_id,
+            "thread_source": "terminal_mcp",
+        }
+    return forwarded or None
+
+
+def _normalize_approved_browser_origins(origins: list[str] | None) -> set[str]:
+    approved: set[str] = set()
+    for raw_origin in origins or []:
+        value = raw_origin.strip()
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        if (
+            scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"invalid approved browser origin: {raw_origin}")
+        approved.add(urlunsplit((scheme, parsed.netloc.lower(), "", "", "")))
+    return approved
+
+
+def _browser_origin_elicitation_is_approved(params: Any, approved_origins: set[str]) -> bool:
+    if not approved_origins or not hasattr(params, "model_dump"):
+        return False
+    payload = params.model_dump(mode="json", by_alias=True, exclude_none=True)
+    meta = payload.get("_meta")
+    if not isinstance(meta, dict):
+        return False
+    origin = meta.get("origin")
+    if not isinstance(origin, str):
+        return False
+    try:
+        normalized_origin = next(iter(_normalize_approved_browser_origins([origin])))
+    except (StopIteration, ValueError):
+        return False
+    return (
+        payload.get("mode") == "form"
+        and meta.get("codex_approval_kind") == "mcp_tool_call"
+        and meta.get("connector_id") == "browser-use"
+        and meta.get("tool_name") == "access_browser_origin"
+        and normalized_origin in approved_origins
+    )
+
+
+def _mcp_elicitation_relay(
+    approved_browser_origins: set[str] | None = None,
+) -> Callable[[Any], Awaitable[Any]] | None:
+    """Relay downstream prompts, with exact per-call browser-origin consent."""
+    approved_origins = approved_browser_origins or set()
+    outer_session: Any = None
+    outer_supports_elicitation = False
+    try:
+        context = mcp.get_context()
+        outer_session = context.request_context.session
+        client_params = getattr(outer_session, "client_params", None)
+        capabilities = getattr(client_params, "capabilities", None)
+        outer_supports_elicitation = getattr(capabilities, "elicitation", None) is not None
+    except (LookupError, ValueError):
+        pass
+
+    if not approved_origins and not outer_supports_elicitation:
+        return None
+
+    async def relay(params: Any) -> Any:
+        if _browser_origin_elicitation_is_approved(params, approved_origins):
+            return mcp_types.ElicitResult(action="accept", content={})
+        if not outer_supports_elicitation or outer_session is None:
+            return mcp_types.ErrorData(
+                code=mcp_types.INVALID_REQUEST,
+                message="The outer MCP client does not support this elicitation request.",
+            )
+        try:
+            return await outer_session.send_request(
+                mcp_types.ServerRequest(mcp_types.ElicitRequest(params=params)),
+                mcp_types.ElicitResult,
+            )
+        except Exception as exc:
+            return mcp_types.ErrorData(
+                code=mcp_types.INTERNAL_ERROR,
+                message=f"Failed to relay downstream elicitation: {type(exc).__name__}",
+            )
+
+    return relay
+
+
 async def _mcp_connection_actor(
     connection: PersistentMcpConnection,
     config: dict[str, Any],
@@ -1228,6 +1442,17 @@ async def _mcp_connection_actor(
     runtime = _runtime_mcp_config(config)
     stack = contextlib.AsyncExitStack()
     client: Any = None
+    current_request: McpActorRequest | None = None
+
+    async def relay_elicitation(_context: Any, params: Any) -> Any:
+        callback = current_request.elicitation_callback if current_request is not None else None
+        if callback is None:
+            return mcp_types.ErrorData(
+                code=mcp_types.INVALID_REQUEST,
+                message="The outer MCP client does not support elicitation for this request.",
+            )
+        return await callback(params)
+
     try:
         if runtime.get("url"):
             if runtime["transport"] == "sse":
@@ -1255,7 +1480,13 @@ async def _mcp_connection_actor(
             )
             streams = await stack.enter_async_context(stdio_client(params))
 
-        client = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+        client = await stack.enter_async_context(
+            ClientSession(
+                streams[0],
+                streams[1],
+                elicitation_callback=relay_elicitation,
+            )
+        )
         await client.initialize()
         if not connection.ready.done():
             connection.ready.set_result(None)
@@ -1265,11 +1496,16 @@ async def _mcp_connection_actor(
             if request is None:
                 break
             connection.last_used = time.time()
+            current_request = request
             try:
                 result = await (
                     client.list_tools()
                     if request.operation == "tools"
-                    else client.call_tool(request.tool_name, request.arguments or {})
+                    else client.call_tool(
+                        request.tool_name,
+                        request.arguments or {},
+                        meta=request.meta,
+                    )
                 )
             except asyncio.CancelledError:
                 if not request.future.done():
@@ -1284,6 +1520,8 @@ async def _mcp_connection_actor(
                 if not request.future.done():
                     request.future.set_result(result)
                 connection.last_used = time.time()
+            finally:
+                current_request = None
     except asyncio.CancelledError:
         if not connection.ready.done():
             connection.ready.cancel()
@@ -1510,13 +1748,22 @@ async def _with_mcp_session(
     operation: str,
     tool_name: str = "",
     arguments: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
+    elicitation_callback: Callable[[Any], Awaitable[Any]] | None = None,
 ) -> Any:
     last_error: BaseException | None = None
     for attempt in range(2):
         connection = await _acquire_mcp_connection(session_id, server_name, config)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
-        request = McpActorRequest(operation, tool_name, arguments, future)
+        request = McpActorRequest(
+            operation,
+            tool_name,
+            arguments,
+            meta,
+            elicitation_callback,
+            future,
+        )
         try:
             task_done = connection.task is not None and connection.task.done()
             if connection.closed or task_done:
@@ -1558,6 +1805,7 @@ async def local_mcp(
     cwd: str | None = None,
     timeout: int = 60,
     max_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
+    approved_browser_origins: list[str] | None = None,
 ) -> Any:
     """List, inspect, call, or reset configured MCP servers through persistent downstream connections."""
     session = await _get_session(session_id)
@@ -1568,6 +1816,28 @@ async def local_mcp(
     root = _find_project_root(run_cwd)
     servers = _discover_mcp_servers(root)
     action = action.strip().lower().replace("_", "-")
+    forwarded_arguments = arguments
+    compatibility_origins: list[str] | None = None
+    if isinstance(arguments, dict) and "__terminal_mcp_approved_browser_origins" in arguments:
+        if action != "call" or server != NODE_REPL_MCP_SERVER:
+            return "Error: __terminal_mcp_approved_browser_origins is only supported for calls to the configured Node REPL server."
+        forwarded_arguments = dict(arguments)
+        raw_compatibility_origins = forwarded_arguments.pop("__terminal_mcp_approved_browser_origins")
+        if not isinstance(raw_compatibility_origins, list) or not all(
+            isinstance(origin, str) for origin in raw_compatibility_origins
+        ):
+            return "Error: __terminal_mcp_approved_browser_origins must be a list of origin strings."
+        compatibility_origins = raw_compatibility_origins
+    combined_approved_origins = [
+        *(approved_browser_origins or []),
+        *(compatibility_origins or []),
+    ]
+    try:
+        approved_origin_set = _normalize_approved_browser_origins(combined_approved_origins)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    if approved_origin_set and (action != "call" or server != NODE_REPL_MCP_SERVER):
+        return "Error: approved_browser_origins is only supported for calls to the configured Node REPL server."
     await _close_idle_mcp_connections()
 
     if action == "list":
@@ -1608,6 +1878,18 @@ async def local_mcp(
     if action == "call" and not tool:
         return "Error: tool is required for action=call."
 
+    request_meta = (
+        _forwardable_mcp_request_meta(
+            fallback_session_id=session.session_id if server == NODE_REPL_MCP_SERVER else None
+        )
+        if action == "call"
+        else None
+    )
+    elicitation_callback = (
+        _mcp_elicitation_relay(approved_origin_set)
+        if action == "call"
+        else None
+    )
     try:
         result = await asyncio.wait_for(
             _with_mcp_session(
@@ -1616,7 +1898,9 @@ async def local_mcp(
                 config,
                 action,
                 tool,
-                arguments,
+                forwarded_arguments,
+                request_meta,
+                elicitation_callback,
             ),
             timeout=max(1, timeout),
         )
@@ -1633,6 +1917,49 @@ async def local_mcp(
         return f"Error: cannot start {server}: {exc}. Use the owning session_id or reset that connection first."
     except Exception as exc:
         return f"Error: MCP {action} failed for {server}: {type(exc).__name__}"
+
+
+@mcp.tool()
+async def node_repl_js(
+    code: str,
+    timeout_ms: int | None = None,
+    title: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+    approved_browser_origins: list[str] | None = None,
+) -> Any:
+    """Run JavaScript through the configured Node REPL MCP. Browser-session APIs are available from this JavaScript when the Codex Chrome bridge is connected."""
+    arguments: dict[str, Any] = {"code": code}
+    if timeout_ms is not None:
+        arguments["timeout_ms"] = timeout_ms
+    if title:
+        arguments["title"] = title
+    return await local_mcp(
+        action="call",
+        server=NODE_REPL_MCP_SERVER,
+        tool="js",
+        arguments=arguments,
+        session_id=session_id,
+        cwd=cwd,
+        timeout=max(60, (timeout_ms or 0) // 1000 + 15),
+        approved_browser_origins=approved_browser_origins,
+    )
+
+
+@mcp.tool()
+async def node_repl_js_reset(
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> Any:
+    """Reset the configured Node REPL MCP kernel and clear its JavaScript bindings."""
+    return await local_mcp(
+        action="call",
+        server=NODE_REPL_MCP_SERVER,
+        tool="js_reset",
+        arguments={},
+        session_id=session_id,
+        cwd=cwd,
+    )
 
 
 @mcp.tool()
@@ -1657,7 +1984,12 @@ async def run_command(
             if gate:
                 return gate
             marker = f"__MCP_PWD_{uuid.uuid4().hex}__"
-            modified = f"{command}\n\nprintf '\\n{marker}:%s\\n' \"$PWD\""
+            modified = (
+                f"{command}\n"
+                "__mcp_status=$?\n"
+                f"printf '\\n{marker}:%s\\n' \"$PWD\"\n"
+                "exit \"$__mcp_status\""
+            )
             process, unit_name = await _spawn_workload(
                 [SHELL, "-lc", modified], shell=True, session=session, request_id=request_id,
                 cwd=run_cwd, env=env,
@@ -3096,6 +3428,7 @@ def _install_dynamic_initialization() -> None:
 PUBLIC_TOOL_ORDER = (
     "bootstrap_thread", "get_thread_context", "context_manifest", "refresh_startup_context",
     "thread_goal", "record_token_usage", "get_token_usage", "project_context", "local_skills", "local_mcp",
+    "node_repl_js", "node_repl_js_reset",
     "run_command", "start_process", "poll_process", "stop_process", "set_session_env",
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
@@ -3113,11 +3446,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8011, help="Port for SSE/HTTP server")
     parser.add_argument("--log-level", default=os.environ.get("MCP_UVICORN_LOG_LEVEL", "info"))
     args = parser.parse_args()
+    watchdog_config = ChatWatchdogConfig.from_env()
     if args.transport in ["sse", "streamable-http"]:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
-        install_usage_dashboard(app, GPT_STORE)
+        chat_watchdog = ChatWatchdog(watchdog_config)
+        install_usage_dashboard(app, GPT_STORE, chat_watchdog)
+        install_chat_watchdog_lifespan(app, chat_watchdog)
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
         if bearer_token:
             app.add_middleware(BearerAuthMiddleware, token=bearer_token)
@@ -3129,9 +3465,21 @@ def main() -> None:
         cors_origins = os.environ.get("MCP_CORS_ORIGINS", "*")
         allow_origins = [origin.strip() for origin in cors_origins.split(",") if origin.strip()]
         app.add_middleware(CORSMiddleware, allow_origins=allow_origins or ["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+        privacy_proxy_path = os.environ.get("MCP_PRIVACY_PROXY_PATH", "").strip()
+        privacy_proxy_upstream = os.environ.get("MCP_PRIVACY_PROXY_UPSTREAM", "").strip()
+        if bool(privacy_proxy_path) != bool(privacy_proxy_upstream):
+            raise RuntimeError("MCP_PRIVACY_PROXY_PATH and MCP_PRIVACY_PROXY_UPSTREAM must be set together")
+        if privacy_proxy_path:
+            app.add_middleware(
+                PrivacyCloneProxyMiddleware,
+                path=privacy_proxy_path,
+                upstream=privacy_proxy_upstream,
+            )
         print(f"Starting Terminal MCP Server in {args.transport.upper()} mode on {args.host}:{args.port}...", file=sys.stderr)
         uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     else:
+        if watchdog_config.enabled:
+            print("ChatGPT thread watchdog is disabled for stdio transport; use SSE or streamable-http.", file=sys.stderr)
         mcp.run(transport="stdio")
 
 if __name__ == "__main__":

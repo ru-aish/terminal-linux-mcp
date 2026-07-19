@@ -2,4 +2,5 @@ mcp>=1.27.1,<2
 uvicorn[standard]>=0.48,<1
 starlette>=1.2,<2
 httpx>=0.28,<1
+websockets>=13,<17
 tiktoken>=0.12,<1
