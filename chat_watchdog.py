@@ -1025,7 +1025,7 @@ class ChatWatchdogConfig:
     completed_path: Path
     adapter_mode: str = CODEX_INTERNAL_ADAPTER_NAME
     cdp_endpoint: str = DEFAULT_CODEX_CDP_ENDPOINT
-    scan_interval_seconds: int = 300
+    scan_interval_seconds: int = 600
     retry_cooldown_seconds: int = 300
     initial_delay_seconds: int = 15
     completion_marker: str = DEFAULT_COMPLETION_MARKER
@@ -1060,7 +1060,7 @@ class ChatWatchdogConfig:
             adapter_mode=adapter_mode,
             cdp_endpoint=os.environ.get("MCP_CHAT_WATCHDOG_CDP", DEFAULT_CODEX_CDP_ENDPOINT).strip()
             or DEFAULT_CODEX_CDP_ENDPOINT,
-            scan_interval_seconds=max(30, int(os.environ.get("MCP_CHAT_WATCHDOG_INTERVAL_SECONDS", "300"))),
+            scan_interval_seconds=max(30, int(os.environ.get("MCP_CHAT_WATCHDOG_INTERVAL_SECONDS", "600"))),
             retry_cooldown_seconds=max(30, int(os.environ.get("MCP_CHAT_WATCHDOG_RETRY_SECONDS", "300"))),
             initial_delay_seconds=max(0, int(os.environ.get("MCP_CHAT_WATCHDOG_INITIAL_DELAY_SECONDS", "15"))),
             completion_marker=os.environ.get("MCP_CHAT_WATCHDOG_COMPLETION_MARKER", DEFAULT_COMPLETION_MARKER).strip()
@@ -1458,6 +1458,18 @@ class ChatWatchdog:
             )
             entries, invalid = await asyncio.to_thread(self.queue.entries)
             self._reconcile_tasks(entries, source=f"scan:{trigger}")
+            orchestrated = self.ledger.active_task_conversation_ids()
+            skipped = [
+                link.conversation_id
+                for link in entries
+                if link.conversation_id in orchestrated
+            ]
+            entries = [
+                link
+                for link in entries
+                if link.conversation_id not in orchestrated
+            ]
+            self._runtime["skipped_orchestrated_conversation_ids"] = skipped
             if invalid:
                 self._runtime["last_error"] = f"queue contains {len(invalid)} invalid line(s)"
             if not entries:

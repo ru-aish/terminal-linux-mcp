@@ -13,6 +13,7 @@ import pytest
 from chat_internal_client import (
     InternalChatClient,
     RuntimeNotReadyError,
+    RuntimeProtocolError,
     normalize_conversation_payload,
     sanitize_runtime_error,
     select_main_renderer_target,
@@ -185,7 +186,7 @@ def test_internal_operations_are_sequential_per_endpoint(monkeypatch):
         active = 0
         maximum = 0
 
-        async def fake_evaluate_raw(self, _expression):
+        async def fake_evaluate_raw(self, _expression, *, timeout=None):
             nonlocal active, maximum
             active += 1
             maximum = max(maximum, active)
@@ -211,7 +212,7 @@ def test_evaluate_reconnects_once_after_transport_failure(monkeypatch):
         attempts = 0
         reconnects = 0
 
-        async def fake_evaluate_raw(_expression):
+        async def fake_evaluate_raw(_expression, *, timeout=None):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
@@ -254,7 +255,7 @@ def test_continue_result_verifies_persisted_user_and_preserves_timeout(monkeypat
             },
         }
 
-        async def fake_evaluate(_body):
+        async def fake_evaluate(_body, **_kwargs):
             return {
                 "sent": True,
                 "observed": False,
@@ -457,7 +458,7 @@ def test_create_thread_uses_project_mode_and_verifies_persistence(monkeypatch):
             },
         }
 
-        async def fake_evaluate(body):
+        async def fake_evaluate(body, **_kwargs):
             nonlocal captured
             captured = body
             return {
@@ -492,7 +493,7 @@ def test_new_thread_late_handle_cannot_restore_completed_stream_marker():
     assert "streamFinished = true; observe(value)" in source
     assert "conversationId && !streamFinished" in source
     assert "streams.delete(conversationId); handles.delete(conversationId)" in source
-    assert "ownedStream = streams.has(conversationId) && !streamFinished" in source
+    assert "ownedStream = ownedStreamActive(conversationId) && !streamFinished" in source
 
 
 def test_create_thread_reports_terminal_readback_without_owned_stream(monkeypatch):
@@ -519,7 +520,7 @@ def test_create_thread_reports_terminal_readback_without_owned_stream(monkeypatc
             },
         }
 
-        async def fake_evaluate(_body):
+        async def fake_evaluate(_body, **_kwargs):
             return {
                 "sent": True,
                 "observed": True,
@@ -543,7 +544,7 @@ def test_orchestration_dispatch_mode_is_encoded_without_terminal_wait():
     source = inspect.getsource(InternalChatClient.continue_thread)
     assert "wait_for_completion: bool = True" in source
     assert "waitForCompletion ?" in source
-    assert "after.currentNode !== expectedNode" in source
+    assert source.count("await client.get(conversationId)") == 2
     assert "completion stream did not start before the dispatch timeout" in source
 
 
@@ -646,7 +647,7 @@ def test_continue_result_does_not_confirm_from_unverified_cyclic_state(monkeypat
             },
         }
 
-        async def fake_evaluate(_body):
+        async def fake_evaluate(_body, **_kwargs):
             return {
                 "sent": True,
                 "observed": True,
@@ -668,3 +669,116 @@ def test_continue_result_does_not_confirm_from_unverified_cyclic_state(monkeypat
         assert "not found" in result["reason"]
 
     asyncio.run(run())
+
+
+def test_mutating_evaluation_is_never_replayed_after_transport_failure(monkeypatch):
+    async def run():
+        client = InternalChatClient("http://127.0.0.1:9993")
+        attempts = 0
+        reconnects = 0
+
+        async def fake_evaluate_raw(_expression, *, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            raise asyncio.TimeoutError("mutation timed out")
+
+        async def fake_reconnect():
+            nonlocal reconnects
+            reconnects += 1
+
+        monkeypatch.setattr(client, "_evaluate_raw", fake_evaluate_raw)
+        monkeypatch.setattr(client, "reconnect", fake_reconnect)
+
+        with pytest.raises(asyncio.TimeoutError, match="mutation timed out"):
+            await client._evaluate(
+                "return {ok:true};",
+                retry_on_transport=False,
+                timeout=15,
+            )
+
+        assert attempts == 1
+        assert reconnects == 0
+
+    asyncio.run(run())
+
+
+def test_javascript_exception_details_are_preserved_and_sanitized(monkeypatch):
+    async def run():
+        client = InternalChatClient("http://127.0.0.1:9992")
+
+        async def fake_call(_method, _params=None, *, timeout=None):
+            return {
+                "result": {"type": "object", "subtype": "error"},
+                "exceptionDetails": {
+                    "text": "Uncaught ReferenceError: token=secret-value is not defined",
+                    "lineNumber": 4,
+                    "columnNumber": 8,
+                },
+            }
+
+        monkeypatch.setattr(client, "_call", fake_call)
+
+        with pytest.raises(RuntimeProtocolError) as error:
+            await client._evaluate_raw("throw new Error('broken')")
+
+        rendered = str(error.value)
+        assert "ReferenceError" in rendered
+        assert "line 5, column 9" in rendered
+        assert "secret-value" not in rendered
+        assert "token=[redacted]" in rendered
+
+    asyncio.run(run())
+
+
+def test_continuation_timeout_preserves_supplied_delivery_identity(monkeypatch):
+    async def run():
+        client = InternalChatClient("http://127.0.0.1:9991")
+        calls = []
+
+        async def fake_evaluate(body, **kwargs):
+            calls.append((body, kwargs))
+            raise asyncio.TimeoutError("dispatch timed out")
+
+        monkeypatch.setattr(client, "_evaluate", fake_evaluate)
+
+        result = await client.continue_thread(
+            "conversation",
+            "continue",
+            expected_current_node="assistant-node",
+            wait_for_completion=False,
+            user_message_id="stable-user-message",
+        )
+
+        assert len(calls) == 1
+        body, kwargs = calls[0]
+        assert "stable-user-message" in body
+        assert kwargs["retry_on_transport"] is False
+        assert kwargs["timeout"] >= 15
+        assert result["sent"] is True
+        assert result["observed"] is False
+        assert result["submission_uncertain"] is True
+        assert result["user_message_id"] == "stable-user-message"
+        assert result["parent_message_id"] == "assistant-node"
+
+    asyncio.run(run())
+
+
+def test_mutation_confirmation_uses_bounded_single_readback():
+    create_source = inspect.getsource(InternalChatClient.create_thread)
+    continue_source = inspect.getsource(InternalChatClient.continue_thread)
+
+    assert create_source.count("await client.get(conversationId)") == 1
+    assert continue_source.count("await client.get(conversationId)") == 2
+    assert "attempt < 20" not in create_source
+    assert "attempts = waitForCompletion" not in continue_source
+
+
+def test_owned_stream_marker_is_age_bounded_but_cancel_handle_is_retained():
+    module_source = Path(InternalChatClient.__module__.replace(".", "/") + ".py")
+    if not module_source.exists():
+        module_source = Path(__file__).resolve().parents[1] / "chat_internal_client.py"
+    source = module_source.read_text()
+
+    assert "Date.now() - startedAt <= 120000" in source
+    assert "owned_stream:ownedStreamActive" in source
+    assert "if (!streams.has(id)) return {cancelled:false" in source

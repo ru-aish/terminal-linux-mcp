@@ -66,7 +66,11 @@ class FakeRuntime:
         self.snapshots: dict[str, dict] = {"parent-chat": terminal_snapshot("parent-chat")}
         self.context_events: dict[str, list[dict]] = {}
         self.create_calls: list[tuple[str, str | None, str | None]] = []
+        self.get_calls: list[str] = []
+        self.context_calls: list[str] = []
+        self.enter_calls = 0
         self.continue_calls: list[tuple[str, str, str]] = []
+        self.continue_message_ids: list[str | None] = []
         self.cancel_calls: list[str] = []
         self.cancel_result = {"cancelled": True, "reason": ""}
         self.get_errors: set[str] = set()
@@ -78,6 +82,7 @@ class FakeRuntime:
         self.before_cancel = None
 
     async def __aenter__(self):
+        self.enter_calls += 1
         return self
 
     async def __aexit__(self, *_args):
@@ -117,6 +122,7 @@ class FakeRuntime:
         }
 
     async def get_thread(self, conversation_id):
+        self.get_calls.append(conversation_id)
         if conversation_id in self.get_errors:
             raise RuntimeError(f"read failed for {conversation_id}")
         return self.snapshots[conversation_id]
@@ -128,24 +134,32 @@ class FakeRuntime:
         *,
         expected_current_node,
         wait_for_completion=True,
+        user_message_id=None,
     ):
         assert wait_for_completion is False
         if self.before_continue is not None:
             self.before_continue(conversation_id)
         self.continue_calls.append((conversation_id, message, expected_current_node))
+        self.continue_message_ids.append(user_message_id)
         if conversation_id in self.continue_errors:
             raise RuntimeError(f"send failed for {conversation_id}")
-        result = self.continue_results.get(
-            conversation_id,
-            {"sent": True, "observed": True, "running": True, "reason": ""},
+        result = dict(
+            self.continue_results.get(
+                conversation_id,
+                {"sent": True, "observed": True, "running": True, "reason": ""},
+            )
         )
+        if user_message_id:
+            result.setdefault("user_message_id", user_message_id)
+        result.setdefault("parent_message_id", expected_current_node)
         if result.get("sent"):
             self.snapshots[conversation_id] = terminal_snapshot(
                 conversation_id, running=True
             )
-        return dict(result)
+        return result
 
     async def thread_context(self, conversation_id, *, since_cursor=None, max_events=60, max_chars=12000):
+        self.context_calls.append(conversation_id)
         events = self.context_events.get(conversation_id, [])
         if since_cursor:
             index = next((i for i, event in enumerate(events) if event["cursor"] == since_cursor), None)
@@ -283,7 +297,7 @@ def test_active_child_queues_followup_then_terminal_child_receives_it(tmp_path):
     asyncio.run(run())
 
 
-def test_sync_inspects_all_agents_but_performs_only_one_write(tmp_path):
+def test_commands_are_delivered_before_unrelated_agent_monitoring(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service = coordinator(tmp_path, runtime)
@@ -298,12 +312,18 @@ def test_sync_inspects_all_agents_but_performs_only_one_write(tmp_path):
         runtime.snapshots["child-chat-2"] = terminal_snapshot("child-chat-2")
         await service.send(parent["agent_id"], child_a["agent"]["agent_id"], "A")
         await service.send(parent["agent_id"], child_b["agent"]["agent_id"], "B")
-        result = await service.sync_once()
-        assert len(result["inspected"]) == 3
-        assert result["write_count"] == 1
+        runtime.get_calls.clear()
+
+        first = await service.sync_once()
+        assert first["inspected"] == []
+        assert first["write_count"] == 1
+        assert runtime.get_calls == ["child-chat-1"]
         assert len(runtime.continue_calls) == 1
+
         second = await service.sync_once()
+        assert second["inspected"] == []
         assert second["write_count"] == 1
+        assert runtime.get_calls == ["child-chat-1", "child-chat-2"]
         assert len(runtime.continue_calls) == 2
 
     asyncio.run(run())
@@ -420,7 +440,7 @@ def test_default_completion_contract_and_automatic_continuation(tmp_path):
     asyncio.run(run())
 
 
-def test_command_read_failure_does_not_starve_later_mailbox(tmp_path):
+def test_command_read_failure_yields_after_one_request_then_advances(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service = coordinator(tmp_path, runtime)
@@ -432,9 +452,16 @@ def test_command_read_failure_does_not_starve_later_mailbox(tmp_path):
         await service.send(parent["agent_id"], first["agent"]["agent_id"], "first")
         await service.send(parent["agent_id"], second["agent"]["agent_id"], "second")
         runtime.get_errors.add("child-chat-1")
+        runtime.get_calls.clear()
 
-        result = await service.sync_once()
-        assert result["write_count"] == 1
+        first_sync = await service.sync_once()
+        assert first_sync["write_count"] == 0
+        assert runtime.get_calls == ["child-chat-1"]
+        assert runtime.continue_calls == []
+
+        second_sync = await service.sync_once()
+        assert second_sync["write_count"] == 1
+        assert runtime.get_calls == ["child-chat-1", "child-chat-2"]
         assert runtime.continue_calls == [
             ("child-chat-2", "second", "a-child-chat-2")
         ]
@@ -1104,6 +1131,11 @@ def test_uncertain_parent_notification_reconciles_from_side_branch(tmp_path):
         parent_snapshot = terminal_snapshot("parent-chat")
         parent_snapshot["all_message_ids"] = ["generated-parent-message"]
         runtime.snapshots["parent-chat"] = parent_snapshot
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET next_attempt_at=0 WHERE command_id=?",
+                (command["command_id"],),
+            )
         second = await service.sync_once()
         assert second["write_count"] == 1
 
@@ -1152,8 +1184,19 @@ def test_restart_preserves_send_evidence_and_reconciles_without_resend(tmp_path)
         assert recovered["request_id"] == "request-1"
         assert recovered["user_message_id"] == "persisted-user-message"
 
+        runtime.get_calls.clear()
+        cooling_down = await restarted.sync_once()
+        assert cooling_down["write_count"] == 0
+        assert runtime.get_calls == []
+        with restarted.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET next_attempt_at=0 WHERE command_id=?",
+                (command["command_id"],),
+            )
+
         result = await restarted.sync_once()
         assert result["write_count"] == 1
+        assert runtime.get_calls == ["child-chat-1"]
         with restarted.repository.connect() as db:
             final_status = db.execute(
                 "SELECT status FROM commands WHERE command_id=?",
@@ -1640,6 +1683,50 @@ def test_delivery_uncertainty_keeps_background_reconciliation_awake(tmp_path):
     asyncio.run(run())
 
 
+def test_legacy_uncertain_without_evidence_is_cancelled_without_remote_read(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        legacy = await service.send(parent["agent_id"], child_id, "legacy")
+        current = await service.send(parent["agent_id"], child_id, "current")
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='delivery_uncertain',user_message_id=NULL,"
+                "parent_message_id=NULL,request_id=NULL,next_attempt_at=0 "
+                "WHERE command_id=?",
+                (legacy["command_id"],),
+            )
+        runtime.get_calls.clear()
+
+        first = await service.sync_once()
+
+        assert first["write_count"] == 0
+        assert runtime.get_calls == []
+        with service.repository.connect() as db:
+            legacy_row = dict(
+                db.execute(
+                    "SELECT status,last_error FROM commands WHERE command_id=?",
+                    (legacy["command_id"],),
+                ).fetchone()
+            )
+        assert legacy_row["status"] == "cancelled"
+        assert "lacks durable reconciliation evidence" in legacy_row["last_error"]
+
+        second = await service.sync_once()
+        assert second["write_count"] == 1
+        assert runtime.continue_calls[-1][1] == "current"
+        with service.repository.connect() as db:
+            current_status = db.execute(
+                "SELECT status FROM commands WHERE command_id=?",
+                (current["command_id"],),
+            ).fetchone()[0]
+        assert current_status == "delivered"
+
+    asyncio.run(run())
+
+
 def test_terminal_parent_cancels_question_and_fails_waiting_child(tmp_path):
     async def run():
         runtime = FakeRuntime()
@@ -1676,5 +1763,308 @@ def test_terminal_parent_cancels_question_and_fails_waiting_child(tmp_path):
             and "terminal parent" in event["payload"]["reason"]
             for event in events
         )
+
+    asyncio.run(run())
+
+
+def test_scheduled_sync_does_not_open_runtime_before_due(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        coordinator_instance, _parent, _child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+        )
+        runtime.enter_calls = 0
+        service = ChatAgentService(coordinator_instance, interval_seconds=600)
+
+        result = await service.sync_now(force=False)
+
+        assert result == {"status": "idle", "write_count": 0, "inspected": []}
+        assert runtime.enter_calls == 0
+
+    asyncio.run(run())
+
+
+def test_scheduled_sync_reads_only_due_child_once_when_unchanged(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        coordinator_instance, parent, child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+        )
+        child_id = child["agent"]["agent_id"]
+        await coordinator_instance.sync_once()
+        runtime.get_calls.clear()
+        runtime.context_calls.clear()
+        with coordinator_instance.repository.transaction() as db:
+            db.execute(
+                "UPDATE tasks SET next_check_at=0 WHERE agent_id=?",
+                (child_id,),
+            )
+
+        result = await ChatAgentService(coordinator_instance).sync_now(force=False)
+
+        assert result["inspected"] == [{"agent_id": child_id, "status": "running"}]
+        assert runtime.get_calls == ["child-chat-1"]
+        assert runtime.context_calls == []
+        assert "parent-chat" not in runtime.get_calls
+        assert parent["agent_id"] != child_id
+
+    asyncio.run(run())
+
+
+def test_scheduled_sync_fetches_context_only_after_structural_change(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        coordinator_instance, _parent, child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+        )
+        child_id = child["agent"]["agent_id"]
+        await coordinator_instance.sync_once()
+        changed = terminal_snapshot("child-chat-1", running=True)
+        changed["current_node"] = "a-child-chat-1-progress"
+        changed["turns"][-1]["key"] = "a-child-chat-1-progress"
+        runtime.snapshots["child-chat-1"] = changed
+        runtime.get_calls.clear()
+        runtime.context_calls.clear()
+        with coordinator_instance.repository.transaction() as db:
+            db.execute(
+                "UPDATE tasks SET next_check_at=0 WHERE agent_id=?",
+                (child_id,),
+            )
+
+        await ChatAgentService(coordinator_instance).sync_now(force=False)
+
+        assert runtime.get_calls == ["child-chat-1"]
+        assert runtime.context_calls == ["child-chat-1"]
+
+    asyncio.run(run())
+
+
+def test_busy_command_is_deferred_without_reopening_runtime(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        coordinator_instance, parent, child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+        )
+        child_id = child["agent"]["agent_id"]
+        await coordinator_instance.sync_once()
+        await coordinator_instance.send(
+            parent["agent_id"],
+            child_id,
+            "queued while running",
+        )
+        service = ChatAgentService(coordinator_instance)
+
+        first = await service.sync_now(force=False)
+        assert first["write_count"] == 0
+        runtime.enter_calls = 0
+        runtime.get_calls.clear()
+
+        second = await service.sync_now(force=False)
+
+        assert second == {"status": "idle", "write_count": 0, "inspected": []}
+        assert runtime.enter_calls == 0
+        assert runtime.get_calls == []
+        with coordinator_instance.repository.connect() as db:
+            next_attempt_at = db.execute(
+                "SELECT next_attempt_at FROM commands WHERE to_agent_id=?",
+                (child_id,),
+            ).fetchone()[0]
+        assert float(next_attempt_at) > 0
+
+    asyncio.run(run())
+
+
+def test_waiting_for_parent_task_is_not_scheduled_after_question_delivery(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        coordinator_instance, parent, child = await make_parent_and_child(
+            tmp_path,
+            runtime,
+        )
+        child_id = child["agent"]["agent_id"]
+        await coordinator_instance.send(
+            child_id,
+            parent["agent_id"],
+            "Need one answer",
+            purpose="question",
+        )
+        await coordinator_instance.sync_once()
+        runtime.enter_calls = 0
+        runtime.get_calls.clear()
+
+        result = await ChatAgentService(coordinator_instance).sync_now(force=False)
+
+        assert result == {"status": "idle", "write_count": 0, "inspected": []}
+        assert runtime.enter_calls == 0
+        assert runtime.get_calls == []
+        assert (await coordinator_instance.status(child_id))["task"]["status"] == "waiting_for_parent"
+
+    asyncio.run(run())
+
+
+def test_delivery_identity_is_persisted_before_dispatch_and_survives_failure(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        command = await service.send(parent["agent_id"], child_id, "follow-up")
+        observed = {}
+
+        def before_continue(_conversation_id):
+            with service.repository.connect() as db:
+                observed.update(
+                    dict(
+                        db.execute(
+                            "SELECT status,user_message_id,parent_message_id "
+                            "FROM commands WHERE command_id=?",
+                            (command["command_id"],),
+                        ).fetchone()
+                    )
+                )
+
+        runtime.before_continue = before_continue
+        runtime.continue_errors.add("child-chat-1")
+
+        result = await service.sync_once()
+
+        assert result["write_count"] == 1
+        assert observed["status"] == "delivery_in_flight"
+        assert observed["user_message_id"]
+        assert observed["parent_message_id"] == "a-child-chat-1"
+        with service.repository.connect() as db:
+            stored = dict(
+                db.execute(
+                    "SELECT status,user_message_id,parent_message_id,next_attempt_at "
+                    "FROM commands WHERE command_id=?",
+                    (command["command_id"],),
+                ).fetchone()
+            )
+        assert stored["status"] == "delivery_uncertain"
+        assert stored["user_message_id"] == observed["user_message_id"]
+        assert stored["parent_message_id"] == observed["parent_message_id"]
+        assert float(stored["next_attempt_at"]) > 0
+        assert runtime.continue_message_ids == [stored["user_message_id"]]
+
+    asyncio.run(run())
+
+
+def test_verified_absence_requeues_and_reuses_the_same_delivery_identity(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
+        command = await service.send(parent["agent_id"], child_id, "follow-up")
+        runtime.continue_errors.add("child-chat-1")
+
+        assert (await service.sync_once())["write_count"] == 1
+        with service.repository.connect() as db:
+            uncertain = dict(
+                db.execute(
+                    "SELECT status,user_message_id FROM commands WHERE command_id=?",
+                    (command["command_id"],),
+                ).fetchone()
+            )
+        stable_id = uncertain["user_message_id"]
+        assert uncertain["status"] == "delivery_uncertain"
+        assert stable_id
+
+        runtime.continue_errors.clear()
+        runtime.get_calls.clear()
+
+        cooling_down = await service.sync_once()
+        assert cooling_down["write_count"] == 0
+        assert runtime.get_calls == []
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET next_attempt_at=0 WHERE command_id=?",
+                (command["command_id"],),
+            )
+
+        reconciled = await service.sync_once()
+        assert reconciled["write_count"] == 0
+        assert runtime.get_calls == ["child-chat-1"]
+        with service.repository.connect() as db:
+            requeued = dict(
+                db.execute(
+                    "SELECT status,user_message_id,next_attempt_at,last_error "
+                    "FROM commands WHERE command_id=?",
+                    (command["command_id"],),
+                ).fetchone()
+            )
+        assert requeued["status"] == "queued"
+        assert requeued["user_message_id"] == stable_id
+        assert float(requeued["next_attempt_at"]) == 0
+        assert "not found" in requeued["last_error"]
+
+        delivered = await service.sync_once()
+        assert delivered["write_count"] == 1
+        assert runtime.continue_message_ids == [stable_id, stable_id]
+        with service.repository.connect() as db:
+            final = dict(
+                db.execute(
+                    "SELECT status,user_message_id FROM commands WHERE command_id=?",
+                    (command["command_id"],),
+                ).fetchone()
+            )
+        assert final == {"status": "delivered", "user_message_id": stable_id}
+
+    asyncio.run(run())
+
+
+def test_scheduled_sync_spreads_multiple_due_children_across_cycles(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service = coordinator(tmp_path, runtime)
+        parent = await service.register_parent("parent-chat")
+        first = await service.spawn(parent["agent_id"], "one")
+        second = await service.spawn(parent["agent_id"], "two")
+        first_id = first["agent"]["agent_id"]
+        second_id = second["agent"]["agent_id"]
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE tasks SET next_check_at=0 WHERE agent_id IN (?,?)",
+                (first_id, second_id),
+            )
+        runtime.get_calls.clear()
+        runtime.context_calls.clear()
+
+        result = await ChatAgentService(service).sync_now(force=False)
+
+        assert len(result["inspected"]) == 1
+        assert result["inspected"][0]["agent_id"] == first_id
+        assert runtime.get_calls == ["child-chat-1"]
+        assert runtime.context_calls == ["child-chat-1"]
+        assert second_id != first_id
+
+    asyncio.run(run())
+
+
+
+def test_manual_sync_also_limits_monitoring_to_one_conversation(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service = coordinator(tmp_path, runtime)
+        parent = await service.register_parent("parent-chat")
+        first = await service.spawn(parent["agent_id"], "one")
+        second = await service.spawn(parent["agent_id"], "two")
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE tasks SET next_check_at=0 WHERE agent_id IN (?,?)",
+                (first["agent"]["agent_id"], second["agent"]["agent_id"]),
+            )
+        runtime.get_calls.clear()
+        runtime.context_calls.clear()
+
+        result = await service.sync_once()
+
+        assert len(result["inspected"]) == 1
+        assert runtime.get_calls == ["child-chat-1"]
+        assert runtime.context_calls == ["child-chat-1"]
 
     asyncio.run(run())
