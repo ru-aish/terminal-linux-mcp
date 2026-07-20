@@ -159,8 +159,16 @@ def test_ledger_owns_schema_and_evidence_columns(tmp_path):
     ledger = DurableLedger(tmp_path / "ledger.sqlite")
     with ledger.connect() as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(commands)")}
-        assert {"request_id", "user_message_id", "parent_message_id", "purpose"} <= columns
-        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "7"
+        task_columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+        assert {
+            "request_id",
+            "user_message_id",
+            "parent_message_id",
+            "purpose",
+            "next_attempt_at",
+        } <= columns
+        assert "next_check_at" in task_columns
+        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "8"
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
@@ -187,6 +195,7 @@ class _GatewayClient:
         *,
         expected_current_node,
         wait_for_completion,
+        user_message_id=None,
     ):
         self.continue_calls.append(
             (conversation_id, message, expected_current_node, wait_for_completion)

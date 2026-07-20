@@ -1619,3 +1619,38 @@ def test_watchdog_and_agent_orchestration_share_one_sqlite_ledger(tmp_path):
             )
         }
     assert {"watchdog_tasks", "agents", "tasks", "commands"} <= tables
+
+
+def test_watchdog_skips_conversation_owned_by_active_orchestration_task(tmp_path):
+    async def run():
+        item = link()
+        fake = FakeAdapter(ThreadSnapshot(True, item.conversation_id))
+        watchdog = make_watchdog(tmp_path, fake)
+        with watchdog.ledger.transaction() as db:
+            db.execute(
+                "INSERT INTO orchestrations(orchestration_id,root_agent_id,notification_policy,created_at) "
+                "VALUES('orch-one',NULL,'notify_only',1)"
+            )
+            db.execute(
+                "INSERT INTO agents(agent_id,orchestration_id,parent_agent_id,root_agent_id,chat_id,title,status,notification_policy,created_at,updated_at) "
+                "VALUES('agent-one','orch-one',NULL,'agent-one',?,'owned','running','notify_only',1,1)",
+                (item.conversation_id,),
+            )
+            db.execute(
+                "UPDATE orchestrations SET root_agent_id='agent-one' WHERE orchestration_id='orch-one'"
+            )
+            db.execute(
+                "INSERT INTO tasks(task_id,agent_id,prompt,completion_marker,status,next_check_at,created_at) "
+                "VALUES('task-one','agent-one','task','DONE','running',0,1)"
+            )
+
+        snapshot = await watchdog.scan_once()
+
+        assert fake.refreshes == 0
+        assert fake.inspections == 0
+        assert fake.sent == []
+        assert snapshot["runtime"]["skipped_orchestrated_conversation_ids"] == [
+            item.conversation_id
+        ]
+
+    asyncio.run(run())

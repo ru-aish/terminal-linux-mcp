@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import json
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -43,6 +44,39 @@ class RuntimeNotReadyError(InternalRuntimeError):
 
 class RuntimeProtocolError(InternalRuntimeError):
     pass
+
+
+_TRANSPORT_EXCEPTIONS = (
+    ConnectionError,
+    OSError,
+    asyncio.TimeoutError,
+    websockets.ConnectionClosed,
+)
+_MUTATION_EXCEPTIONS = (InternalRuntimeError,) + _TRANSPORT_EXCEPTIONS
+
+
+def _javascript_exception_description(
+    result: dict[str, Any], remote: dict[str, Any]
+) -> str:
+    details = result.get("exceptionDetails")
+    candidates: list[str] = []
+    if isinstance(remote.get("description"), str):
+        candidates.append(remote["description"])
+    if isinstance(details, dict):
+        exception = details.get("exception")
+        if isinstance(exception, dict) and isinstance(exception.get("description"), str):
+            candidates.append(exception["description"])
+        if isinstance(details.get("text"), str):
+            candidates.append(details["text"])
+        line = details.get("lineNumber")
+        column = details.get("columnNumber")
+        if isinstance(line, int):
+            location = f"line {line + 1}"
+            if isinstance(column, int):
+                location += f", column {column + 1}"
+            candidates.append(location)
+    description = ": ".join(value.strip() for value in candidates if value.strip())
+    return sanitize_runtime_error(description or "JavaScript evaluation failed")
 
 
 @dataclass(frozen=True)
@@ -637,6 +671,12 @@ window[streamsKey] ||= new Map();
 window[handlesKey] ||= new Map();
 const streams = window[streamsKey];
 const handles = window[handlesKey];
+const ownedStreamActive = (conversationId) => {
+  const state = streams.get(conversationId);
+  if (!state) return false;
+  const startedAt = Number(state.started_at || 0);
+  return !startedAt || Date.now() - startedAt <= 120000;
+};
 const objectLike = (value) => !!value && (typeof value === 'object' || typeof value === 'function');
 const methodNames = (value) => {
   if (!objectLike(value)) return new Set();
@@ -923,14 +963,25 @@ class InternalChatClient:
         await self.close()
         await self.connect()
 
-    async def _call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _call(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         if self._socket is None:
             raise RuntimeUnavailableError("Codex renderer is not connected")
         self._sequence += 1
         identifier = self._sequence
-        await self._socket.send(json.dumps({"id": identifier, "method": method, "params": params or {}}))
+        await self._socket.send(
+            json.dumps({"id": identifier, "method": method, "params": params or {}})
+        )
+        response_timeout = self.timeout if timeout is None else max(1.0, float(timeout))
         while True:
-            raw = await asyncio.wait_for(self._socket.recv(), timeout=self.timeout)
+            raw = await asyncio.wait_for(
+                self._socket.recv(), timeout=response_timeout
+            )
             message = json.loads(raw)
             if message.get("id") != identifier:
                 continue
@@ -938,22 +989,42 @@ class InternalChatClient:
                 raise RuntimeProtocolError(f"CDP {method} failed")
             return message.get("result", {})
 
-    async def _evaluate_raw(self, expression: str) -> Any:
-        result = await self._call("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True, "userGesture": False})
+    async def _evaluate_raw(
+        self, expression: str, *, timeout: float | None = None
+    ) -> Any:
+        result = await self._call(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": False,
+            },
+            timeout=timeout,
+        )
         remote = result.get("result", {})
         if remote.get("subtype") == "error" or result.get("exceptionDetails"):
-            description = remote.get("description") or "JavaScript evaluation failed"
-            raise RuntimeProtocolError(sanitize_runtime_error(description))
+            raise RuntimeProtocolError(
+                _javascript_exception_description(result, remote)
+            )
         return remote.get("value")
 
-    async def _evaluate(self, body: str) -> Any:
+    async def _evaluate(
+        self,
+        body: str,
+        *,
+        retry_on_transport: bool = True,
+        timeout: float | None = None,
+    ) -> Any:
         expression = f"(async () => {{ {_BRIDGE_JS} {body} }})()"
         async with self._lock_for(self.endpoint):
             try:
-                return await self._evaluate_raw(expression)
-            except (ConnectionError, OSError, asyncio.TimeoutError, websockets.ConnectionClosed):
+                return await self._evaluate_raw(expression, timeout=timeout)
+            except _TRANSPORT_EXCEPTIONS:
+                if not retry_on_transport:
+                    raise
                 await self.reconnect()
-                return await self._evaluate_raw(expression)
+                return await self._evaluate_raw(expression, timeout=timeout)
 
     async def health(self) -> dict[str, Any]:
         payload = await self._evaluate("const resolved = await resolveClient(); const catalog = collectModels(await resolved.client.models()); return {ready:true, model_count:catalog.models.length, diagnostics:resolved.diagnostics};")
@@ -1016,7 +1087,8 @@ class InternalChatClient:
 
     async def _get_thread_raw(self, conversation_id: str) -> Any:
         return await self._evaluate(
-            f"const resolved = await resolveClient(); return plain(await resolved.client.get({json.dumps(conversation_id)}));"
+            f"const resolved = await resolveClient(); return plain(await resolved.client.get({json.dumps(conversation_id)}));",
+            timeout=max(self.timeout, 30.0),
         )
 
     async def create_thread(
@@ -1030,13 +1102,14 @@ class InternalChatClient:
         if not prompt:
             raise ValueError("prompt is required")
         project = project_id.strip() if project_id else ""
+        user_message_id = str(uuid.uuid4())
         body = f"""
         const resolved = await resolveClient();
         const client = resolved.client;
         const text = {json.dumps(prompt)};
         const projectId = {json.dumps(project)};
         const model = chooseModel(await client.models(), {json.dumps(self.preferred_model)}, '', {json.dumps(self.thinking_effort)}, {json.dumps(self.require_high_reasoning)});
-        const userMessageId = crypto.randomUUID();
+        const userMessageId = {json.dumps(user_message_id)};
         const request = {{
           action:'next', model:model.slug,
           messages:[{{id:userMessageId,author:{{role:'user'}},content:{{content_type:'text',parts:[text]}},create_time:Date.now()/1000,end_turn:null,metadata:{{}},recipient:'all',status:'finished_successfully',weight:1}}],
@@ -1100,17 +1173,16 @@ class InternalChatClient:
         }});
         if (!conversationId) return {{sent:true,observed:false,running:true,reason:timedOut?'new conversation id was not observed before timeout':'new conversation id was not observed',request_id:requestId,user_message_id:userMessageId,project_id:projectId||null,terminal_event:terminalEvent}};
         let afterRaw = null;
-        for (let attempt = 0; attempt < 20; attempt += 1) {{
-          try {{ afterRaw = await client.get(conversationId); }} catch {{}}
-          const after = summary(afterRaw);
-          if (after.valid) break;
-          await new Promise((resolve) => setTimeout(resolve, 250));
-        }}
+        try {{ afterRaw = await client.get(conversationId); }} catch {{}}
         const finalSummary = summary(afterRaw);
-        const ownedStream = streams.has(conversationId) && !streamFinished;
+        const ownedStream = ownedStreamActive(conversationId) && !streamFinished;
         return {{sent:true,observed:!!afterRaw,running:ownedStream||finalSummary.running,owned_stream:ownedStream,reason:afterRaw?'':'created conversation could not be read back',conversation_id:conversationId,request_id:requestId,user_message_id:userMessageId,final_message_id:finalMessageId,final_status:finalStatus,project_id:projectId||null,terminal_event:terminalEvent,after_raw:afterRaw?plain(afterRaw):null,title_requested:{json.dumps(title or '')}}};
         """
-        payload = await self._evaluate(body)
+        payload = await self._evaluate(
+            body,
+            retry_on_transport=False,
+            timeout=max(self.timeout, 35.0),
+        )
         if not isinstance(payload, dict):
             raise RuntimeProtocolError("new conversation creation returned an invalid result")
         conversation_id = str(payload.get("conversation_id") or "")
@@ -1164,7 +1236,8 @@ class InternalChatClient:
 
     async def get_thread(self, conversation_id: str) -> dict[str, Any]:
         payload = await self._evaluate(
-            f"const resolved = await resolveClient(); const raw = await resolved.client.get({json.dumps(conversation_id)}); return {{raw:plain(raw), owned_stream:streams.has({json.dumps(conversation_id)})}};"
+            f"const resolved = await resolveClient(); const raw = await resolved.client.get({json.dumps(conversation_id)}); return {{raw:plain(raw), owned_stream:ownedStreamActive({json.dumps(conversation_id)})}};",
+            timeout=max(self.timeout, 30.0),
         )
         if not isinstance(payload, dict):
             raise RuntimeProtocolError("conversation read returned an invalid result")
@@ -1177,9 +1250,15 @@ class InternalChatClient:
         *,
         expected_current_node: str,
         wait_for_completion: bool = True,
+        user_message_id: str | None = None,
     ) -> dict[str, Any]:
         if not expected_current_node:
             raise ValueError("expected_current_node is required")
+        delivery_message_id = (
+            user_message_id.strip() if user_message_id else str(uuid.uuid4())
+        )
+        if not delivery_message_id:
+            raise ValueError("user_message_id must not be empty")
         body = f"""
         const resolved = await resolveClient();
         const client = resolved.client;
@@ -1190,7 +1269,7 @@ class InternalChatClient:
         const beforeRaw = await client.get(conversationId);
         const before = summary(beforeRaw);
         if (!before.valid || before.currentNode !== expectedNode) return {{sent:false, running:false, reason:'canonical current_node changed before send'}};
-        if (streams.has(conversationId) || before.running) return {{sent:false, running:true, reason:'thread is running'}};
+        if (ownedStreamActive(conversationId) || before.running) return {{sent:false, running:true, reason:'thread is running'}};
         const latest = before.latest;
         const status = String(latest && latest.status || '').toLowerCase();
         const terminal = new Set(['finished_successfully','finished_error','failed','cancelled','canceled','interrupted','incomplete']);
@@ -1198,7 +1277,7 @@ class InternalChatClient:
         if (!terminal.has(status) || latest.end_turn !== true) return {{sent:false, running:false, reason:'latest assistant response is not terminal'}};
         const metadata = latest.metadata || {{}};
         const model = chooseModel(await client.models(), {json.dumps(self.preferred_model)}, String(metadata.model_slug || metadata.default_model_slug || ''), {json.dumps(self.thinking_effort)}, {json.dumps(self.require_high_reasoning)});
-        const userMessageId = crypto.randomUUID();
+        const userMessageId = {json.dumps(delivery_message_id)};
         const request = {{
           action:'next', conversation_id:conversationId, parent_message_id:expectedNode, model:model.slug,
           messages:[{{id:userMessageId, author:{{role:'user'}}, content:{{content_type:'text', parts:[text]}}, create_time:Date.now()/1000, end_turn:null, metadata:{{}}, recipient:'all', status:'finished_successfully', weight:1}}],
@@ -1249,21 +1328,37 @@ class InternalChatClient:
           }} catch (error) {{ fail(error); }}
         }});
         let afterRaw = null;
-        const attempts = waitForCompletion ? 1 : 20;
-        for (let attempt = 0; attempt < attempts; attempt += 1) {{
-          try {{ afterRaw = await client.get(conversationId); }} catch {{}}
-          const after = summary(afterRaw);
-          if (after.valid && (waitForCompletion || after.currentNode !== expectedNode)) break;
-          if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, 100));
-        }}
+        try {{ afterRaw = await client.get(conversationId); }} catch {{}}
         const afterSummary = summary(afterRaw);
-        const running = streams.has(conversationId) || afterSummary.running;
+        const running = ownedStreamActive(conversationId) || afterSummary.running;
         if (timedOut) {{
           return {{sent:true, observed:false, running:true, reason:waitForCompletion?'completion stream exceeded the configured timeout':'completion stream did not start before the dispatch timeout', request_id:requestId, user_message_id:userMessageId, final_message_id:finalMessageId, final_status:finalStatus, parent_message_id:expectedNode, terminal_event:terminalEvent, after_raw:afterRaw ? plain(afterRaw) : null}};
         }}
         return {{sent:true, observed:!!afterRaw, running:running, reason:afterRaw?'':'submitted conversation could not be read back', request_id:requestId, user_message_id:userMessageId, final_message_id:finalMessageId, final_status:finalStatus, parent_message_id:expectedNode, terminal_event:terminalEvent, after_raw:afterRaw ? plain(afterRaw) : null}};
         """
-        payload = await self._evaluate(body)
+        dispatch_timeout = (
+            max(self.timeout, float(self.stream_timeout_seconds) + 5.0)
+            if wait_for_completion
+            else max(self.timeout, 30.0)
+        )
+        try:
+            payload = await self._evaluate(
+                body,
+                retry_on_transport=False,
+                timeout=dispatch_timeout,
+            )
+        except _MUTATION_EXCEPTIONS as exc:
+            return {
+                "sent": True,
+                "observed": False,
+                "running": False,
+                "reason": sanitize_runtime_error(
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "user_message_id": delivery_message_id,
+                "parent_message_id": expected_current_node,
+                "submission_uncertain": True,
+            }
         if not isinstance(payload, dict):
             raise RuntimeProtocolError("continuation returned an invalid result")
         if payload.get("after_raw") is not None:
@@ -1305,6 +1400,8 @@ class InternalChatClient:
             " else if (typeof resolved.client.cancelStream === 'function') await resolved.client.cancelStream(id);"
             " else return {cancelled:false, reason:'cancel is unavailable'};"
             " streams.delete(id); handles.delete(id); return {cancelled:true, reason:''};"
-            "} catch { return {cancelled:false, reason:'cancel failed'}; }"
+            "} catch { return {cancelled:false, reason:'cancel failed'}; }",
+            retry_on_transport=False,
+            timeout=max(self.timeout, 15.0),
         )
         return payload if isinstance(payload, dict) else {"cancelled": False, "reason": "invalid result"}

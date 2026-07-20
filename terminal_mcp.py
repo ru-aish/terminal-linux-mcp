@@ -68,7 +68,16 @@ CHAT_AGENT_DB_PATH = Path(
 CHAT_AGENT_ENABLED = os.environ.get("MCP_CHAT_AGENT_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
-CHAT_AGENT_SYNC_SECONDS = max(1.0, float(os.environ.get("MCP_CHAT_AGENT_SYNC_SECONDS", "15")))
+CHAT_AGENT_SYNC_SECONDS = max(30.0, float(os.environ.get("MCP_CHAT_AGENT_SYNC_SECONDS", "600")))
+CHAT_AGENT_INITIAL_CHECK_SECONDS = max(
+    10.0, float(os.environ.get("MCP_CHAT_AGENT_INITIAL_CHECK_SECONDS", "60"))
+)
+CHAT_AGENT_PROGRESS_CHECK_SECONDS = max(
+    30.0, float(os.environ.get("MCP_CHAT_AGENT_PROGRESS_CHECK_SECONDS", "180"))
+)
+CHAT_AGENT_IDLE_CHECK_SECONDS = max(
+    10.0, float(os.environ.get("MCP_CHAT_AGENT_IDLE_CHECK_SECONDS", "60"))
+)
 CHAT_AGENT_CONTEXT_MAX_EVENTS = max(1, int(os.environ.get("MCP_CHAT_AGENT_CONTEXT_MAX_EVENTS", "60")))
 CHAT_AGENT_CONTEXT_MAX_CHARS = max(1000, int(os.environ.get("MCP_CHAT_AGENT_CONTEXT_MAX_CHARS", "12000")))
 CHAT_AGENT_TAIL_LINES = max(1, int(os.environ.get("MCP_CHAT_AGENT_TAIL_LINES", "60")))
@@ -118,6 +127,10 @@ def get_chat_agent_coordinator() -> ChatAgentCoordinator:
                 tail_max_chars=CHAT_AGENT_TAIL_MAX_CHARS,
                 max_continue_attempts=CHAT_AGENT_MAX_CONTINUE_ATTEMPTS,
                 stale_after_seconds=CHAT_AGENT_STALE_SECONDS,
+                initial_check_seconds=CHAT_AGENT_INITIAL_CHECK_SECONDS,
+                progress_check_seconds=CHAT_AGENT_PROGRESS_CHECK_SECONDS,
+                idle_check_seconds=CHAT_AGENT_IDLE_CHECK_SECONDS,
+                heartbeat_seconds=CHAT_AGENT_SYNC_SECONDS,
             ),
             _chat_agent_runtime_factory,
         )
