@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, AsyncContextManager, Callable, Protocol
@@ -115,7 +116,9 @@ class ConversationGateway:
         *,
         expected_current_node: str,
         wait_for_completion: bool = False,
+        user_message_id: str = "",
     ) -> DeliveryResult:
+        delivery_message_id = user_message_id.strip() or str(uuid.uuid4())
         try:
             async with self.client_factory() as client:
                 try:
@@ -151,9 +154,15 @@ class ConversationGateway:
                         message,
                         expected_current_node=expected_current_node,
                         wait_for_completion=wait_for_completion,
+                        user_message_id=delivery_message_id,
                     )
                 except (ValueError, PermissionError) as exc:
-                    return self.classify_send_exception(exc, message=message)
+                    return self.classify_send_exception(
+                        exc,
+                        message=message,
+                        user_message_id=delivery_message_id,
+                        parent_message_id=expected_current_node,
+                    )
                 except _TRANSPORT_ERRORS as exc:
                     # Once continue_thread is invoked, a transport failure can
                     # occur after ChatGPT accepted the message. Fail closed and
@@ -162,10 +171,22 @@ class ConversationGateway:
                         exc,
                         message=message,
                         submission_started=True,
+                        user_message_id=delivery_message_id,
+                        parent_message_id=expected_current_node,
                     )
-                return self.classify_send_result(result, message=message)
+                return self.classify_send_result(
+                    result,
+                    message=message,
+                    user_message_id=delivery_message_id,
+                    parent_message_id=expected_current_node,
+                )
         except (ValueError, PermissionError) as exc:
-            return self.classify_send_exception(exc, message=message)
+            return self.classify_send_exception(
+                exc,
+                message=message,
+                user_message_id=delivery_message_id,
+                parent_message_id=expected_current_node,
+            )
         except _TRANSPORT_ERRORS as exc:
             return DeliveryResult(
                 state=DeliveryState.TEMPORARILY_UNREADABLE,
@@ -179,6 +200,8 @@ class ConversationGateway:
         *,
         message: str = "",
         submission_started: bool = False,
+        user_message_id: str = "",
+        parent_message_id: str = "",
     ) -> DeliveryResult:
         reason = sanitize_runtime_error(f"{type(exc).__name__}: {exc}")
         if isinstance(exc, (ValueError, PermissionError)):
@@ -187,10 +210,22 @@ class ConversationGateway:
             state = DeliveryState.SENT_UNCONFIRMED
         else:
             state = DeliveryState.TEMPORARILY_UNREADABLE
-        return DeliveryResult(state=state, reason=reason, message=message)
+        return DeliveryResult(
+            state=state,
+            reason=reason,
+            user_message_id=user_message_id,
+            parent_message_id=parent_message_id,
+            message=message,
+        )
 
     @staticmethod
-    def classify_send_result(result: dict[str, Any], *, message: str = "") -> DeliveryResult:
+    def classify_send_result(
+        result: dict[str, Any],
+        *,
+        message: str = "",
+        user_message_id: str = "",
+        parent_message_id: str = "",
+    ) -> DeliveryResult:
         sent = bool(result.get("sent"))
         observed = bool(result.get("observed"))
         reason = str(result.get("reason") or "")
@@ -210,8 +245,12 @@ class ConversationGateway:
             state=state,
             reason=reason,
             request_id=str(result.get("request_id") or ""),
-            user_message_id=str(result.get("user_message_id") or ""),
-            parent_message_id=str(result.get("parent_message_id") or ""),
+            user_message_id=str(
+                result.get("user_message_id") or user_message_id
+            ),
+            parent_message_id=str(
+                result.get("parent_message_id") or parent_message_id
+            ),
             final_message_id=str(result.get("final_message_id") or ""),
             final_status=str(result.get("final_status") or ""),
             message=message,

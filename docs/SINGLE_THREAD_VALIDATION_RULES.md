@@ -11,8 +11,9 @@ This document is mandatory for all further work on `refactor/three-block-orchest
 
 ## Tool and thread discipline
 
-- Use only `terminal_mcp2` for terminal work.
-- Reuse terminal thread/session ID `three-block-single-thread-validation` for every terminal call.
+- Use only `terminal_mcp` for terminal work.
+- Reuse terminal thread/session ID `live-queued-prompts-status` for every terminal call.
+- Earlier `terminal_mcp2` validation sessions were abandoned after connector or execution-worker failures. Do not return to them or create another replacement session.
 - Do not create or use sub-agents.
 - Codex may be used only when necessary; prefer direct inspection and implementation first.
 - Do not use another terminal connector as a fallback.

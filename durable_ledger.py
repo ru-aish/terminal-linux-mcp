@@ -36,7 +36,7 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
 class DurableLedger:
     """Transactional repository for actors, tasks, commands and cursors."""
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(self, path: Path):
         self.path = Path(path).expanduser().resolve()
@@ -77,7 +77,8 @@ class DurableLedger:
                     task_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL UNIQUE REFERENCES agents(agent_id) ON DELETE CASCADE,
                     prompt TEXT NOT NULL, completion_marker TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
                     continue_attempts INTEGER NOT NULL DEFAULT 0, last_continue_node TEXT,
-                    last_continue_at REAL, created_at REAL NOT NULL, completed_at REAL
+                    last_continue_at REAL, next_check_at REAL NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL, completed_at REAL
                 );
                 CREATE TABLE IF NOT EXISTS commands(
                     command_id TEXT PRIMARY KEY, from_agent_id TEXT REFERENCES agents(agent_id),
@@ -86,7 +87,8 @@ class DurableLedger:
                     status TEXT NOT NULL, idempotency_key TEXT, ack_event_seq INTEGER,
                     request_id TEXT, user_message_id TEXT, parent_message_id TEXT,
                     created_at REAL NOT NULL, delivered_at REAL, last_error TEXT NOT NULL DEFAULT '',
-                    purpose TEXT NOT NULL DEFAULT 'instruction'
+                    purpose TEXT NOT NULL DEFAULT 'instruction',
+                    next_attempt_at REAL NOT NULL DEFAULT 0
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS commands_sender_key
                     ON commands(from_agent_id, to_agent_id, idempotency_key)
@@ -117,11 +119,13 @@ class DurableLedger:
                 ("tasks", "continue_attempts", "INTEGER NOT NULL DEFAULT 0"),
                 ("tasks", "last_continue_node", "TEXT"),
                 ("tasks", "last_continue_at", "REAL"),
+                ("tasks", "next_check_at", "REAL NOT NULL DEFAULT 0"),
                 ("commands", "ack_event_seq", "INTEGER"),
                 ("commands", "request_id", "TEXT"),
                 ("commands", "user_message_id", "TEXT"),
                 ("commands", "parent_message_id", "TEXT"),
                 ("commands", "purpose", "TEXT NOT NULL DEFAULT 'instruction'"),
+                ("commands", "next_attempt_at", "REAL NOT NULL DEFAULT 0"),
                 ("agents", "last_progress_at", "REAL"),
                 ("agents", "working_directory", "TEXT"),
                 ("agents", "progress_signature", "TEXT"),
@@ -180,36 +184,110 @@ class DurableLedger:
                 "SELECT * FROM agents WHERE parent_agent_id=? ORDER BY created_at,agent_id", (parent_agent_id,)
             )]
 
-    def active_agents(self) -> list[dict[str, Any]]:
+    def active_agents(
+        self,
+        *,
+        now: float | None = None,
+        include_future: bool = False,
+    ) -> list[dict[str, Any]]:
+        current = time.time() if now is None else float(now)
         with self.connect() as db:
-            return [dict(row) for row in db.execute(
-                "SELECT * FROM agents WHERE chat_id IS NOT NULL AND status NOT IN "
-                "('cancelled','failed','completed') ORDER BY created_at,agent_id"
-            )]
-
-    def queued_commands(self) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            return [
-                dict(row)
-                for row in db.execute(
-                    "SELECT c.* FROM commands c "
-                    "WHERE c.status IN ('queued','waiting_after_cancel') "
-                    "AND NOT EXISTS ("
-                    "  SELECT 1 FROM commands prior "
-                    "  WHERE prior.to_agent_id=c.to_agent_id "
-                    "  AND prior.sequence_no<c.sequence_no "
-                    "  AND prior.status NOT IN "
-                    "      ('delivered','acknowledged','cancelled','superseded')"
-                    ") "
-                    "ORDER BY c.created_at,c.sequence_no,c.command_id"
+            query = (
+                "SELECT a.* FROM agents a JOIN tasks t ON t.agent_id=a.agent_id "
+                "WHERE a.chat_id IS NOT NULL "
+            )
+            params: tuple[Any, ...] = ()
+            if include_future:
+                query += "AND t.status NOT IN ('completed','failed','cancelled') "
+            else:
+                query += (
+                    "AND t.status NOT IN "
+                    "('completed','failed','cancelled','waiting_for_parent') "
+                    "AND COALESCE(t.next_check_at,0)<=? "
                 )
-            ]
+                params = (current,)
+            query += "ORDER BY a.created_at,a.agent_id"
+            return [dict(row) for row in db.execute(query, params)]
 
-    def uncertain_commands(self) -> list[dict[str, Any]]:
+    def queued_commands(
+        self,
+        *,
+        include_future: bool = False,
+    ) -> list[dict[str, Any]]:
         with self.connect() as db:
-            return [dict(row) for row in db.execute(
-                "SELECT * FROM commands WHERE status='delivery_uncertain' ORDER BY created_at,sequence_no,command_id"
-            )]
+            query = (
+                "SELECT c.* FROM commands c "
+                "WHERE c.status IN ('queued','waiting_after_cancel') "
+            )
+            params: tuple[Any, ...] = ()
+            if not include_future:
+                query += "AND COALESCE(c.next_attempt_at,0)<=? "
+                params = (time.time(),)
+            query += (
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM commands prior "
+                "  WHERE prior.to_agent_id=c.to_agent_id "
+                "  AND prior.sequence_no<c.sequence_no "
+                "  AND prior.status NOT IN "
+                "      ('delivered','acknowledged','cancelled','superseded')"
+                ") "
+                "ORDER BY c.created_at,c.sequence_no,c.command_id"
+            )
+            return [dict(row) for row in db.execute(query, params)]
+
+    def uncertain_commands(
+        self,
+        *,
+        include_future: bool = False,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            query = "SELECT * FROM commands WHERE status='delivery_uncertain' "
+            params: tuple[Any, ...] = ()
+            if not include_future:
+                query += "AND COALESCE(next_attempt_at,0)<=? "
+                params = (time.time(),)
+            query += "ORDER BY created_at,sequence_no,command_id"
+            return [dict(row) for row in db.execute(query, params)]
+
+    def next_due_at(self, *, now: float | None = None) -> float | None:
+        current = time.time() if now is None else float(now)
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT MIN(due_at) FROM ("
+                "  SELECT CASE WHEN COALESCE(t.next_check_at,0)<=0 THEN ? "
+                "              ELSE t.next_check_at END AS due_at "
+                "  FROM tasks t JOIN agents a ON a.agent_id=t.agent_id "
+                "  WHERE t.status NOT IN ('completed','failed','cancelled','waiting_for_parent') "
+                "  AND (a.chat_id IS NOT NULL OR a.status='creating_thread') "
+                "  UNION ALL "
+                "  SELECT CASE WHEN COALESCE(c.next_attempt_at,0)<=0 THEN ? "
+                "              ELSE c.next_attempt_at END "
+                "  FROM commands c "
+                "  WHERE c.status IN ('queued','waiting_after_cancel','delivery_uncertain') "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM commands prior "
+                "    WHERE prior.to_agent_id=c.to_agent_id "
+                "    AND prior.sequence_no<c.sequence_no "
+                "    AND prior.status NOT IN "
+                "      ('delivered','acknowledged','cancelled','superseded')"
+                "  )"
+                ")",
+                (current, current),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0])
+
+    def active_task_conversation_ids(self) -> set[str]:
+        with self.connect() as db:
+            return {
+                str(row[0])
+                for row in db.execute(
+                    "SELECT a.chat_id FROM agents a JOIN tasks t ON t.agent_id=a.agent_id "
+                    "WHERE a.chat_id IS NOT NULL "
+                    "AND t.status NOT IN ('completed','failed','cancelled')"
+                )
+            }
 
     def events_after(self, agent_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         with self.connect() as db:
