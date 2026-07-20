@@ -222,7 +222,7 @@ class ChatAgentCoordinator:
             creation_rows = [
                 dict(row)
                 for row in db.execute(
-                    "SELECT a.agent_id,t.task_id FROM agents a "
+                    "SELECT a.agent_id,a.chat_id,t.task_id FROM agents a "
                     "JOIN tasks t ON t.agent_id=a.agent_id "
                     "WHERE a.status='creation_in_flight' "
                     "OR t.status='creation_in_flight'"
@@ -230,6 +230,30 @@ class ChatAgentCoordinator:
             ]
             for row in creation_rows:
                 reason = "Terminal MCP stopped while creating the ChatGPT child thread"
+                if row.get("chat_id"):
+                    db.execute(
+                        "UPDATE agents SET status='creation_uncertain',last_error=?,updated_at=? "
+                        "WHERE agent_id=?",
+                        (reason, now, row["agent_id"]),
+                    )
+                    db.execute(
+                        "UPDATE tasks SET status='creation_uncertain',completed_at=NULL,next_check_at=? "
+                        "WHERE task_id=?",
+                        (now, row["task_id"]),
+                    )
+                    self._insert_event(
+                        db,
+                        row["agent_id"],
+                        row["task_id"],
+                        "blocked",
+                        {
+                            "reason": reason,
+                            "operation": "thread_creation",
+                            "uncertain": True,
+                        },
+                        source_cursor=f"restart-creation-uncertain:{row['task_id']}",
+                    )
+                    continue
                 db.execute(
                     "UPDATE agents SET status='failed',last_error=?,updated_at=? WHERE agent_id=?",
                     (reason, now, row["agent_id"]),
@@ -536,6 +560,51 @@ class ChatAgentCoordinator:
                 source_cursor=f"creation-failed:{task_id}",
             )
 
+    def _mark_creation_uncertain(
+        self,
+        agent_id: str,
+        task_id: str,
+        created: dict[str, Any],
+        reason: str,
+    ) -> None:
+        chat_id = str(created.get("conversation_id") or "")
+        if not chat_id:
+            raise ValueError("an uncertain creation requires a conversation_id")
+        message = f"{reason}; awaiting canonical creation reconciliation"
+        with self.repository.transaction() as db:
+            db.execute(
+                "UPDATE agents SET chat_id=?,status='creation_uncertain',current_node=?,"
+                "creation_request_id=?,creation_user_message_id=?,last_error=?,updated_at=? "
+                "WHERE agent_id=?",
+                (
+                    chat_id,
+                    str(created.get("current_node") or ""),
+                    str(created.get("request_id") or "") or None,
+                    str(created.get("user_message_id") or "") or None,
+                    message,
+                    _now(),
+                    agent_id,
+                ),
+            )
+            db.execute(
+                "UPDATE tasks SET status='creation_uncertain',completed_at=NULL,next_check_at=? "
+                "WHERE task_id=?",
+                (_now() + self.config.initial_check_seconds, task_id),
+            )
+            self._insert_event(
+                db,
+                agent_id,
+                task_id,
+                "blocked",
+                {
+                    "reason": message,
+                    "operation": "thread_creation",
+                    "uncertain": True,
+                    "chat_id": chat_id,
+                },
+                source_cursor=f"creation-uncertain:{task_id}",
+            )
+
     async def _create_reserved_agent(
         self,
         runtime: AgentRuntime,
@@ -620,6 +689,14 @@ class ChatAgentCoordinator:
                 created.get("reason")
                 or "new conversation was not canonically observed"
             )
+            if chat_id and created.get("sent"):
+                self._mark_creation_uncertain(
+                    agent_id,
+                    task["task_id"],
+                    created,
+                    reason,
+                )
+                return
             self._mark_creation_failed(
                 agent_id,
                 task["task_id"],
@@ -630,13 +707,17 @@ class ChatAgentCoordinator:
 
         with self.repository.transaction() as db:
             db.execute(
-                "UPDATE agents SET chat_id=?,status=?,current_node=?,last_progress_at=?,progress_signature=?,updated_at=?,last_error='' WHERE agent_id=?",
+                "UPDATE agents SET chat_id=?,status=?,current_node=?,last_progress_at=?,"
+                "progress_signature=?,creation_request_id=?,creation_user_message_id=?,"
+                "updated_at=?,last_error='' WHERE agent_id=?",
                 (
                     chat_id,
                     "running" if created.get("running") else "idle",
                     str(created.get("current_node") or ""),
                     _now(),
                     self._progress_signature(created),
+                    str(created.get("request_id") or "") or None,
+                    str(created.get("user_message_id") or "") or None,
                     _now(),
                     agent_id,
                 ),
@@ -659,7 +740,113 @@ class ChatAgentCoordinator:
         runtime: AgentRuntime,
         *,
         force: bool = False,
-    ) -> int:
+    ) -> int | None:
+        with self.repository.connect() as db:
+            uncertain_query = (
+                "SELECT a.*,t.task_id,t.next_check_at FROM agents a "
+                "JOIN tasks t ON t.agent_id=a.agent_id "
+                "WHERE a.status='creation_uncertain' AND a.chat_id IS NOT NULL "
+            )
+            uncertain_params: tuple[Any, ...] = ()
+            if not force:
+                uncertain_query += "AND COALESCE(t.next_check_at,0)<=? "
+                uncertain_params = (_now(),)
+            uncertain_query += "ORDER BY a.created_at,a.agent_id LIMIT 1"
+            uncertain = db.execute(
+                uncertain_query, uncertain_params
+            ).fetchone()
+        if uncertain:
+            candidate = dict(uncertain)
+            try:
+                snapshot = await runtime.get_thread(str(candidate["chat_id"]))
+            except Exception as exc:
+                with self.repository.transaction() as db:
+                    db.execute(
+                        "UPDATE agents SET last_error=?,updated_at=? WHERE agent_id=?",
+                        (_safe_error(exc), _now(), candidate["agent_id"]),
+                    )
+                    db.execute(
+                        "UPDATE tasks SET next_check_at=? WHERE task_id=?",
+                        (
+                            _now() + self.config.progress_check_seconds,
+                            candidate["task_id"],
+                        ),
+                    )
+                return 0
+            expected_user_id = str(
+                candidate.get("creation_user_message_id") or ""
+            )
+            user_observed = not expected_user_id or (
+                expected_user_id in {
+                    str(value)
+                    for value in snapshot.get("all_message_ids", ())
+                    if value
+                }
+                or any(
+                    str(turn.get("key") or "") == expected_user_id
+                    for turn in snapshot.get("turns", ())
+                    if isinstance(turn, dict)
+                )
+            )
+            verified = bool(
+                snapshot.get("found")
+                and snapshot.get("canonical")
+                and snapshot.get("state_verified")
+                and user_observed
+            )
+            if not verified:
+                with self.repository.transaction() as db:
+                    db.execute(
+                        "UPDATE agents SET last_error=?,updated_at=? WHERE agent_id=?",
+                        (
+                            "created conversation is not canonically verified yet",
+                            _now(),
+                            candidate["agent_id"],
+                        ),
+                    )
+                    db.execute(
+                        "UPDATE tasks SET next_check_at=? WHERE task_id=?",
+                        (
+                            _now() + self.config.progress_check_seconds,
+                            candidate["task_id"],
+                        ),
+                    )
+                return 0
+            with self.repository.transaction() as db:
+                db.execute(
+                    "UPDATE agents SET status=?,current_node=?,last_progress_at=?,"
+                    "progress_signature=?,last_error='',updated_at=? WHERE agent_id=?",
+                    (
+                        "running" if snapshot.get("running") else "idle",
+                        str(snapshot.get("current_node") or ""),
+                        _now(),
+                        self._progress_signature(snapshot),
+                        _now(),
+                        candidate["agent_id"],
+                    ),
+                )
+                db.execute(
+                    "UPDATE tasks SET status='running',completed_at=NULL,next_check_at=? "
+                    "WHERE task_id=?",
+                    (
+                        _now() + self.config.initial_check_seconds,
+                        candidate["task_id"],
+                    ),
+                )
+                self._insert_event(
+                    db,
+                    candidate["agent_id"],
+                    candidate["task_id"],
+                    "started",
+                    {
+                        "chat_id": candidate["chat_id"],
+                        "project_id": candidate.get("project_id"),
+                        "recovered": True,
+                    },
+                    source_cursor=f"started:{candidate['task_id']}",
+                )
+            return 0
+
         with self.repository.connect() as db:
             query = (
                 "SELECT a.agent_id FROM agents a JOIN tasks t ON t.agent_id=a.agent_id "
@@ -672,7 +859,7 @@ class ChatAgentCoordinator:
             query += "ORDER BY a.created_at,a.agent_id LIMIT 1"
             row = db.execute(query, params).fetchone()
         if not row:
-            return 0
+            return None
         try:
             await self._create_reserved_agent(runtime, str(row["agent_id"]))
         except Exception:
@@ -841,11 +1028,6 @@ class ChatAgentCoordinator:
             # used upward is a non-blocking child update, so persist it as
             # progress; final completion may then supersede uncertain progress.
             purpose = "progress"
-        terminal_statuses = {"cancelled", "failed", "completed"}
-        if str(sender.get("status") or "") in terminal_statuses:
-            raise ValueError("sender agent is terminal and cannot send new messages")
-        if str(target.get("status") or "") in terminal_statuses:
-            raise ValueError("target agent is terminal and cannot receive new messages")
         key = idempotency_key.strip() if idempotency_key else None
         if key:
             with self.repository.connect() as db:
@@ -855,8 +1037,24 @@ class ChatAgentCoordinator:
                 ).fetchone()
             if existing:
                 return dict(existing)
+        terminal_statuses = {"cancelled", "failed", "completed"}
+        if str(sender.get("status") or "") in terminal_statuses:
+            raise ValueError("sender agent is terminal and cannot send new messages")
+        if str(target.get("status") or "") in terminal_statuses:
+            raise ValueError("target agent is terminal and cannot receive new messages")
         try:
             with self.repository.transaction() as db:
+                if interrupt_policy == "interrupt" and purpose == "instruction":
+                    db.execute(
+                        "UPDATE commands SET status='superseded',last_error=?,next_attempt_at=0 "
+                        "WHERE from_agent_id=? AND to_agent_id=? AND purpose='instruction' "
+                        "AND interrupt_policy='queue' AND status IN ('queued','waiting_after_cancel')",
+                        (
+                            "superseded by direct interrupt steering",
+                            from_agent_id,
+                            to_agent_id,
+                        ),
+                    )
                 sequence = int(
                     db.execute(
                         "SELECT COALESCE(MAX(sequence_no),0)+1 FROM commands WHERE to_agent_id=?",
@@ -979,11 +1177,13 @@ class ChatAgentCoordinator:
                             "inspected": inspected,
                             "new_event_ids": new_events,
                         }
-                write_count = await self._recover_one_creation(runtime, force=force)
-                if write_count:
+                creation_write_count = await self._recover_one_creation(
+                    runtime, force=force
+                )
+                if creation_write_count is not None:
                     return {
                         "status": "ok",
-                        "write_count": write_count,
+                        "write_count": creation_write_count,
                         "inspected": inspected,
                         "new_event_ids": new_events,
                     }
@@ -1324,9 +1524,27 @@ class ChatAgentCoordinator:
                     "UPDATE commands SET status='delivered',delivered_at=?,last_error='',next_attempt_at=0 WHERE command_id=?",
                     (_now(), command["command_id"]),
                 )
+                self._activate_target_after_delivery(db, command)
                 self._ack_command_cursor(db, command)
             return 1
         return 0
+
+    @staticmethod
+    def _activate_target_after_delivery(
+        db: sqlite3.Connection, command: dict[str, Any]
+    ) -> None:
+        if command.get("purpose") not in {"instruction", "answer"}:
+            return
+        db.execute(
+            "UPDATE agents SET status='waiting_assistant',last_error='',updated_at=? "
+            "WHERE agent_id=? AND status NOT IN ('failed','cancelled')",
+            (_now(), command["to_agent_id"]),
+        )
+        db.execute(
+            "UPDATE tasks SET status='waiting_assistant',completed_at=NULL,next_check_at=0 "
+            "WHERE agent_id=? AND status NOT IN ('failed','cancelled')",
+            (command["to_agent_id"],),
+        )
 
     @staticmethod
     def _ack_command_cursor(db: sqlite3.Connection, command: dict[str, Any]) -> None:
@@ -1357,11 +1575,11 @@ class ChatAgentCoordinator:
                         ("delivery target is unavailable", command["command_id"]),
                     )
                 continue
-            if str(target.get("status") or "") in {
-                "cancelled",
-                "failed",
-                "completed",
-            }:
+            target_status = str(target.get("status") or "")
+            if target_status in {"cancelled", "failed"} or (
+                target_status == "completed"
+                and command.get("purpose") not in {"instruction", "answer"}
+            ):
                 with self.repository.transaction() as db:
                     terminal_reason = "target agent became terminal before delivery"
                     db.execute(
@@ -1429,6 +1647,7 @@ class ChatAgentCoordinator:
                     )
                 return 0
 
+            write_count = 0
             if snapshot.get("running") or snapshot.get("active_stream"):
                 if command["status"] == "waiting_after_cancel":
                     with self.repository.transaction() as db:
@@ -1464,21 +1683,56 @@ class ChatAgentCoordinator:
                             ),
                         )
                     return 1
-                with self.repository.transaction() as db:
-                    db.execute(
-                        "UPDATE commands SET status=?,last_error=?,next_attempt_at=? WHERE command_id=?",
-                        (
-                            "waiting_after_cancel",
-                            str(result.get("reason") or ""),
-                            _now() + self.config.progress_check_seconds,
-                            command["command_id"],
-                        ),
-                    )
-                return 1
+                write_count = 1
+                if not result.get("cancelled"):
+                    with self.repository.transaction() as db:
+                        db.execute(
+                            "UPDATE commands SET status='waiting_after_cancel',last_error=?,next_attempt_at=? WHERE command_id=?",
+                            (
+                                str(result.get("reason") or "cancel was not accepted"),
+                                _now() + self.config.progress_check_seconds,
+                                command["command_id"],
+                            ),
+                        )
+                    return write_count
+                for attempt in range(10):
+                    if attempt:
+                        await asyncio.sleep(0.2)
+                    try:
+                        snapshot = await runtime.get_thread(target["chat_id"])
+                    except Exception as exc:
+                        with self.repository.transaction() as db:
+                            db.execute(
+                                "UPDATE commands SET status='waiting_after_cancel',last_error=?,next_attempt_at=? WHERE command_id=?",
+                                (
+                                    _safe_error(exc),
+                                    _now() + min(self.config.progress_check_seconds, 1.0),
+                                    command["command_id"],
+                                ),
+                            )
+                        return write_count
+                    if not (
+                        snapshot.get("running") or snapshot.get("active_stream")
+                    ):
+                        break
+                if snapshot.get("running") or snapshot.get("active_stream"):
+                    with self.repository.transaction() as db:
+                        db.execute(
+                            "UPDATE commands SET status='waiting_after_cancel',last_error=?,next_attempt_at=? WHERE command_id=?",
+                            (
+                                "cancel accepted; waiting for canonical terminal state",
+                                _now() + min(self.config.progress_check_seconds, 1.0),
+                                command["command_id"],
+                            ),
+                        )
+                    return write_count
 
             target_task = self.repository.task_for_agent(target["agent_id"])
             decision = reduce_snapshot(target_task or {}, snapshot, (command,))
-            if decision.state is ReducedState.COMPLETED and command.get("purpose") != "completion":
+            if decision.state is ReducedState.COMPLETED and command.get("purpose") in {
+                "progress",
+                "question",
+            }:
                 with self.repository.transaction() as db:
                     db.execute(
                         "UPDATE commands SET status='cancelled',last_error=? WHERE command_id=?",
@@ -1492,7 +1746,7 @@ class ChatAgentCoordinator:
                         command["command_id"],
                         seconds=self.config.progress_check_seconds,
                     )
-                return 0
+                return write_count
             delivery_message_id = str(
                 command.get("user_message_id") or uuid.uuid4()
             )
@@ -1542,7 +1796,7 @@ class ChatAgentCoordinator:
                             command["command_id"],
                         ),
                     )
-                return 1
+                return write_count + 1
 
             delivery = ConversationGateway.classify_send_result(
                 result,
@@ -1579,17 +1833,8 @@ class ChatAgentCoordinator:
                         command["command_id"],
                     ),
                 )
-                if command_status == "delivered" and command.get("purpose") == "answer":
-                    db.execute(
-                        "UPDATE agents SET status='waiting_assistant',updated_at=? "
-                        "WHERE agent_id=? AND status NOT IN ('completed','failed','cancelled')",
-                        (_now(), command["to_agent_id"]),
-                    )
-                    db.execute(
-                        "UPDATE tasks SET status='waiting_assistant',next_check_at=0 "
-                        "WHERE agent_id=? AND status='waiting_for_parent'",
-                        (command["to_agent_id"],),
-                    )
+                if command_status == "delivered":
+                    self._activate_target_after_delivery(db, command)
                 if command_status == "delivered" and command.get("ack_event_seq"):
                     db.execute(
                         "UPDATE subscriptions SET last_acked_event_seq="
@@ -1602,7 +1847,7 @@ class ChatAgentCoordinator:
                             command["from_agent_id"],
                         ),
                     )
-            return 1
+            return write_count + 1
         return 0
 
     async def _continue_one_task(
