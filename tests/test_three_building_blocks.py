@@ -160,6 +160,7 @@ def test_ledger_owns_schema_and_evidence_columns(tmp_path):
     with ledger.connect() as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(commands)")}
         task_columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+        agent_columns = {row[1] for row in db.execute("PRAGMA table_info(agents)")}
         assert {
             "request_id",
             "user_message_id",
@@ -168,7 +169,8 @@ def test_ledger_owns_schema_and_evidence_columns(tmp_path):
             "next_attempt_at",
         } <= columns
         assert "next_check_at" in task_columns
-        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "8"
+        assert {"creation_request_id", "creation_user_message_id"} <= agent_columns
+        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "9"
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 

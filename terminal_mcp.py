@@ -3757,11 +3757,14 @@ async def agent_send(
     cwd: str | None = None,
     purpose: str = "instruction",
 ) -> str:
-    """Queue an ordered parent/child message.
+    """Queue an ordered parent/child message or explicitly steer an active child.
 
     Use ``purpose=question`` for a blocking child-to-parent question and
-    ``purpose=answer`` for the direct parent's reply. Active turns are not
-    interrupted unless ``interrupt_policy=interrupt`` is explicit.
+    ``purpose=answer`` for the direct parent's reply. The default queue policy
+    waits for a canonical terminal turn. Explicit ``interrupt`` supersedes older
+    unsent queued instructions from the same sender, cancels the owned active
+    generation, and dispatches the steering prompt when the terminal node is
+    canonically verified.
     """
     if gate := await _chat_agent_gate(session_id, cwd):
         return gate
@@ -3805,7 +3808,7 @@ async def agent_sync(
     session_id: str = "default",
     cwd: str | None = None,
 ) -> str:
-    """Run one explicit sequential orchestration sync and perform at most one ChatGPT write."""
+    """Run one explicit sequential orchestration sync; interrupt steering may cancel and dispatch in one cycle."""
     if gate := await _chat_agent_gate(session_id, cwd):
         return gate
     try:

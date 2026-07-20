@@ -77,6 +77,7 @@ class FakeRuntime:
         self.continue_errors: set[str] = set()
         self.continue_results: dict[str, dict] = {}
         self.create_delay = 0.0
+        self.create_result: dict | None = None
         self.before_create = None
         self.before_continue = None
         self.before_cancel = None
@@ -112,14 +113,18 @@ class FakeRuntime:
         chat_id = f"child-chat-{len(self.create_calls) + 1}"
         self.create_calls.append((prompt, project_id, title))
         self.snapshots[chat_id] = terminal_snapshot(chat_id, running=True)
-        return {
+        result = {
             "sent": True,
             "observed": True,
             "running": True,
             "conversation_id": chat_id,
             "current_node": f"a-{chat_id}",
+            "user_message_id": f"u-{chat_id}",
             "chat_url": f"https://chatgpt.com/c/{chat_id}",
         }
+        if self.create_result is not None:
+            result.update(self.create_result)
+        return result
 
     async def get_thread(self, conversation_id):
         self.get_calls.append(conversation_id)
@@ -748,7 +753,7 @@ def test_same_node_text_growth_counts_as_structural_progress(tmp_path):
     asyncio.run(run())
 
 
-def test_waiting_after_cancel_does_not_repeat_cancel(tmp_path):
+def test_interrupt_directly_cancels_and_steers_in_one_sync(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service, parent, child = await make_parent_and_child(tmp_path, runtime)
@@ -756,29 +761,33 @@ def test_waiting_after_cancel_does_not_repeat_cancel(tmp_path):
         runtime.snapshots["child-chat-1"] = terminal_snapshot(
             "child-chat-1", running=True
         )
-        await service.send(
+        command = await service.send(
             parent["agent_id"],
             child_id,
             "urgent correction",
             interrupt_policy="interrupt",
         )
-        assert (await service.sync_once())["write_count"] == 1
-        assert runtime.cancel_calls == ["child-chat-1"]
 
-        runtime.snapshots["child-chat-1"] = terminal_snapshot(
-            "child-chat-1", running=True
-        )
+        result = await service.sync_once()
+        assert result["write_count"] == 2
+        assert runtime.cancel_calls == ["child-chat-1"]
+        assert runtime.continue_calls == [
+            ("child-chat-1", "urgent correction", "a-child-chat-1")
+        ]
+        with service.repository.connect() as db:
+            status = db.execute(
+                "SELECT status FROM commands WHERE command_id=?",
+                (command["command_id"],),
+            ).fetchone()[0]
+        assert status == "delivered"
+
         assert (await service.sync_once())["write_count"] == 0
         assert runtime.cancel_calls == ["child-chat-1"]
-
-        runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")
-        assert (await service.sync_once())["write_count"] == 1
-        assert runtime.continue_calls[-1][0] == "child-chat-1"
 
     asyncio.run(run())
 
 
-def test_command_queued_before_target_completion_is_cancelled(tmp_path):
+def test_queued_instruction_survives_completion_and_reopens_thread(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service, parent, child = await make_parent_and_child(tmp_path, runtime)
@@ -795,14 +804,20 @@ def test_command_queued_before_target_completion_is_cancelled(tmp_path):
             marker=f"done\n{DEFAULT_AGENT_COMPLETION_MARKER}",
         )
         result = await service.sync_once()
-        assert result["write_count"] == 0
-        assert all(call[0] != "child-chat-1" for call in runtime.continue_calls)
+        assert result["write_count"] == 1
+        assert runtime.continue_calls == [
+            ("child-chat-1", "late follow-up", "a-child-chat-1")
+        ]
         with service.repository.connect() as db:
-            status = db.execute(
+            row = db.execute(
                 "SELECT status FROM commands WHERE command_id=?",
                 (command["command_id"],),
-            ).fetchone()[0]
-        assert status == "cancelled"
+            ).fetchone()
+        assert row["status"] == "delivered"
+        status = await service.status(child_id)
+        assert status["agent"]["status"] == "waiting_assistant"
+        assert status["task"]["status"] == "waiting_assistant"
+        assert status["task"]["completed_at"] is None
 
     asyncio.run(run())
 
@@ -2066,5 +2081,211 @@ def test_manual_sync_also_limits_monitoring_to_one_conversation(tmp_path):
         assert len(result["inspected"]) == 1
         assert runtime.get_calls == ["child-chat-1"]
         assert runtime.context_calls == ["child-chat-1"]
+
+    asyncio.run(run())
+
+
+def test_uncertain_creation_with_known_chat_id_is_reconciled_without_duplicate(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        runtime.create_result = {
+            "observed": False,
+            "reason": "created conversation could not be read back",
+        }
+        service = coordinator(tmp_path, runtime)
+        parent = await service.register_parent(
+            "parent-chat", project_id="g-p-project"
+        )
+        child = await service.spawn(
+            parent["agent_id"],
+            "child task",
+            project_policy="explicit",
+            project_id="g-p-project",
+            idempotency_key="uncertain-spawn",
+        )
+        child_id = child["agent"]["agent_id"]
+        assert child["agent"]["chat_id"] == "child-chat-1"
+        assert child["agent"]["status"] == "creation_uncertain"
+        assert child["task"]["status"] == "creation_uncertain"
+        assert len(runtime.create_calls) == 1
+
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE tasks SET next_check_at=0 WHERE agent_id=?",
+                (child_id,),
+            )
+        result = await service.sync_once()
+        assert result["write_count"] == 0
+        recovered = await service.status(child_id)
+        assert recovered["agent"]["status"] == "running"
+        assert recovered["task"]["status"] == "running"
+        assert recovered["agent"]["chat_id"] == "child-chat-1"
+        assert len(runtime.create_calls) == 1
+        assert any(
+            event["kind"] == "started"
+            and event["payload"].get("recovered") is True
+            for event in (await service.wait(child_id))["events"]
+        )
+
+    asyncio.run(run())
+
+
+def test_restart_preserves_known_creation_in_flight_for_reconciliation(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, _parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE agents SET status='creation_in_flight' WHERE agent_id=?",
+                (child_id,),
+            )
+            db.execute(
+                "UPDATE tasks SET status='creation_in_flight' WHERE agent_id=?",
+                (child_id,),
+            )
+
+        restarted = coordinator(tmp_path, runtime)
+        uncertain = await restarted.status(child_id)
+        assert uncertain["agent"]["status"] == "creation_uncertain"
+        assert uncertain["task"]["status"] == "creation_uncertain"
+        assert uncertain["agent"]["chat_id"] == "child-chat-1"
+        assert len(runtime.create_calls) == 1
+
+        assert (await restarted.sync_once())["write_count"] == 0
+        recovered = await restarted.status(child_id)
+        assert recovered["agent"]["status"] == "running"
+        assert recovered["task"]["status"] == "running"
+        assert len(runtime.create_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_send_idempotency_replay_precedes_terminal_target_validation(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        command = await service.send(
+            parent["agent_id"],
+            child_id,
+            "queued work",
+            idempotency_key="terminal-replay",
+        )
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='cancelled' WHERE command_id=?",
+                (command["command_id"],),
+            )
+            db.execute(
+                "UPDATE agents SET status='completed' WHERE agent_id=?",
+                (child_id,),
+            )
+            db.execute(
+                "UPDATE tasks SET status='completed',completed_at=1 WHERE agent_id=?",
+                (child_id,),
+            )
+
+        replay = await service.send(
+            parent["agent_id"],
+            child_id,
+            "different retry body",
+            idempotency_key="terminal-replay",
+        )
+        assert replay["command_id"] == command["command_id"]
+        assert replay["status"] == "cancelled"
+        assert replay["message"] == "queued work"
+
+    asyncio.run(run())
+
+
+def test_interrupt_supersedes_older_unsent_queue_instruction(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        runtime.snapshots["child-chat-1"] = terminal_snapshot(
+            "child-chat-1", running=True
+        )
+        queued = await service.send(
+            parent["agent_id"],
+            child_id,
+            "older queued work",
+            interrupt_policy="queue",
+            idempotency_key="older-queue",
+        )
+        interrupt = await service.send(
+            parent["agent_id"],
+            child_id,
+            "direct steering",
+            interrupt_policy="interrupt",
+            idempotency_key="direct-steering",
+        )
+
+        with service.repository.connect() as db:
+            older = dict(
+                db.execute(
+                    "SELECT status,last_error FROM commands WHERE command_id=?",
+                    (queued["command_id"],),
+                ).fetchone()
+            )
+        assert older == {
+            "status": "superseded",
+            "last_error": "superseded by direct interrupt steering",
+        }
+
+        result = await service.sync_once()
+        assert result["write_count"] == 2
+        assert runtime.cancel_calls == ["child-chat-1"]
+        assert runtime.continue_calls == [
+            ("child-chat-1", "direct steering", "a-child-chat-1")
+        ]
+        with service.repository.connect() as db:
+            delivered = db.execute(
+                "SELECT status FROM commands WHERE command_id=?",
+                (interrupt["command_id"],),
+            ).fetchone()[0]
+        assert delivered == "delivered"
+
+    asyncio.run(run())
+
+
+def test_reconciled_instruction_reopens_completed_target(tmp_path):
+    async def run():
+        runtime = FakeRuntime()
+        service, parent, child = await make_parent_and_child(tmp_path, runtime)
+        child_id = child["agent"]["agent_id"]
+        command = await service.send(
+            parent["agent_id"],
+            child_id,
+            "queued next turn",
+            idempotency_key="reconciled-next-turn",
+        )
+        with service.repository.transaction() as db:
+            db.execute(
+                "UPDATE commands SET status='delivery_uncertain',user_message_id=?,"
+                "parent_message_id=?,next_attempt_at=0 WHERE command_id=?",
+                ("persisted-next-turn", "a-child-chat-1", command["command_id"]),
+            )
+            db.execute(
+                "UPDATE agents SET status='completed' WHERE agent_id=?",
+                (child_id,),
+            )
+            db.execute(
+                "UPDATE tasks SET status='completed',completed_at=123 WHERE agent_id=?",
+                (child_id,),
+            )
+        snapshot = terminal_snapshot("child-chat-1")
+        snapshot["all_message_ids"] = ["persisted-next-turn"]
+        runtime.snapshots["child-chat-1"] = snapshot
+
+        result = await service.sync_once()
+        assert result["write_count"] == 1
+        assert runtime.continue_calls == []
+        status = await service.status(child_id)
+        assert status["agent"]["status"] == "waiting_assistant"
+        assert status["task"]["status"] == "waiting_assistant"
+        assert status["task"]["completed_at"] is None
+        assert status["mailbox"]["delivered"] == 1
 
     asyncio.run(run())
