@@ -23,7 +23,8 @@ COMMAND_PURPOSES = frozenset({
     "instruction", "answer", "question", "progress", "completion",
 })
 TASK_STATES = frozenset({
-    "creating_thread", "creation_in_flight", "running", "continuation_in_flight",
+    "creating_thread", "creation_in_flight", "creation_uncertain", "running",
+    "waiting_assistant", "continuation_in_flight",
     "continuation_uncertain", "waiting_after_continue", "completed", "failed",
     "cancelled", "unknown", "waiting_for_parent",
 })
@@ -36,7 +37,7 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
 class DurableLedger:
     """Transactional repository for actors, tasks, commands and cursors."""
 
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
 
     def __init__(self, path: Path):
         self.path = Path(path).expanduser().resolve()
@@ -68,6 +69,7 @@ class DurableLedger:
                     title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
                     notification_policy TEXT NOT NULL, context_cursor TEXT, current_node TEXT,
                     last_progress_at REAL, progress_signature TEXT, last_error TEXT NOT NULL DEFAULT '',
+                    creation_request_id TEXT, creation_user_message_id TEXT,
                     spawn_idempotency_key TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS agents_parent_spawn_key
@@ -129,6 +131,8 @@ class DurableLedger:
                 ("agents", "last_progress_at", "REAL"),
                 ("agents", "working_directory", "TEXT"),
                 ("agents", "progress_signature", "TEXT"),
+                ("agents", "creation_request_id", "TEXT"),
+                ("agents", "creation_user_message_id", "TEXT"),
             ):
                 self._ensure_column(db, table, column, definition)
             # Rows created before schema v6 had no purpose column. Notification
