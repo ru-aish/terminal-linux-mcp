@@ -83,6 +83,34 @@ def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
     assert not (project / "blocked.txt").exists()
 
 
+def test_bounded_command_capture_spills_large_output(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    monkeypatch.setattr(terminal_mcp, "CAPTURE_MEMORY_CHARS", 128)
+    session = "bounded-output"
+    run(terminal_mcp.project_context(session_id=session, cwd=str(project)))
+    result = run(terminal_mcp.run_command(
+        "python -c \"print('x' * 4096)\"",
+        session_id=session,
+        cwd=str(project),
+        max_output_chars=96,
+    ))
+    assert "Full Output Logs:" in result
+    log = next((line for line in result.splitlines() if line.startswith(str(terminal_mcp.LOG_DIR))), None)
+    assert log and Path(log).read_text(encoding="utf-8").count("x") == 4096
+
+
+def test_workload_scope_prefix_is_optional_and_sanitized(monkeypatch):
+    monkeypatch.setattr(terminal_mcp, "WORKLOAD_ISOLATION", "auto")
+    monkeypatch.setattr(terminal_mcp.shutil, "which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
+    args, unit = terminal_mcp._systemd_workload_prefix("a / b", "request:1")
+    assert unit == "mcp-workload-a-b-request-1.scope"
+    assert args[:4] == ["systemd-run", "--user", "--scope", "--quiet"]
+    assert "--pipe" not in args
+
+
 def test_local_skills_list_read_and_search(tmp_path, monkeypatch):
     isolated_home(tmp_path, monkeypatch)
     (tmp_path / ".git").mkdir()
