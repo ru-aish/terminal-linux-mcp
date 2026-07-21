@@ -48,8 +48,10 @@ The normal-chat client can take substantially longer than CDP to become usable
 while plugins and MCP status initialize. `CHAT_RUNTIME_HEALTH_TIMEOUT` therefore
 controls the timeout for one complete renderer/client health probe independently
 from `CHAT_RUNTIME_PROBE_INTERVAL`. Keep it long enough for a cold start; the
-default is 90 seconds. Probes remain sequential, so slow discovery cannot create
-an overlapping retry storm.
+default is 90 seconds. Set `MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS` to
+the same value so direct watchdog inspections do not time out earlier than the
+managed-runtime health probe. Probes remain sequential, so slow discovery cannot
+create an overlapping retry storm.
 
 The gateway has a separate global `runtime` circuit. Infrastructure failures do
 not spend an agent's retry budget and do not terminalize the agent. The original
