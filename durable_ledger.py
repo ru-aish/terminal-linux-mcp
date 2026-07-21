@@ -15,19 +15,58 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-COMMAND_STATES = frozenset({
-    "queued", "waiting_after_cancel", "cancel_in_flight", "delivery_in_flight",
-    "delivery_uncertain", "delivered", "acknowledged", "cancelled", "superseded",
-})
-COMMAND_PURPOSES = frozenset({
-    "instruction", "answer", "question", "progress", "completion",
-})
-TASK_STATES = frozenset({
-    "creating_thread", "creation_in_flight", "creation_uncertain", "running",
-    "waiting_assistant", "continuation_in_flight",
-    "continuation_uncertain", "waiting_after_continue", "completed", "failed",
-    "cancelled", "unknown", "waiting_for_parent",
-})
+COMMAND_STATES = frozenset(
+    {
+        "queued",
+        "waiting_after_cancel",
+        "cancel_in_flight",
+        "delivery_in_flight",
+        "delivery_uncertain",
+        "delivered",
+        "acknowledged",
+        "cancelled",
+        "superseded",
+    }
+)
+COMMAND_PURPOSES = frozenset(
+    {
+        "instruction",
+        "answer",
+        "question",
+        "progress",
+        "completion",
+        "wakeup",
+        "after_completion",
+    }
+)
+AUTOMATION_KINDS = frozenset({"wakeup", "after_completion"})
+AUTOMATION_STATES = frozenset(
+    {
+        "scheduled",
+        "waiting",
+        "queued",
+        "delivered",
+        "cancelled",
+        "failed",
+    }
+)
+TASK_STATES = frozenset(
+    {
+        "creating_thread",
+        "creation_in_flight",
+        "creation_uncertain",
+        "running",
+        "waiting_assistant",
+        "continuation_in_flight",
+        "continuation_uncertain",
+        "waiting_after_continue",
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "waiting_for_parent",
+    }
+)
 
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -37,7 +76,7 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
 class DurableLedger:
     """Transactional repository for actors, tasks, commands and cursors."""
 
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
 
     def __init__(self, path: Path):
         self.path = Path(path).expanduser().resolve()
@@ -114,6 +153,24 @@ class DurableLedger:
                     notification_policy TEXT NOT NULL, last_acked_event_seq INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL, PRIMARY KEY(parent_agent_id, child_agent_id)
                 );
+                CREATE TABLE IF NOT EXISTS agent_automations(
+                    automation_id TEXT PRIMARY KEY,
+                    orchestration_id TEXT NOT NULL REFERENCES orchestrations(orchestration_id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    source_agent_id TEXT REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    target_agent_id TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                    message TEXT NOT NULL, completion_marker TEXT, due_at REAL,
+                    status TEXT NOT NULL, command_id TEXT REFERENCES commands(command_id) ON DELETE SET NULL,
+                    idempotency_key TEXT, triggered_at REAL, completed_at REAL,
+                    last_error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS agent_automations_target_key
+                    ON agent_automations(target_agent_id, kind, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS agent_automations_due
+                    ON agent_automations(status, due_at);
+                CREATE INDEX IF NOT EXISTS agent_automations_source
+                    ON agent_automations(source_agent_id, status);
                 CREATE TABLE IF NOT EXISTS watchdog_tasks(
                     conversation_id TEXT PRIMARY KEY,
                     state_json TEXT NOT NULL,
@@ -152,7 +209,7 @@ class DurableLedger:
             # mistaken for parent instructions after migration.
             db.execute(
                 "UPDATE commands SET purpose=CASE "
-                "WHEN message LIKE '%\"kind\":\"completed\"%' "
+                'WHEN message LIKE \'%"kind":"completed"%\' '
                 "OR message LIKE '%\"kind\":\"completion\"%' THEN 'completion' "
                 "ELSE 'progress' END "
                 "WHERE ack_event_seq IS NOT NULL AND purpose='instruction'"
@@ -164,7 +221,9 @@ class DurableLedger:
             )
 
     @staticmethod
-    def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    def _ensure_column(
+        db: sqlite3.Connection, table: str, column: str, definition: str
+    ) -> None:
         columns = {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -184,21 +243,37 @@ class DurableLedger:
 
     def agent(self, agent_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
-            return _row(db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone())
+            return _row(
+                db.execute(
+                    "SELECT * FROM agents WHERE agent_id=?", (agent_id,)
+                ).fetchone()
+            )
 
     def agent_by_chat(self, chat_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
-            return _row(db.execute("SELECT * FROM agents WHERE chat_id=?", (chat_id,)).fetchone())
+            return _row(
+                db.execute(
+                    "SELECT * FROM agents WHERE chat_id=?", (chat_id,)
+                ).fetchone()
+            )
 
     def task_for_agent(self, agent_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
-            return _row(db.execute("SELECT * FROM tasks WHERE agent_id=?", (agent_id,)).fetchone())
+            return _row(
+                db.execute(
+                    "SELECT * FROM tasks WHERE agent_id=?", (agent_id,)
+                ).fetchone()
+            )
 
     def children(self, parent_agent_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
-            return [dict(row) for row in db.execute(
-                "SELECT * FROM agents WHERE parent_agent_id=? ORDER BY created_at,agent_id", (parent_agent_id,)
-            )]
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT * FROM agents WHERE parent_agent_id=? ORDER BY created_at,agent_id",
+                    (parent_agent_id,),
+                )
+            ]
 
     def active_agents(
         self,
@@ -265,6 +340,52 @@ class DurableLedger:
             query += "ORDER BY created_at,sequence_no,command_id"
             return [dict(row) for row in db.execute(query, params)]
 
+    def automation(self, automation_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            return _row(
+                db.execute(
+                    "SELECT * FROM agent_automations WHERE automation_id=?",
+                    (automation_id,),
+                ).fetchone()
+            )
+
+    def automations(
+        self,
+        *,
+        agent_id: str | None = None,
+        include_terminal: bool = True,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM agent_automations"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if agent_id:
+            clauses.append("(source_agent_id=? OR target_agent_id=?)")
+            params.extend((agent_id, agent_id))
+        if not include_terminal:
+            clauses.append("status NOT IN ('delivered','cancelled','failed')")
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,due_at,created_at,automation_id"
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(query, tuple(params))]
+
+    def next_automation_due_at(self) -> float | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT MIN(due_at) FROM ("
+                "  SELECT due_at FROM agent_automations "
+                "  WHERE kind='wakeup' AND status='scheduled' AND due_at IS NOT NULL "
+                "  UNION ALL "
+                "  SELECT CASE WHEN COALESCE(c.next_attempt_at,0)<=0 "
+                "              THEN a.triggered_at ELSE c.next_attempt_at END "
+                "  FROM agent_automations a JOIN commands c ON c.command_id=a.command_id "
+                "  WHERE a.status='queued' AND c.status IN ('queued','waiting_after_cancel')"
+                ")"
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0])
+
     def next_due_at(self, *, now: float | None = None) -> float | None:
         current = time.time() if now is None else float(now)
         with self.connect() as db:
@@ -308,11 +429,15 @@ class DurableLedger:
     def events_after(self, agent_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         with self.connect() as db:
             result = []
-            for row in db.execute("SELECT * FROM events WHERE agent_id=? AND event_seq>? ORDER BY event_seq", (agent_id, after_seq)):
+            for row in db.execute(
+                "SELECT * FROM events WHERE agent_id=? AND event_seq>? ORDER BY event_seq",
+                (agent_id, after_seq),
+            ):
                 item = dict(row)
                 item["payload"] = json.loads(item.pop("payload_json"))
                 result.append(item)
             return result
+
     def watchdog_state(self, conversation_id: str) -> dict[str, Any]:
         with self.connect() as db:
             row = db.execute(
@@ -359,4 +484,11 @@ class DurableLedger:
         return normalized
 
 
-__all__ = ["COMMAND_PURPOSES", "COMMAND_STATES", "TASK_STATES", "DurableLedger"]
+__all__ = [
+    "AUTOMATION_KINDS",
+    "AUTOMATION_STATES",
+    "COMMAND_PURPOSES",
+    "COMMAND_STATES",
+    "TASK_STATES",
+    "DurableLedger",
+]

@@ -52,17 +52,30 @@ class CodexRendererBackend:
         stream_start_timeout: float = 30.0,
         cdp_timeout: float = 45.0,
         webview_port: int = 5175,
+        thinking_effort: str = "extended",
+        require_high_reasoning: bool = True,
     ) -> None:
         self.cdp_endpoint = cdp_endpoint.rstrip("/")
         self.model_slug = model_slug.strip()
         self.stream_start_timeout = stream_start_timeout
         self.cdp_timeout = cdp_timeout
         self.webview_port = int(webview_port)
+        self.thinking_effort = thinking_effort.strip()
+        self.require_high_reasoning = bool(require_high_reasoning)
         self._lock = Lock()
         if not self.model_slug:
             raise ValueError("model_slug cannot be empty")
         if not 1 <= self.webview_port <= 65535:
             raise ValueError("webview_port must be between 1 and 65535")
+        if self.require_high_reasoning:
+            if not self.thinking_effort:
+                raise ValueError(
+                    "thinking_effort is required when high reasoning is mandatory"
+                )
+            if self.thinking_effort.casefold() not in {"high", "extended"}:
+                raise ValueError(
+                    "thinking_effort must be high or extended when high reasoning is mandatory"
+                )
 
     @classmethod
     def from_environment(cls) -> "CodexRendererBackend":
@@ -76,6 +89,17 @@ class CodexRendererBackend:
             ),
             cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
             webview_port=int(os.environ.get("CHAT_GATEWAY_WEBVIEW_PORT", "5175")),
+            thinking_effort=os.environ.get(
+                "CHAT_GATEWAY_THINKING_EFFORT",
+                os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
+            ),
+            require_high_reasoning=os.environ.get(
+                "CHAT_GATEWAY_REQUIRE_HIGH_REASONING",
+                os.environ.get("MCP_CHAT_WATCHDOG_REQUIRE_HIGH", "1"),
+            )
+            .strip()
+            .lower()
+            not in {"0", "false", "no", "off"},
         )
 
     async def health(self) -> Mapping[str, Any]:
@@ -131,6 +155,8 @@ class CodexRendererBackend:
             timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,
             timezone_offset_min:new Date().getTimezoneOffset()
           }};
+          const thinkingEffort = {json.dumps(self.thinking_effort)};
+          if (thinkingEffort) request.thinking_effort = thinkingEffort;
           if (projectId) {{
             request.gizmo_id = projectId;
             request.conversation_mode = {{kind:'gizmo_interaction',gizmo_id:projectId}};
@@ -245,6 +271,8 @@ class CodexRendererBackend:
             timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,
             timezone_offset_min:new Date().getTimezoneOffset()
           }};
+          const thinkingEffort = {json.dumps(self.thinking_effort)};
+          if (thinkingEffort) request.thinking_effort = thinkingEffort;
           let handle = null;
           const started = await new Promise((resolve,reject) => {{
             let settled=false;

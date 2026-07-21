@@ -13,6 +13,12 @@ _TERMINAL_CANCELLED = {"cancelled", "canceled", "aborted"}
 _IN_PROGRESS = {"in_progress", "running", "streaming", "pending"}
 
 
+def _marker_present(text: str, marker: str) -> bool:
+    return bool(marker) and any(
+        line.strip() == marker for line in str(text or "").splitlines()
+    )
+
+
 @dataclass(frozen=True)
 class Reduction:
     state: AgentState
@@ -62,7 +68,7 @@ def reduce_snapshot(
 
     last_assistant = assistant_turns[-1]
     status = last_assistant.status.strip().lower()
-    marker_present = completion_marker in (last_assistant.text or "")
+    marker_present = _marker_present(last_assistant.text or "", completion_marker)
     later_in_progress = _has_later_in_progress(snapshot, last_assistant)
 
     if status in _TERMINAL_FAILURE and not later_in_progress:

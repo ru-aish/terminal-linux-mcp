@@ -23,8 +23,17 @@ class DashboardCoordinator:
                 "active": 2,
                 "terminal": 1,
                 "queued_operations": 1,
+                "active_automations": 2,
+                "scheduled_wakeups": 1,
+                "completion_triggers": 1,
             },
             "next_eligible_at": 1020.0,
+            "next_wakeup_at": 1010.0,
+            "reasoning": {
+                "model": "gpt-5.6-terra",
+                "thinking_effort": "extended",
+                "require_high_reasoning": True,
+            },
             "circuits": [
                 {
                     "scope": "conversation",
@@ -55,6 +64,9 @@ class DashboardCoordinator:
                     "gateway_state": "UNKNOWN",
                     "task": None,
                     "pending_mailbox": 0,
+                    "depth": 0,
+                    "path": ["agent-root"],
+                    "children_count": 1,
                 },
                 {
                     "agent_id": "agent-child",
@@ -64,11 +76,46 @@ class DashboardCoordinator:
                     "gateway_state": "RUNNING",
                     "task": {"status": "running"},
                     "pending_mailbox": 1,
+                    "depth": 1,
+                    "path": ["agent-root", "agent-child"],
+                    "children_count": 0,
+                },
+            ],
+            "automations": [
+                {
+                    "automation_id": "auto-wake",
+                    "kind": "wakeup",
+                    "target_agent_id": "agent-root",
+                    "target_title": "Root",
+                    "message": "Review children",
+                    "due_at": 1010.0,
+                    "status": "scheduled",
+                },
+                {
+                    "automation_id": "auto-gate",
+                    "kind": "after_completion",
+                    "source_agent_id": "agent-child",
+                    "source_title": "Child",
+                    "target_agent_id": "agent-root",
+                    "target_title": "Root",
+                    "message": "Synthesize",
+                    "completion_marker": "DONE",
+                    "status": "waiting",
                 },
             ],
             "request_summary": [],
             "requests": [],
         }
+
+
+class DashboardService:
+    state = {
+        "enabled": True,
+        "running": True,
+        "last_sync_at": 999.0,
+        "last_result": {"physical_requests": 1},
+        "last_error": "",
+    }
 
 
 def make_store(tmp_path: Path, monkeypatch) -> GPTThreadStore:
@@ -88,16 +135,17 @@ def test_agent_dashboard_page_api_assets_and_auth(tmp_path, monkeypatch):
         app,
         make_store(tmp_path, monkeypatch),
         agent_coordinator=DashboardCoordinator(),
+        agent_service=DashboardService(),
     )
     with TestClient(app) as client:
         page = client.get("/dashboard/agents")
         assert page.status_code == 200
-        assert "Every request has a place in line" in page.text
+        assert "See who is working, sleeping, and next in line" in page.text
         assert "width=device-width" in page.text
         script = client.get("/dashboard/assets/agents.js").text
         assert "/dashboard/agents/api" in script
-        assert "requestSummary" in script
-        assert ' : "idle"' in script
+        assert "renderAutomations" in script
+        assert "next_wakeup_at" in script
         css = client.get("/dashboard/assets/agents.css")
         assert css.status_code == 200
         assert "min-width: 320px" in css.text
@@ -105,6 +153,9 @@ def test_agent_dashboard_page_api_assets_and_auth(tmp_path, monkeypatch):
         payload = client.get("/dashboard/agents/api").json()
         assert payload["capacity"]["maximum_active_children"] == 5
         assert payload["operations"][0]["type"] == "INSPECT"
+        assert payload["sync_service"]["running"] is True
+        assert payload["reasoning"]["thinking_effort"] == "extended"
+        assert payload["automations"][1]["completion_marker"] == "DONE"
 
     monkeypatch.setenv("MCP_DASHBOARD_TOKEN", "agent-secret")
     protected = Starlette()
@@ -112,6 +163,7 @@ def test_agent_dashboard_page_api_assets_and_auth(tmp_path, monkeypatch):
         protected,
         make_store(tmp_path / "protected", monkeypatch),
         agent_coordinator=DashboardCoordinator(),
+        agent_service=DashboardService(),
     )
     with TestClient(protected) as client:
         assert client.get("/dashboard/agents").status_code == 401

@@ -176,7 +176,7 @@ def test_ledger_owns_schema_and_evidence_columns(tmp_path):
             "gateway_control_operation_id",
         } <= agent_columns
         assert "gateway_operation_id" in columns
-        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "10"
+        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "11"
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
@@ -355,3 +355,26 @@ def test_gateway_transport_failure_after_submission_is_sent_unconfirmed():
     assert result.state is DeliveryState.SENT_UNCONFIRMED
     assert result.message == "message"
     assert len(client.continue_calls) == 1
+
+
+def test_domain_reducer_rejects_marker_embedded_in_other_text():
+    marker = "DONE"
+    snapshot = {
+        "canonical": True,
+        "state_verified": True,
+        "current_node": "assistant",
+        "running": False,
+        "active_stream": False,
+        "turns": [
+            {
+                "key": "assistant",
+                "role": "assistant",
+                "status": "finished_successfully",
+                "end_turn": True,
+                "text": "The word DONE appears inside a sentence.",
+            }
+        ],
+    }
+    reduction = reduce_snapshot({"completion_marker": marker}, snapshot)
+    assert reduction.state is ReducedState.STOPPED_INCOMPLETE
+    assert reduction.actions == (ActionType.SEND_CONTINUATION,)

@@ -32,6 +32,12 @@ class ActionType(str, Enum):
     NO_ACTION = "no_action"
 
 
+def _marker_present(text: str, marker: str) -> bool:
+    return bool(marker) and any(
+        line.strip() == marker for line in str(text or "").splitlines()
+    )
+
+
 @dataclass(frozen=True)
 class Reduction:
     state: ReducedState
@@ -111,7 +117,7 @@ def reduce_snapshot(
 
     marker = str(task.get("completion_marker") or "")
     text = str(latest.get("text") or "")
-    exact_marker = bool(marker and any(line.strip() == marker for line in text.splitlines()))
+    exact_marker = _marker_present(text, marker)
     if exact_marker and status == "finished_successfully" and end_turn is True:
         actions = [ActionType.MARK_COMPLETED]
         if _has(commands, "completion", "completed"):

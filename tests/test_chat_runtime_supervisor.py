@@ -134,3 +134,66 @@ def test_supervisor_restarts_whole_generation_after_health_threshold(
         assert await asyncio.wait_for(task, timeout=5) == 0
 
     asyncio.run(scenario())
+
+
+def test_gateway_create_and_continue_send_configured_high_reasoning(
+    monkeypatch,
+) -> None:
+    backend = codex_renderer.CodexRendererBackend(
+        model_slug="gpt-5.6-terra",
+        thinking_effort="extended",
+        require_high_reasoning=True,
+    )
+    expressions: list[str] = []
+
+    def evaluate(expression: str, *, timeout=None):
+        expressions.append(expression)
+        if "title_requested" in expression:
+            return {
+                "accepted": True,
+                "conversation_id": "conversation-1",
+                "message_id": "message-1",
+                "running": True,
+            }
+        return {
+            "accepted": True,
+            "conversation_id": "conversation-1",
+            "message_id": "message-2",
+            "running": True,
+        }
+
+    monkeypatch.setattr(backend, "_evaluate", evaluate)
+    asyncio.run(
+        backend.create_thread(
+            project_id="",
+            prompt="Create with high reasoning.",
+            title="Reasoning",
+            idempotency_key="create-reasoning",
+        )
+    )
+    asyncio.run(
+        backend.continue_thread(
+            conversation_id="conversation-1",
+            message="Continue with high reasoning.",
+            idempotency_key="continue-reasoning",
+        )
+    )
+    assert len(expressions) == 2
+    for expression in expressions:
+        assert 'const thinkingEffort = "extended"' in expression
+        assert "request.thinking_effort = thinkingEffort" in expression
+        assert "client.models()" not in expression
+
+
+def test_gateway_rejects_required_reasoning_without_an_effort() -> None:
+    with pytest.raises(ValueError, match="thinking_effort is required"):
+        codex_renderer.CodexRendererBackend(
+            thinking_effort="", require_high_reasoning=True
+        )
+
+
+def test_gateway_rejects_non_high_effort_when_high_reasoning_is_required() -> None:
+    with pytest.raises(ValueError, match="must be high or extended"):
+        codex_renderer.CodexRendererBackend(
+            thinking_effort="medium", require_high_reasoning=True
+        )

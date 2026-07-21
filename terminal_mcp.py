@@ -174,6 +174,15 @@ def get_chat_gateway() -> ChatGateway:
             ),
             cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
             webview_port=_chat_runtime_webview_port(),
+            thinking_effort=os.environ.get(
+                "CHAT_GATEWAY_THINKING_EFFORT",
+                os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
+            ),
+            require_high_reasoning=os.environ.get(
+                "CHAT_GATEWAY_REQUIRE_HIGH_REASONING",
+                os.environ.get("MCP_CHAT_WATCHDOG_REQUIRE_HIGH", "1"),
+            ).strip().lower()
+            not in {"0", "false", "no", "off"},
         )
         _CHAT_GATEWAY = ChatGateway(
             SQLiteLedger(CHAT_GATEWAY_DB_PATH),
@@ -4002,6 +4011,99 @@ async def agent_send(
 
 
 @mcp.tool()
+async def agent_schedule_wakeup(
+    thread_id: str,
+    wake_at: str,
+    prompt: str = "",
+    idempotency_key: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Schedule one durable wake-up prompt for an agent or ChatGPT thread.
+
+    ``wake_at`` accepts Unix seconds or an ISO-8601 timestamp with an explicit
+    timezone. When due, the backend queues the prompt; provider delivery still
+    obeys the shared gateway rate limits and circuit state.
+    """
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        result = await get_chat_agent_coordinator().schedule_wakeup(
+            thread_id,
+            wake_at,
+            prompt=prompt,
+            idempotency_key=idempotency_key or None,
+        )
+        get_chat_agent_service().wake()
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_queue_after_completion(
+    source_thread_id: str,
+    target_thread_id: str,
+    prompt: str,
+    completion_marker: str = "",
+    idempotency_key: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Queue a prompt only after exact canonical completion-marker evidence.
+
+    The source and target may be durable agent IDs or ChatGPT conversation IDs.
+    An empty marker uses the source task's configured completion marker. A
+    terminal response without the exact marker does not activate the prompt.
+    """
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        result = await get_chat_agent_coordinator().queue_after_completion(
+            source_thread_id,
+            target_thread_id,
+            prompt,
+            completion_marker=completion_marker,
+            idempotency_key=idempotency_key or None,
+        )
+        get_chat_agent_service().wake()
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def agent_automation(
+    action: str = "list",
+    automation_id: str = "",
+    thread_id: str = "",
+    include_terminal: bool = True,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """List or cancel durable agent wake-up and completion automations."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        normalized = action.strip().lower()
+        coordinator = get_chat_agent_coordinator()
+        if normalized == "list":
+            result = await coordinator.automations(
+                thread_id=thread_id, include_terminal=include_terminal
+            )
+        elif normalized == "cancel":
+            if not automation_id.strip():
+                raise ValueError("automation_id is required for cancel")
+            result = await coordinator.cancel_automation(automation_id)
+            get_chat_agent_service().wake()
+        else:
+            raise ValueError("action must be list or cancel")
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
 async def agent_wait(
     agent_id: str,
     after_event_seq: int = 0,
@@ -4128,7 +4230,9 @@ PUBLIC_TOOL_ORDER = (
     "chat_runtime_logs", "chat_runtime_circuit",
     "agent_projects_list", "agent_project_get", "agent_project_threads",
     "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
-    "agent_tail", "agent_send", "agent_wait", "agent_sync", "agent_children",
+    "agent_tail", "agent_send", "agent_schedule_wakeup",
+    "agent_queue_after_completion", "agent_automation",
+    "agent_wait", "agent_sync", "agent_children",
     "agent_subscribe", "agent_ack", "agent_cancel",
 )
 mcp._tool_manager._tools = {name: mcp._tool_manager._tools[name] for name in PUBLIC_TOOL_ORDER}
@@ -4154,11 +4258,16 @@ def main() -> None:
             runtime_ensure=runtime_controller.ensure_ready,
         )
         set_chat_agent_runtime_ensure(runtime_controller.ensure_ready)
+        agent_service = get_chat_agent_service()
         install_usage_dashboard(
-            app, GPT_STORE, chat_watchdog, get_chat_agent_coordinator()
+            app,
+            GPT_STORE,
+            chat_watchdog,
+            get_chat_agent_coordinator(),
+            agent_service,
         )
         install_chat_watchdog_lifespan(app, chat_watchdog)
-        install_chat_agent_lifespan(app, get_chat_agent_service())
+        install_chat_agent_lifespan(app, agent_service)
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
         if bearer_token:
             app.add_middleware(BearerAuthMiddleware, token=bearer_token)

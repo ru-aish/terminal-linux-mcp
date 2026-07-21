@@ -8,8 +8,9 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Protocol
+from typing import Any, AsyncContextManager, AsyncIterator, Callable, Protocol
 
 from conversation_gateway import ConversationGateway, DeliveryResult, DeliveryState
 from durable_ledger import COMMAND_PURPOSES, DurableLedger
@@ -47,6 +48,30 @@ def _safe_error(error: BaseException) -> str:
         if index >= 0:
             text = text[:index] + f"{needle}=[redacted]"
     return text[:500]
+
+
+def _parse_wake_at(value: str | float | int) -> float:
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    else:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("wake_at is required")
+        try:
+            parsed = float(text)
+        except ValueError:
+            try:
+                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(
+                    "wake_at must be a Unix timestamp or ISO-8601 time with timezone"
+                ) from exc
+            if moment.tzinfo is None:
+                raise ValueError("wake_at ISO-8601 values must include a timezone")
+            parsed = moment.timestamp()
+    if not 0 < parsed < 32_503_680_000:
+        raise ValueError("wake_at is outside the supported timestamp range")
+    return parsed
 
 
 class AgentRuntime(Protocol):
@@ -272,7 +297,8 @@ class ChatAgentCoordinator:
                 )
 
     def next_due_at(self) -> float | None:
-        return self.repository.next_due_at()
+        value = self.repository.next_due_at()
+        return float(value) if value is not None else None
 
     def has_pending_work(self) -> bool:
         due_at = self.next_due_at()
@@ -1104,6 +1130,230 @@ class ChatAgentCoordinator:
                     "SELECT * FROM commands WHERE command_id=?", (command_id,)
                 ).fetchone()
             )
+
+    def _resolve_agent_reference(self, value: str) -> dict[str, Any]:
+        reference = str(value or "").strip()
+        if not reference:
+            raise ValueError("thread_id is required")
+        agent = self.repository.agent(reference)
+        if agent is None:
+            agent = self.repository.agent_by_chat(reference)
+        if agent is None:
+            raise ValueError("agent/thread was not found")
+        return dict(agent)
+
+    @staticmethod
+    def _public_automation(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: row.get(key)
+            for key in (
+                "automation_id",
+                "orchestration_id",
+                "kind",
+                "source_agent_id",
+                "target_agent_id",
+                "message",
+                "completion_marker",
+                "due_at",
+                "status",
+                "command_id",
+                "triggered_at",
+                "completed_at",
+                "last_error",
+                "created_at",
+                "updated_at",
+            )
+        }
+
+    async def schedule_wakeup(
+        self,
+        thread_id: str,
+        wake_at: str | float | int,
+        *,
+        prompt: str = "",
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        target = self._resolve_agent_reference(thread_id)
+        if str(target.get("status") or "") in {"failed", "cancelled"}:
+            raise ValueError("failed or cancelled agents cannot be scheduled")
+        message = prompt.strip() or (
+            "Wake up now. Inspect your durable objective, managed subagents, queued "
+            "messages, timers, and synchronization state, then continue the work that "
+            "is actually due."
+        )
+        if len(message) > 100_000:
+            raise ValueError("prompt is too large")
+        due_at = _parse_wake_at(wake_at)
+        key = idempotency_key.strip() if idempotency_key else None
+        if key:
+            with self.repository.connect() as db:
+                existing = db.execute(
+                    "SELECT * FROM agent_automations WHERE target_agent_id=? "
+                    "AND kind='wakeup' AND idempotency_key=?",
+                    (target["agent_id"], key),
+                ).fetchone()
+            if existing:
+                return self._public_automation(dict(existing))
+        now = _now()
+        automation_id = _id("auto")
+        with self.repository.transaction() as db:
+            if key:
+                existing = db.execute(
+                    "SELECT * FROM agent_automations WHERE target_agent_id=? "
+                    "AND kind='wakeup' AND idempotency_key=?",
+                    (target["agent_id"], key),
+                ).fetchone()
+                if existing:
+                    return self._public_automation(dict(existing))
+            db.execute(
+                "INSERT INTO agent_automations("
+                "automation_id,orchestration_id,kind,target_agent_id,message,due_at,"
+                "status,idempotency_key,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    automation_id,
+                    target["orchestration_id"],
+                    "wakeup",
+                    target["agent_id"],
+                    message,
+                    due_at,
+                    "scheduled",
+                    key,
+                    now,
+                    now,
+                ),
+            )
+        row = self.repository.automation(automation_id)
+        assert row is not None
+        return self._public_automation(row)
+
+    async def queue_after_completion(
+        self,
+        source_thread_id: str,
+        target_thread_id: str,
+        prompt: str,
+        *,
+        completion_marker: str = "",
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        source = self._resolve_agent_reference(source_thread_id)
+        target = self._resolve_agent_reference(target_thread_id)
+        if source["orchestration_id"] != target["orchestration_id"]:
+            raise ValueError("source and target agents belong to different orchestrations")
+        if str(target.get("status") or "") in {"failed", "cancelled"}:
+            raise ValueError("failed or cancelled agents cannot receive queued prompts")
+        message = prompt.strip()
+        if not message:
+            raise ValueError("prompt is required")
+        if len(message) > 100_000:
+            raise ValueError("prompt is too large")
+        source_task = self.repository.task_for_agent(str(source["agent_id"]))
+        marker = completion_marker.strip() or str(
+            (source_task or {}).get("completion_marker")
+            or DEFAULT_AGENT_COMPLETION_MARKER
+        ).strip()
+        if not marker:
+            raise ValueError("completion_marker is required for this source thread")
+        if "\n" in marker or "\r" in marker:
+            raise ValueError("completion_marker must be a single line")
+        if len(marker) > 2_000:
+            raise ValueError("completion_marker is too large")
+        key = idempotency_key.strip() if idempotency_key else None
+        if key:
+            with self.repository.connect() as db:
+                existing = db.execute(
+                    "SELECT * FROM agent_automations WHERE target_agent_id=? "
+                    "AND kind='after_completion' AND idempotency_key=?",
+                    (target["agent_id"], key),
+                ).fetchone()
+            if existing:
+                return self._public_automation(dict(existing))
+        now = _now()
+        automation_id = _id("auto")
+        with self.repository.transaction() as db:
+            if key:
+                existing = db.execute(
+                    "SELECT * FROM agent_automations WHERE target_agent_id=? "
+                    "AND kind='after_completion' AND idempotency_key=?",
+                    (target["agent_id"], key),
+                ).fetchone()
+                if existing:
+                    return self._public_automation(dict(existing))
+            db.execute(
+                "INSERT INTO agent_automations("
+                "automation_id,orchestration_id,kind,source_agent_id,target_agent_id,"
+                "message,completion_marker,status,idempotency_key,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    automation_id,
+                    source["orchestration_id"],
+                    "after_completion",
+                    source["agent_id"],
+                    target["agent_id"],
+                    message,
+                    marker,
+                    "waiting",
+                    key,
+                    now,
+                    now,
+                ),
+            )
+        row = self.repository.automation(automation_id)
+        assert row is not None
+        return self._public_automation(row)
+
+    async def automations(
+        self,
+        *,
+        thread_id: str = "",
+        include_terminal: bool = True,
+    ) -> dict[str, Any]:
+        agent_id = ""
+        if thread_id.strip():
+            agent_id = str(self._resolve_agent_reference(thread_id)["agent_id"])
+        rows = self.repository.automations(
+            agent_id=agent_id or None, include_terminal=include_terminal
+        )
+        return {
+            "agent_id": agent_id or None,
+            "automations": [self._public_automation(row) for row in rows],
+        }
+
+    async def cancel_automation(self, automation_id: str) -> dict[str, Any]:
+        row = self.repository.automation(automation_id.strip())
+        if row is None:
+            raise ValueError("automation was not found")
+        if row["status"] in {"delivered", "cancelled", "failed"}:
+            return self._public_automation(row)
+        command_id = str(row.get("command_id") or "")
+        now = _now()
+        with self.repository.transaction() as db:
+            if command_id:
+                command = db.execute(
+                    "SELECT status FROM commands WHERE command_id=?", (command_id,)
+                ).fetchone()
+                command_status = str(command["status"] or "") if command else ""
+                if command_status in {
+                    "delivery_in_flight",
+                    "delivery_uncertain",
+                    "cancel_in_flight",
+                }:
+                    raise ValueError(
+                        "automation delivery is already in flight and cannot be cancelled safely"
+                    )
+                if command_status in {"queued", "waiting_after_cancel"}:
+                    db.execute(
+                        "UPDATE commands SET status='cancelled',last_error=? WHERE command_id=?",
+                        ("automation cancelled before delivery", command_id),
+                    )
+            db.execute(
+                "UPDATE agent_automations SET status='cancelled',completed_at=?,"
+                "updated_at=?,last_error='' WHERE automation_id=?",
+                (now, now, row["automation_id"]),
+            )
+        updated = self.repository.automation(str(row["automation_id"]))
+        assert updated is not None
+        return self._public_automation(updated)
 
     async def sync_once(self, *, force: bool = True) -> dict[str, Any]:
         if self._lock.locked():
@@ -2345,7 +2595,7 @@ class ChatAgentCoordinator:
             raise ValueError("agent was not found")
         if not agent.get("chat_id"):
             raise ValueError("agent does not have a ChatGPT conversation yet")
-        return agent
+        return dict(agent)
 
     @staticmethod
     def _public_agent(agent: dict[str, Any]) -> dict[str, Any]:
@@ -2443,10 +2693,18 @@ class ChatAgentService:
         return result
 
     def _next_wait_seconds(self) -> float:
+        now = _now()
         due_at = self.coordinator.next_due_at()
-        if due_at is None:
-            return self.interval_seconds
-        return min(self.interval_seconds, max(30.0, due_at - _now()))
+        regular_wait = (
+            self.interval_seconds
+            if due_at is None
+            else min(self.interval_seconds, max(30.0, due_at - now))
+        )
+        timer_getter = getattr(self.coordinator, "next_wakeup_at", None)
+        timer_due = timer_getter() if callable(timer_getter) else None
+        if timer_due is None:
+            return regular_wait
+        return min(regular_wait, max(1.0, float(timer_due) - now))
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -2472,7 +2730,7 @@ def install_chat_agent_lifespan(app: Any, service: ChatAgentService) -> None:
     original = app.router.lifespan_context
 
     @contextlib.asynccontextmanager
-    async def combined(application: Any):
+    async def combined(application: Any) -> AsyncIterator[Any]:
         async with original(application) as state:
             await service.start()
             try:

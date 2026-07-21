@@ -22,7 +22,9 @@ EXPECTED_TOOLS = [
     "chat_runtime_logs", "chat_runtime_circuit",
     "agent_projects_list", "agent_project_get", "agent_project_threads",
     "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
-    "agent_tail", "agent_send", "agent_wait", "agent_sync", "agent_children",
+    "agent_tail", "agent_send", "agent_schedule_wakeup",
+    "agent_queue_after_completion", "agent_automation",
+    "agent_wait", "agent_sync", "agent_children",
     "agent_subscribe", "agent_ack", "agent_cancel",
 ]
 
@@ -714,6 +716,31 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
         async def status(self, agent_id):
             return {"agent": {"agent_id": agent_id, "status": "running"}}
 
+        async def schedule_wakeup(self, thread_id, wake_at, **kwargs):
+            return {
+                "automation_id": "auto-wakeup",
+                "target_agent_id": thread_id,
+                "due_at": float(wake_at),
+                "status": "scheduled",
+                "options": kwargs,
+            }
+
+        async def queue_after_completion(self, source_thread_id, target_thread_id, prompt, **kwargs):
+            return {
+                "automation_id": "auto-completion",
+                "source_agent_id": source_thread_id,
+                "target_agent_id": target_thread_id,
+                "message": prompt,
+                "status": "waiting",
+                "options": kwargs,
+            }
+
+        async def automations(self, **kwargs):
+            return {"automations": [{"automation_id": "auto-wakeup"}], "options": kwargs}
+
+        async def cancel_automation(self, automation_id):
+            return {"automation_id": automation_id, "status": "cancelled"}
+
     class FakeService:
         def __init__(self):
             self.wakes = 0
@@ -750,6 +777,41 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
     )))
     assert child["agent"]["agent_id"] == "agent-child"
     assert service.wakes == 1
+
+    wake = json.loads(run(terminal_mcp.agent_schedule_wakeup(
+        "agent-child",
+        "12345",
+        prompt="Review children",
+        session_id=session_id,
+        cwd=str(project),
+    )))
+    assert wake["automation_id"] == "auto-wakeup"
+
+    completion = json.loads(run(terminal_mcp.agent_queue_after_completion(
+        "agent-child",
+        "agent-root",
+        "Synthesize result",
+        session_id=session_id,
+        cwd=str(project),
+    )))
+    assert completion["status"] == "waiting"
+
+    listed = json.loads(run(terminal_mcp.agent_automation(
+        action="list",
+        thread_id="agent-child",
+        session_id=session_id,
+        cwd=str(project),
+    )))
+    assert listed["automations"][0]["automation_id"] == "auto-wakeup"
+
+    cancelled = json.loads(run(terminal_mcp.agent_automation(
+        action="cancel",
+        automation_id="auto-wakeup",
+        session_id=session_id,
+        cwd=str(project),
+    )))
+    assert cancelled["status"] == "cancelled"
+    assert service.wakes == 4
 
     synced = json.loads(run(terminal_mcp.agent_sync(
         session_id=session_id, cwd=str(project)

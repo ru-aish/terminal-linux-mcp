@@ -329,7 +329,7 @@ OpenAI does not store the MCP `authorization` value in the Response object, so p
 | Session environment | `set_session_env` |
 | Files and images | `read_file`, `watch_image`, `write_file`, `replace_in_file`, `apply_patch`, `list_dir`, `stat_path`, `make_dir`, `copy_path`, `move_path` |
 | Delegated agents | `run_codex_yolo`, `start_codex_yolo`, `run_agy_yolo`, `start_agy_yolo` |
-| ChatGPT agent orchestration | `agent_projects_list`, `agent_project_get`, `agent_project_threads`, `agent_register_parent`, `agent_spawn`, `agent_status`, `agent_context`, `agent_tail`, `agent_send`, `agent_wait`, `agent_sync`, `agent_children`, `agent_subscribe`, `agent_ack`, `agent_cancel` |
+| ChatGPT agent orchestration | `agent_projects_list`, `agent_project_get`, `agent_project_threads`, `agent_register_parent`, `agent_spawn`, `agent_status`, `agent_context`, `agent_tail`, `agent_send`, `agent_schedule_wakeup`, `agent_queue_after_completion`, `agent_automation`, `agent_wait`, `agent_sync`, `agent_children`, `agent_subscribe`, `agent_ack`, `agent_cancel` |
 
 ## Persistent downstream MCP proxy
 
@@ -434,6 +434,8 @@ Copy `.env.example` to `.env`. Important values:
 | `MCP_CHAT_WATCHDOG_REQUIRE_HIGH` | `1` | Refuse to silently lower the requested reasoning level |
 | `MCP_CHAT_WATCHDOG_MODEL` | empty | Preferred live model slug; otherwise reuse the thread model or live default |
 | `MCP_CHAT_WATCHDOG_THINKING_EFFORT` | `extended` | Requested live reasoning effort |
+| `CHAT_GATEWAY_THINKING_EFFORT` | falls back to watchdog effort | Reasoning effort attached to every durable agent create/continue request |
+| `CHAT_GATEWAY_REQUIRE_HIGH_REASONING` | falls back to watchdog requirement | Accept only high or extended effort for durable agent requests |
 | `MCP_CHAT_WATCHDOG_STREAM_TIMEOUT_SECONDS` | `3600` | Maximum time to wait for a watchdog-owned completion stream |
 | `MCP_CHAT_WATCHDOG_STALE_GENERATION_SECONDS` | `600` | Age after which an in-progress canonical state is reported as stale and never auto-continued |
 | `MCP_CHAT_WATCHDOG_MAX_CONTINUE_ATTEMPTS` | `20` | Hard per-task continuation-attempt ceiling |
@@ -478,7 +480,9 @@ Every child receives exact orchestration IDs, project and working-directory plac
 
 The Claude-style core behavior prompt is stored at `prompts/terminal_mcp_core_behavior.md` and is inserted before global/project `.GPT/AGENTS.md` content for startup, bootstrap, and context reload. It contains no sub-agent policy or proprietary Claude prompt text. UI tasks are instructed to load the `frontend-design` and `user-html-ui-preference` skills.
 
-The authenticated agent control room is available at `/dashboard/agents`. Its API at `/dashboard/agents/api` exposes managed capacity, agent/task state, mailboxes, queued gateway operations, request history, circuit state, errors, and next request eligibility. The page is mobile-first and linked from the existing `/dashboard` usage ledger.
+The authenticated agent control room is available at `/dashboard/agents`. Its API at `/dashboard/agents/api` exposes the durable parent/child tree, synchronization state, reasoning configuration, wake timers, exact-marker completion gates, managed capacity, mailboxes, queued gateway operations, request history, circuits, errors, and next request eligibility. The page is mobile-first and linked from the existing `/dashboard` usage ledger.
+
+Wake timers and completion-triggered prompts are local durable automations. When activated, they materialize one ordinary ordered command and use the same one-request gateway, rate limits, circuits, and staged verification as `agent_send`. See `docs/AGENT_AUTOMATION_AND_CONTROL_TOWER.md` for the exact completion contract, timing model, tools, and verification map.
 
 Operational migration and rollback instructions are in `docs/AGENT_GATEWAY_CUTOVER.md`. Existing orchestration records are preserved in the domain database and mapped to gateway records on startup. Always back up the domain database before first deployment; the gateway database may start clean.
 

@@ -103,6 +103,7 @@ def install_usage_dashboard(
     store: GPTThreadStore,
     watchdog: ChatWatchdog | None = None,
     agent_coordinator: Any | None = None,
+    agent_service: Any | None = None,
 ) -> None:
     """Mount the live usage dashboard into an existing Starlette/FastMCP app."""
 
@@ -132,6 +133,9 @@ def install_usage_dashboard(
                 JSONResponse({"error": "unauthorized"}, status_code=401)
             )
         snapshot = await asyncio.to_thread(agent_coordinator.dashboard_snapshot)
+        snapshot["sync_service"] = (
+            dict(agent_service.state) if agent_service is not None else None
+        )
         return _security_headers(JSONResponse(snapshot))
 
     async def dashboard_login(request: Request) -> Response:

@@ -171,10 +171,20 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                     "AND (gateway_operation_id IS NULL OR gateway_operation_id='') LIMIT 1"
                 ).fetchone()
             )
+        candidates: list[float] = []
         if local:
-            return now
+            candidates.append(now)
         gateway_due = self._gateway_operation_due_at()
-        return float(gateway_due) if gateway_due is not None else None
+        if gateway_due is not None:
+            candidates.append(float(gateway_due))
+        automation_due = self.next_wakeup_at()
+        if automation_due is not None:
+            candidates.append(float(automation_due))
+        return min(candidates) if candidates else None
+
+    def next_wakeup_at(self) -> float | None:
+        value = self.repository.next_automation_due_at()
+        return float(value) if value is not None else None
 
     def has_pending_work(self) -> bool:
         due = self.next_due_at()
@@ -196,6 +206,59 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                 self.repository.agent(str(result["agent_id"])) or agent
             )
         return result
+
+    async def queue_after_completion(
+        self,
+        source_thread_id: str,
+        target_thread_id: str,
+        prompt: str,
+        *,
+        completion_marker: str = "",
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        result = await super().queue_after_completion(
+            source_thread_id,
+            target_thread_id,
+            prompt,
+            completion_marker=completion_marker,
+            idempotency_key=idempotency_key,
+        )
+        if str(result.get("status") or "") == "waiting":
+            source = self._resolve_agent_reference(source_thread_id)
+            self._ensure_completion_source_monitoring(source)
+        return dict(result)
+
+    def _ensure_completion_source_monitoring(self, source: Mapping[str, Any]) -> None:
+        status = str(source.get("status") or "")
+        if status in {"failed", "cancelled"}:
+            return
+        gateway_id = str(source.get("gateway_agent_id") or "")
+        if not gateway_id and source.get("chat_id"):
+            gateway_id = self._ensure_gateway_mapping(source)
+        if not gateway_id:
+            return
+        gateway_agent = self.gateway.ledger.get_agent(gateway_id)
+        if gateway_agent is None or not gateway_agent.conversation_id:
+            return
+        if gateway_agent.state in {AgentState.FAILED, AgentState.CANCELLED}:
+            return
+        if gateway_agent.state is AgentState.COMPLETED:
+            self.gateway.ledger.reopen_agent(gateway_id, now=self.gateway.clock.now())
+            gateway_agent = self.gateway.ledger.get_agent(gateway_id)
+            if gateway_agent is None:
+                return
+        due_at = max(
+            self.gateway.clock.now(),
+            float(gateway_agent.next_inspection_at or self.gateway.clock.now()),
+        )
+        try:
+            self.gateway.enqueue_inspect(
+                agent_id=gateway_id,
+                due_at=due_at,
+                completion_sensitive=True,
+            )
+        except ValueError:
+            pass
 
     async def spawn(
         self,
@@ -375,8 +438,211 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
         self._reconcile_gateway_state()
         self._reconcile_gateway_operations()
         self._queue_parent_notifications()
+        self._prepare_automations()
         self._queue_command_operations()
         self._queue_automatic_continuations()
+
+    def _prepare_automations(self) -> None:
+        self._reconcile_automation_commands()
+        now = _now()
+        for automation in self.repository.automations(include_terminal=False):
+            kind = str(automation.get("kind") or "")
+            status = str(automation.get("status") or "")
+            if kind == "wakeup" and status == "scheduled":
+                due_at = float(automation.get("due_at") or 0)
+                if due_at <= now:
+                    self._materialize_automation(automation)
+                continue
+            if kind != "after_completion" or status != "waiting":
+                continue
+            source_id = str(automation.get("source_agent_id") or "")
+            source = self.repository.agent(source_id)
+            if source is None:
+                self._fail_automation(
+                    automation, "completion source agent was not found"
+                )
+                continue
+            gateway_id = str(source.get("gateway_agent_id") or "")
+            snapshot = self.gateway.latest_snapshot(gateway_id) if gateway_id else None
+            marker = str(automation.get("completion_marker") or "")
+            if self._snapshot_has_completion_marker(snapshot, marker):
+                self._materialize_automation(automation)
+                continue
+            if snapshot is None:
+                self._ensure_completion_source_monitoring(source)
+                continue
+            if str(source.get("status") or "") in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                self._fail_automation(
+                    automation,
+                    "completion source became terminal without the exact standalone marker",
+                )
+
+    @staticmethod
+    def _snapshot_has_completion_marker(
+        snapshot: Mapping[str, Any] | None, marker: str
+    ) -> bool:
+        if not snapshot or snapshot.get("found") is not True or not marker:
+            return False
+        turns = snapshot.get("turns")
+        if not isinstance(turns, list):
+            return False
+        latest = next(
+            (
+                turn
+                for turn in reversed(turns)
+                if isinstance(turn, Mapping) and turn.get("role") == "assistant"
+            ),
+            None,
+        )
+        if latest is None:
+            return False
+        return (
+            str(latest.get("status") or "").lower() in _TERMINAL_MESSAGE_STATUSES
+            and latest.get("end_turn") is True
+            and any(
+                line.strip() == marker
+                for line in str(latest.get("text") or "").splitlines()
+            )
+        )
+
+    def _materialize_automation(self, automation: Mapping[str, Any]) -> None:
+        automation_id = str(automation["automation_id"])
+        target_id = str(automation["target_agent_id"])
+        target = self.repository.agent(target_id)
+        if target is None:
+            self._fail_automation(automation, "automation target agent was not found")
+            return
+        if str(target.get("status") or "") in {"failed", "cancelled"}:
+            self._fail_automation(
+                automation, "automation target is failed or cancelled"
+            )
+            return
+        now = _now()
+        try:
+            with self.repository.transaction() as db:
+                current = db.execute(
+                    "SELECT * FROM agent_automations WHERE automation_id=?",
+                    (automation_id,),
+                ).fetchone()
+                if current is None or str(current["status"]) not in {
+                    "scheduled",
+                    "waiting",
+                }:
+                    return
+                sequence = int(
+                    db.execute(
+                        "SELECT COALESCE(MAX(sequence_no),0)+1 FROM commands "
+                        "WHERE to_agent_id=?",
+                        (target_id,),
+                    ).fetchone()[0]
+                )
+                command_id = _id("cmd")
+                kind = str(automation["kind"])
+                db.execute(
+                    "INSERT INTO commands("
+                    "command_id,from_agent_id,to_agent_id,sequence_no,message,"
+                    "interrupt_policy,status,idempotency_key,purpose,created_at"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        command_id,
+                        None,
+                        target_id,
+                        sequence,
+                        str(automation["message"]),
+                        "queue",
+                        "queued",
+                        f"automation:{automation_id}",
+                        kind,
+                        now,
+                    ),
+                )
+                db.execute(
+                    "UPDATE agent_automations SET status='queued',command_id=?,"
+                    "triggered_at=?,updated_at=?,last_error='' WHERE automation_id=?",
+                    (command_id, now, now, automation_id),
+                )
+                task = db.execute(
+                    "SELECT task_id FROM tasks WHERE agent_id=?", (target_id,)
+                ).fetchone()
+                self._insert_event(
+                    db,
+                    target_id,
+                    str(task["task_id"]) if task else None,
+                    "wakeup_due" if kind == "wakeup" else "completion_prompt_queued",
+                    {
+                        "automation_id": automation_id,
+                        "kind": kind,
+                        "source_agent_id": automation.get("source_agent_id"),
+                        "due_at": automation.get("due_at"),
+                    },
+                    source_cursor=f"automation:{automation_id}:queued",
+                )
+        except Exception as exc:
+            self._fail_automation(automation, _safe_error(exc))
+
+    def _fail_automation(self, automation: Mapping[str, Any], reason: str) -> None:
+        now = _now()
+        with self.repository.transaction() as db:
+            db.execute(
+                "UPDATE agent_automations SET status='failed',completed_at=?,"
+                "updated_at=?,last_error=? WHERE automation_id=? "
+                "AND status NOT IN ('delivered','cancelled','failed')",
+                (now, now, reason[:500], automation["automation_id"]),
+            )
+
+    def _reconcile_automation_commands(self) -> None:
+        with self.repository.connect() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT a.automation_id,a.status AS automation_status,"
+                    "c.status AS command_status,c.last_error "
+                    "FROM agent_automations a JOIN commands c ON c.command_id=a.command_id "
+                    "WHERE a.status='queued'"
+                )
+            ]
+        now = _now()
+        for row in rows:
+            command_status = str(row.get("command_status") or "")
+            if command_status in {"delivered", "acknowledged"}:
+                status, error = "delivered", ""
+            elif command_status in {"cancelled", "superseded"}:
+                status, error = (
+                    "failed",
+                    str(row.get("last_error") or "delivery cancelled"),
+                )
+            else:
+                continue
+            with self.repository.transaction() as db:
+                db.execute(
+                    "UPDATE agent_automations SET status=?,completed_at=?,updated_at=?,"
+                    "last_error=? WHERE automation_id=? AND status='queued'",
+                    (status, now, now, error[:500], row["automation_id"]),
+                )
+
+    def _reopen_automation_target(
+        self, target: Mapping[str, Any], gateway_id: str
+    ) -> None:
+        gateway_agent = self.gateway.ledger.get_agent(gateway_id)
+        if gateway_agent is None or gateway_agent.state is not AgentState.COMPLETED:
+            return
+        self.gateway.ledger.reopen_agent(gateway_id, now=self.gateway.clock.now())
+        now = _now()
+        with self.repository.transaction() as db:
+            db.execute(
+                "UPDATE agents SET status='unknown',last_error='',updated_at=? "
+                "WHERE agent_id=? AND status='completed'",
+                (now, target["agent_id"]),
+            )
+            db.execute(
+                "UPDATE tasks SET status='unknown',completed_at=NULL,next_check_at=0 "
+                "WHERE agent_id=? AND status='completed'",
+                (target["agent_id"],),
+            )
 
     def _queue_command_operations(self) -> None:
         for command in self.repository.queued_commands(include_future=False):
@@ -397,6 +663,11 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                 continue
             if gateway_agent is None:
                 continue
+            if str(command.get("purpose") or "") in {"wakeup", "after_completion"}:
+                self._reopen_automation_target(target, gateway_id)
+                gateway_agent = self.gateway.ledger.get_agent(gateway_id)
+                if gateway_agent is None:
+                    continue
             if gateway_agent.state in {AgentState.FAILED, AgentState.CANCELLED}:
                 with self.repository.transaction() as db:
                     db.execute(
@@ -431,11 +702,17 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                 except ValueError:
                     continue
                 with self.repository.transaction() as db:
+                    delay = (
+                        1
+                        if str(command.get("purpose") or "")
+                        in {"wakeup", "after_completion"}
+                        else 30
+                    )
                     db.execute(
                         "UPDATE commands SET last_error=?,next_attempt_at=? WHERE command_id=?",
                         (
                             f"waiting for canonical target read ({operation_id})",
-                            _now() + 30,
+                            _now() + delay,
                             command["command_id"],
                         ),
                     )
@@ -579,6 +856,7 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
         self._reconcile_command_operations()
         self._reconcile_task_operations()
         self._reconcile_control_operations()
+        self._reconcile_automation_commands()
 
     def _reconcile_command_operations(self) -> None:
         with self.repository.connect() as db:
@@ -978,6 +1256,12 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
             if gateway_agent
             else None
         )
+        result["automations"] = [
+            self._public_automation(row)
+            for row in self.repository.automations(
+                agent_id=agent_id, include_terminal=False
+            )
+        ]
         return dict(result)
 
     async def context(
@@ -1101,11 +1385,12 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
         return {"agent_id": agent_id, "cancelled": True, "reason": ""}
 
     def dashboard_snapshot(self) -> dict[str, Any]:
-        agents = []
         with self.repository.connect() as db:
             domain_rows = [
                 dict(row)
-                for row in db.execute("SELECT * FROM agents ORDER BY created_at")
+                for row in db.execute(
+                    "SELECT * FROM agents ORDER BY created_at,agent_id"
+                )
             ]
             tasks = {
                 str(row["agent_id"]): dict(row)
@@ -1118,7 +1403,38 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                     "('delivered','acknowledged','cancelled','superseded') GROUP BY to_agent_id"
                 )
             }
+
+        by_id = {str(row["agent_id"]): row for row in domain_rows}
+        children: dict[str, list[str]] = {}
+        roots: list[str] = []
         for row in domain_rows:
+            agent_id = str(row["agent_id"])
+            parent_id = str(row.get("parent_agent_id") or "")
+            if parent_id and parent_id in by_id:
+                children.setdefault(parent_id, []).append(agent_id)
+            else:
+                roots.append(agent_id)
+
+        ordered: list[tuple[str, int, list[str]]] = []
+        visited: set[str] = set()
+
+        def walk(agent_id: str, depth: int, path: list[str]) -> None:
+            if agent_id in visited:
+                return
+            visited.add(agent_id)
+            current_path = [*path, agent_id]
+            ordered.append((agent_id, depth, current_path))
+            for child_id in children.get(agent_id, []):
+                walk(child_id, depth + 1, current_path)
+
+        for root_id in roots:
+            walk(root_id, 0, [])
+        for row in domain_rows:
+            walk(str(row["agent_id"]), 0, [])
+
+        agents: list[dict[str, Any]] = []
+        for agent_id, depth, path in ordered:
+            row = by_id[agent_id]
             gateway_id = str(row.get("gateway_agent_id") or "")
             gateway_agent = (
                 self.gateway.ledger.get_agent(gateway_id) if gateway_id else None
@@ -1126,6 +1442,9 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
             agents.append(
                 {
                     **self._public_agent(row),
+                    "depth": depth,
+                    "path": path,
+                    "children_count": len(children.get(agent_id, [])),
                     "gateway_agent_id": gateway_id or None,
                     "gateway_state": gateway_agent.state.value
                     if gateway_agent
@@ -1133,10 +1452,14 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                     "next_inspection_at": gateway_agent.next_inspection_at
                     if gateway_agent
                     else None,
-                    "task": tasks.get(str(row["agent_id"])),
-                    "pending_mailbox": mailbox.get(str(row["agent_id"]), 0),
+                    "last_inspected_at": gateway_agent.last_inspected_at
+                    if gateway_agent
+                    else None,
+                    "task": tasks.get(agent_id),
+                    "pending_mailbox": mailbox.get(agent_id, 0),
                 }
             )
+
         operations = [
             {
                 "id": operation.id,
@@ -1161,6 +1484,20 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
             }
             for circuit in self.gateway.ledger.list_circuits()
         ]
+        title_by_id = {
+            str(agent["agent_id"]): str(agent.get("title") or "") for agent in agents
+        }
+        automations = []
+        for row in self.repository.automations():
+            item = self._public_automation(row)
+            source_id = str(row.get("source_agent_id") or "")
+            target_id = str(row.get("target_agent_id") or "")
+            item.update(
+                source_title=title_by_id.get(source_id, ""),
+                target_title=title_by_id.get(target_id, ""),
+            )
+            automations.append(item)
+
         request_summary = self.gateway.ledger.request_stats(since=time.time() - 86400)
         requests = self.gateway.ledger.recent_request_events(limit=100)
         active = sum(
@@ -1169,6 +1506,20 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
             if agent.get("parent_agent_id")
             and agent.get("status") not in _TERMINAL_DOMAIN_STATES
         )
+        backend = self.gateway.backend
+        reasoning = {
+            "model": str(getattr(backend, "model_slug", "") or ""),
+            "thinking_effort": str(getattr(backend, "thinking_effort", "") or ""),
+            "require_high_reasoning": bool(
+                getattr(backend, "require_high_reasoning", False)
+            ),
+            "applies_to": ["create", "continue", "wakeup", "after_completion"],
+        }
+        active_automations = [
+            item
+            for item in automations
+            if item.get("status") not in {"delivered", "cancelled", "failed"}
+        ]
         return {
             "generated_at": _now(),
             "capacity": {
@@ -1184,10 +1535,22 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                     if agent.get("status") in _TERMINAL_DOMAIN_STATES
                 ),
                 "queued_operations": len(operations),
+                "active_automations": len(active_automations),
+                "scheduled_wakeups": sum(
+                    1 for item in active_automations if item.get("kind") == "wakeup"
+                ),
+                "completion_triggers": sum(
+                    1
+                    for item in active_automations
+                    if item.get("kind") == "after_completion"
+                ),
             },
             "next_eligible_at": self.gateway.next_eligible_at(),
+            "next_wakeup_at": self.next_wakeup_at(),
+            "reasoning": reasoning,
             "circuits": circuits,
             "operations": operations,
+            "automations": automations,
             "agents": agents,
             "request_summary": request_summary,
             "requests": requests,

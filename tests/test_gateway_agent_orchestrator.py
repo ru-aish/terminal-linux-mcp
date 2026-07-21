@@ -451,3 +451,495 @@ def test_runtime_outage_pauses_agents_without_consuming_retry_budget(tmp_path):
     assert resumed["operation_type"] == OperationType.CREATE.value
     assert resumed["outcome"] == "success"
     assert sum(call.method == "create_thread" for call in backend.calls) == 2
+
+
+def _register_parent_in_fake_backend(backend: FakeBackend) -> None:
+    backend.set_snapshot(
+        ThreadSnapshot(
+            conversation_id="parent-chat",
+            found=True,
+            running=False,
+            title="Parent",
+            current_node="parent-assistant",
+            turns=(
+                TurnSnapshot(
+                    "parent-assistant",
+                    "assistant",
+                    "finished_successfully",
+                    "ready",
+                    True,
+                ),
+            ),
+        ),
+        project_id="g-p-project",
+    )
+
+
+def test_wakeup_timer_materializes_once_and_uses_gateway_rail(tmp_path, monkeypatch):
+    import chat_agent_orchestrator
+    import gateway_agent_orchestrator
+
+    wall = [10_000.0]
+    monkeypatch.setattr(chat_agent_orchestrator, "_now", lambda: wall[0])
+    monkeypatch.setattr(gateway_agent_orchestrator, "_now", lambda: wall[0])
+    coordinator, gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+
+    scheduled = run(
+        coordinator.schedule_wakeup(
+            "parent-chat",
+            wall[0] + 5,
+            prompt="Review every managed child now.",
+            idempotency_key="parent-review",
+        )
+    )
+    replay = run(
+        coordinator.schedule_wakeup(
+            parent["agent_id"],
+            wall[0] + 500,
+            prompt="This duplicate must not replace the first timer.",
+            idempotency_key="parent-review",
+        )
+    )
+    assert replay["automation_id"] == scheduled["automation_id"]
+    assert replay["due_at"] == wall[0] + 5
+    assert coordinator.next_wakeup_at() == wall[0] + 5
+
+    coordinator.prepare_local_work()
+    assert (
+        coordinator.repository.automation(scheduled["automation_id"])["status"]
+        == "scheduled"
+    )
+    assert not any(
+        operation.type is OperationType.CONTINUE
+        for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
+    )
+
+    wall[0] += 5
+    coordinator.prepare_local_work()
+    automation = coordinator.repository.automation(scheduled["automation_id"])
+    assert automation["status"] == "queued"
+    assert automation["triggered_at"] == wall[0]
+    assert any(
+        operation.type is OperationType.INSPECT
+        for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
+    )
+    assert backend.calls == []
+
+    inspection = run(coordinator.sync_once())
+    assert inspection["operation_type"] == OperationType.INSPECT.value
+    wall[0] += 1
+    coordinator.prepare_local_work()
+    assert any(
+        operation.type is OperationType.CONTINUE
+        for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
+    )
+    tick = run(coordinator.sync_once())
+    assert tick["operation_type"] == OperationType.CONTINUE.value
+    assert tick["physical_requests"] == 1
+    assert backend.calls[-1].method == "continue_thread"
+    assert (
+        coordinator.repository.automation(scheduled["automation_id"])["status"]
+        == "delivered"
+    )
+
+
+def test_completion_prompt_requires_exact_marker_before_queueing(tmp_path, monkeypatch):
+    import chat_agent_orchestrator
+    import gateway_agent_orchestrator
+
+    wall = [20_000.0]
+    monkeypatch.setattr(chat_agent_orchestrator, "_now", lambda: wall[0])
+    monkeypatch.setattr(gateway_agent_orchestrator, "_now", lambda: wall[0])
+    coordinator, gateway, backend, clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    child = run(
+        coordinator.spawn(
+            parent["agent_id"],
+            "Produce verified evidence.",
+            idempotency_key="completion-source",
+            notification_policy="notify_only",
+        )
+    )
+    child_id = child["agent"]["agent_id"]
+    run(coordinator.sync_once())
+    clock.advance(1)
+    run(coordinator.sync_once())
+    gateway_id = coordinator.repository.agent(child_id)["gateway_agent_id"]
+    conversation_id = gateway.ledger.get_agent(gateway_id).conversation_id
+    with coordinator.repository.transaction() as db:
+        db.execute(
+            "UPDATE tasks SET status='waiting_for_parent' WHERE agent_id=?",
+            (child_id,),
+        )
+
+    trigger = run(
+        coordinator.queue_after_completion(
+            conversation_id,
+            "parent-chat",
+            "Synthesize the completed child result.",
+            idempotency_key="synthesize-after-child",
+        )
+    )
+    backend.set_snapshot(
+        ThreadSnapshot(
+            conversation_id=conversation_id,
+            found=True,
+            running=False,
+            current_node="assistant-no-marker",
+            turns=(
+                TurnSnapshot(
+                    "assistant-no-marker",
+                    "assistant",
+                    "finished_successfully",
+                    "The work looks complete, but the exact contract is absent.",
+                    True,
+                ),
+            ),
+        ),
+        project_id="g-p-project",
+    )
+    clock.advance(1)
+    without_marker = run(coordinator.sync_once())
+    assert without_marker["operation_type"] == OperationType.INSPECT.value
+    coordinator.prepare_local_work()
+    assert (
+        coordinator.repository.automation(trigger["automation_id"])["status"]
+        == "waiting"
+    )
+    assert not any(
+        row["purpose"] == "after_completion"
+        for row in coordinator.repository.queued_commands(include_future=True)
+    )
+
+    marker = child["task"]["completion_marker"]
+    backend.set_snapshot(
+        ThreadSnapshot(
+            conversation_id=conversation_id,
+            found=True,
+            running=False,
+            current_node="assistant-with-marker",
+            turns=(
+                TurnSnapshot(
+                    "assistant-with-marker",
+                    "assistant",
+                    "finished_successfully",
+                    f"All evidence is verified.\n{marker}",
+                    True,
+                ),
+            ),
+        ),
+        project_id="g-p-project",
+    )
+    gateway.enqueue_inspect(
+        agent_id=gateway_id,
+        due_at=clock.now(),
+        completion_sensitive=True,
+    )
+    marker_tick = run(coordinator.sync_once())
+    assert marker_tick["operation_type"] == OperationType.INSPECT.value
+    coordinator.prepare_local_work()
+    queued = coordinator.repository.automation(trigger["automation_id"])
+    assert queued["status"] == "queued"
+    assert queued["triggered_at"] == wall[0]
+    assert (
+        len(
+            [
+                row
+                for row in coordinator.repository.queued_commands(include_future=True)
+                if row["purpose"] == "after_completion"
+            ]
+        )
+        <= 1
+    )
+
+    delivered = None
+    for _ in range(6):
+        tick = run(coordinator.sync_once())
+        if tick["operation_type"] == OperationType.CONTINUE.value:
+            delivered = tick
+            break
+        wall[0] += 1
+        clock.advance(1)
+        coordinator.prepare_local_work()
+    assert delivered is not None
+    assert (
+        coordinator.repository.automation(trigger["automation_id"])["status"]
+        == "delivered"
+    )
+
+
+def test_cancel_automation_is_idempotent_and_blocks_future_materialization(
+    tmp_path, monkeypatch
+):
+    import chat_agent_orchestrator
+    import gateway_agent_orchestrator
+
+    wall = [30_000.0]
+    monkeypatch.setattr(chat_agent_orchestrator, "_now", lambda: wall[0])
+    monkeypatch.setattr(gateway_agent_orchestrator, "_now", lambda: wall[0])
+    coordinator, _gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    timer = run(
+        coordinator.schedule_wakeup(
+            parent["agent_id"], wall[0] + 10, idempotency_key="cancel-me"
+        )
+    )
+    first = run(coordinator.cancel_automation(timer["automation_id"]))
+    second = run(coordinator.cancel_automation(timer["automation_id"]))
+    assert first["status"] == second["status"] == "cancelled"
+    wall[0] += 20
+    coordinator.prepare_local_work()
+    assert (
+        coordinator.repository.automation(timer["automation_id"])["status"]
+        == "cancelled"
+    )
+    assert coordinator.repository.queued_commands(include_future=True) == []
+
+
+def test_background_service_waits_for_near_wakeup_without_thirty_second_floor(
+    monkeypatch,
+):
+    import chat_agent_orchestrator
+    from chat_agent_orchestrator import ChatAgentService
+
+    monkeypatch.setattr(chat_agent_orchestrator, "_now", lambda: 100.0)
+
+    class Coordinator:
+        def next_due_at(self):
+            return None
+
+        def next_wakeup_at(self):
+            return 104.5
+
+    service = ChatAgentService(Coordinator(), interval_seconds=600)
+    assert service._next_wait_seconds() == 4.5
+
+
+def test_completion_marker_must_be_an_exact_standalone_line(tmp_path):
+    coordinator, gateway, backend, clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    child = run(
+        coordinator.spawn(
+            parent["agent_id"],
+            "Complete with an exact marker.",
+            idempotency_key="standalone-marker-source",
+            notification_policy="notify_only",
+        )
+    )
+    child_id = child["agent"]["agent_id"]
+    run(coordinator.sync_once())
+    clock.advance(1)
+    run(coordinator.sync_once())
+    gateway_id = coordinator.repository.agent(child_id)["gateway_agent_id"]
+    conversation_id = gateway.ledger.get_agent(gateway_id).conversation_id
+    marker = child["task"]["completion_marker"]
+    trigger = run(
+        coordinator.queue_after_completion(
+            child_id,
+            parent["agent_id"],
+            "This must never queue from embedded evidence.",
+            idempotency_key="standalone-marker-gate",
+        )
+    )
+    backend.set_snapshot(
+        ThreadSnapshot(
+            conversation_id=conversation_id,
+            found=True,
+            running=False,
+            current_node="assistant-embedded-marker",
+            turns=(
+                TurnSnapshot(
+                    "assistant-embedded-marker",
+                    "assistant",
+                    "finished_successfully",
+                    "A sentence containing " + marker + " inside other text.",
+                    True,
+                ),
+            ),
+        ),
+        project_id="g-p-project",
+    )
+    clock.advance(1)
+    run(coordinator.sync_once())
+    coordinator.prepare_local_work()
+    automation = coordinator.repository.automation(trigger["automation_id"])
+    assert automation["status"] == "waiting"
+    assert automation["last_error"] == ""
+    assert gateway.ledger.get_agent(gateway_id).state is AgentState.UNKNOWN
+    assert not any(
+        row["purpose"] == "after_completion"
+        for row in coordinator.repository.queued_commands(include_future=True)
+    )
+
+
+def test_wake_timestamp_requires_timezone_for_iso_values(tmp_path):
+    coordinator, _gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    with pytest.raises(ValueError, match="include a timezone"):
+        run(coordinator.schedule_wakeup(parent["agent_id"], "2026-07-22T09:30:00"))
+
+
+def test_dashboard_snapshot_exposes_tree_automations_and_reasoning(tmp_path):
+    coordinator, _gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    backend.model_slug = "gpt-5.6-terra"
+    backend.thinking_effort = "extended"
+    backend.require_high_reasoning = True
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    child = run(
+        coordinator.spawn(
+            parent["agent_id"],
+            "Create one tree child.",
+            idempotency_key="dashboard-child",
+            notification_policy="notify_only",
+        )
+    )
+    run(
+        coordinator.schedule_wakeup(
+            child["agent"]["agent_id"],
+            40_000,
+            idempotency_key="dashboard-timer",
+        )
+    )
+    snapshot = coordinator.dashboard_snapshot()
+    agents = {agent["agent_id"]: agent for agent in snapshot["agents"]}
+    assert agents[parent["agent_id"]]["depth"] == 0
+    assert agents[parent["agent_id"]]["children_count"] == 1
+    assert agents[child["agent"]["agent_id"]]["depth"] == 1
+    assert agents[child["agent"]["agent_id"]]["path"] == [
+        parent["agent_id"],
+        child["agent"]["agent_id"],
+    ]
+    assert snapshot["automations"][0]["kind"] == "wakeup"
+    assert snapshot["counts"]["scheduled_wakeups"] == 1
+    assert snapshot["reasoning"] == {
+        "model": "gpt-5.6-terra",
+        "thinking_effort": "extended",
+        "require_high_reasoning": True,
+        "applies_to": ["create", "continue", "wakeup", "after_completion"],
+    }
+
+
+def test_completion_trigger_rejects_multiline_marker(tmp_path):
+    coordinator, _gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    with pytest.raises(ValueError, match="must be a single line"):
+        run(
+            coordinator.queue_after_completion(
+                parent["agent_id"],
+                parent["agent_id"],
+                "Do not queue this.",
+                completion_marker="FIRST\nSECOND",
+            )
+        )
+
+
+def test_wakeup_idempotency_is_transactional_under_concurrent_callers(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    coordinator, _gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+
+    def schedule():
+        return run(
+            coordinator.schedule_wakeup(
+                parent["agent_id"],
+                50_000,
+                prompt="One durable timer only.",
+                idempotency_key="concurrent-timer",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _index: schedule(), range(8)))
+    assert len({result["automation_id"] for result in results}) == 1
+    rows = coordinator.repository.automations(
+        agent_id=parent["agent_id"], include_terminal=True
+    )
+    assert len(rows) == 1
+
+
+def test_gateway_reducer_rejects_marker_embedded_in_other_text() -> None:
+    from chat_gateway.status_reducer import reduce_snapshot as reduce_gateway_snapshot
+
+    marker = "DONE_I_HAVE_COMPLETED_ALL_THE_STEPS"
+    snapshot = ThreadSnapshot(
+        conversation_id="embedded-marker",
+        found=True,
+        running=False,
+        current_node="assistant-embedded",
+        turns=(
+            TurnSnapshot(
+                "assistant-embedded",
+                "assistant",
+                "finished_successfully",
+                "This sentence mentions " + marker + " but is not the contract line.",
+                True,
+            ),
+        ),
+    )
+    reduction = reduce_gateway_snapshot(snapshot, completion_marker=marker)
+    assert reduction.state is AgentState.UNKNOWN
+    assert reduction.marker_present is False
+    assert reduction.terminal is False
+
+
+def test_completion_gate_actively_monitors_existing_root_without_cached_snapshot(
+    tmp_path,
+):
+    coordinator, gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    gateway_id = coordinator.repository.agent(parent["agent_id"])["gateway_agent_id"]
+    assert gateway.latest_snapshot(gateway_id) is None
+
+    marker = gateway.config.completion_marker
+    backend.set_snapshot(
+        ThreadSnapshot(
+            conversation_id="parent-chat",
+            found=True,
+            running=False,
+            title="Parent",
+            current_node="parent-complete",
+            turns=(
+                TurnSnapshot(
+                    "parent-complete",
+                    "assistant",
+                    "finished_successfully",
+                    "Root work is complete.\n" + marker,
+                    True,
+                ),
+            ),
+        ),
+        project_id="g-p-project",
+    )
+    trigger = run(
+        coordinator.queue_after_completion(
+            "parent-chat",
+            "parent-chat",
+            "Begin the next verified phase.",
+            idempotency_key="root-completion-monitor",
+        )
+    )
+    pending = gateway.ledger.list_operations(state=OperationState.PENDING)
+    assert any(operation.type is OperationType.INSPECT for operation in pending)
+
+    inspection = run(coordinator.sync_once())
+    assert inspection["operation_type"] == OperationType.INSPECT.value
+    assert gateway.ledger.get_agent(gateway_id).state is AgentState.COMPLETED
+
+    coordinator.prepare_local_work()
+    automation = coordinator.repository.automation(trigger["automation_id"])
+    assert automation["status"] == "queued"
+    assert any(
+        operation.type is OperationType.CONTINUE
+        for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
+    )
