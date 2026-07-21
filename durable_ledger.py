@@ -37,7 +37,7 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
 class DurableLedger:
     """Transactional repository for actors, tasks, commands and cursors."""
 
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
 
     def __init__(self, path: Path):
         self.path = Path(path).expanduser().resolve()
@@ -70,7 +70,9 @@ class DurableLedger:
                     notification_policy TEXT NOT NULL, context_cursor TEXT, current_node TEXT,
                     last_progress_at REAL, progress_signature TEXT, last_error TEXT NOT NULL DEFAULT '',
                     creation_request_id TEXT, creation_user_message_id TEXT,
-                    spawn_idempotency_key TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+                    gateway_agent_id TEXT, gateway_control_operation_id TEXT,
+                    spawn_idempotency_key TEXT,
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS agents_parent_spawn_key
                     ON agents(parent_agent_id, spawn_idempotency_key)
@@ -79,7 +81,8 @@ class DurableLedger:
                     task_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL UNIQUE REFERENCES agents(agent_id) ON DELETE CASCADE,
                     prompt TEXT NOT NULL, completion_marker TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
                     continue_attempts INTEGER NOT NULL DEFAULT 0, last_continue_node TEXT,
-                    last_continue_at REAL, next_check_at REAL NOT NULL DEFAULT 0,
+                    last_continue_at REAL, gateway_operation_id TEXT,
+                    next_check_at REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL, completed_at REAL
                 );
                 CREATE TABLE IF NOT EXISTS commands(
@@ -90,6 +93,7 @@ class DurableLedger:
                     request_id TEXT, user_message_id TEXT, parent_message_id TEXT,
                     created_at REAL NOT NULL, delivered_at REAL, last_error TEXT NOT NULL DEFAULT '',
                     purpose TEXT NOT NULL DEFAULT 'instruction',
+                    gateway_operation_id TEXT,
                     next_attempt_at REAL NOT NULL DEFAULT 0
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS commands_sender_key
@@ -133,8 +137,16 @@ class DurableLedger:
                 ("agents", "progress_signature", "TEXT"),
                 ("agents", "creation_request_id", "TEXT"),
                 ("agents", "creation_user_message_id", "TEXT"),
+                ("agents", "gateway_agent_id", "TEXT"),
+                ("agents", "gateway_control_operation_id", "TEXT"),
+                ("tasks", "gateway_operation_id", "TEXT"),
+                ("commands", "gateway_operation_id", "TEXT"),
             ):
                 self._ensure_column(db, table, column, definition)
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS agents_gateway_agent_id "
+                "ON agents(gateway_agent_id) WHERE gateway_agent_id IS NOT NULL"
+            )
             # Rows created before schema v6 had no purpose column. Notification
             # commands are identifiable by their event cursor and must not be
             # mistaken for parent instructions after migration.

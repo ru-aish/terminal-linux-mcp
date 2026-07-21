@@ -39,6 +39,9 @@ from chat_agent_orchestrator import (
     CoordinatorConfig,
     install_chat_agent_lifespan,
 )
+from gateway_agent_orchestrator import GatewayChatAgentCoordinator
+from chat_gateway import ChatGateway, GatewayConfig, SQLiteLedger
+from chat_gateway.adapters.codex_renderer import CodexRendererBackend
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -65,6 +68,18 @@ GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
 CHAT_AGENT_DB_PATH = Path(
     os.environ.get("MCP_CHAT_AGENT_DB", "~/.GPT/chat-agent-orchestrator.db")
 ).expanduser().resolve()
+CHAT_GATEWAY_DB_PATH = Path(
+    os.environ.get("MCP_CHAT_GATEWAY_DB", "~/.GPT/chat-agent-gateway.db")
+).expanduser().resolve()
+CHAT_AGENT_MAX_ACTIVE_CHILDREN = max(
+    1, int(os.environ.get("MCP_CHAT_AGENT_MAX_ACTIVE_CHILDREN", "5"))
+)
+CORE_BEHAVIOR_PROMPT_PATH = Path(
+    os.environ.get(
+        "MCP_CORE_BEHAVIOR_PROMPT",
+        str(Path(__file__).resolve().parent / "prompts" / "terminal_mcp_core_behavior.md"),
+    )
+).expanduser().resolve()
 CHAT_AGENT_ENABLED = os.environ.get("MCP_CHAT_AGENT_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -90,6 +105,7 @@ CHAT_AGENT_STALE_SECONDS = max(
 )
 _CHAT_AGENT_COORDINATOR: ChatAgentCoordinator | None = None
 _CHAT_AGENT_SERVICE: ChatAgentService | None = None
+_CHAT_GATEWAY: ChatGateway | None = None
 _CHAT_AGENT_RUNTIME_ENSURE: Callable[[], Awaitable[Any]] | None = None
 
 
@@ -115,10 +131,40 @@ async def _chat_agent_runtime_factory():
         yield runtime
 
 
+def get_chat_gateway() -> ChatGateway:
+    global _CHAT_GATEWAY
+    if _CHAT_GATEWAY is None:
+        config = GatewayConfig(
+            database_path=str(CHAT_GATEWAY_DB_PATH),
+            maximum_active_agents=max(64, CHAT_AGENT_MAX_ACTIVE_CHILDREN + 8),
+        )
+        backend = CodexRendererBackend(
+            cdp_endpoint=os.environ.get(
+                "CHAT_GATEWAY_CDP_ENDPOINT",
+                os.environ.get("MCP_CHAT_WATCHDOG_CDP", DEFAULT_CODEX_CDP_ENDPOINT),
+            ),
+            model_slug=os.environ.get(
+                "CHAT_GATEWAY_MODEL_SLUG",
+                os.environ.get("MCP_CHAT_WATCHDOG_MODEL", "gpt-5.6-terra"),
+            )
+            or "gpt-5.6-terra",
+            stream_start_timeout=float(
+                os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
+            ),
+            cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
+        )
+        _CHAT_GATEWAY = ChatGateway(
+            SQLiteLedger(CHAT_GATEWAY_DB_PATH),
+            backend,
+            config,
+        )
+    return _CHAT_GATEWAY
+
+
 def get_chat_agent_coordinator() -> ChatAgentCoordinator:
     global _CHAT_AGENT_COORDINATOR
     if _CHAT_AGENT_COORDINATOR is None:
-        _CHAT_AGENT_COORDINATOR = ChatAgentCoordinator(
+        _CHAT_AGENT_COORDINATOR = GatewayChatAgentCoordinator(
             CoordinatorConfig(
                 CHAT_AGENT_DB_PATH,
                 context_max_events=CHAT_AGENT_CONTEXT_MAX_EVENTS,
@@ -133,6 +179,8 @@ def get_chat_agent_coordinator() -> ChatAgentCoordinator:
                 heartbeat_seconds=CHAT_AGENT_SYNC_SECONDS,
             ),
             _chat_agent_runtime_factory,
+            get_chat_gateway(),
+            maximum_active_children=CHAT_AGENT_MAX_ACTIVE_CHILDREN,
         )
     return _CHAT_AGENT_COORDINATOR
 
@@ -2299,6 +2347,20 @@ def _configured_mcp_manifest(root: Path) -> list[dict[str, str]]:
     ]
 
 
+def _core_behavior_prompt() -> str:
+    try:
+        content = CORE_BEHAVIOR_PROMPT_PATH.read_text(
+            encoding="utf-8", errors="replace"
+        ).strip()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Terminal MCP core behavior prompt is unavailable: {CORE_BEHAVIOR_PROMPT_PATH}"
+        ) from exc
+    if not content:
+        raise RuntimeError("Terminal MCP core behavior prompt is empty")
+    return content
+
+
 def _build_thread_context_document(
     thread_id: str,
     run_cwd: Path,
@@ -2322,6 +2384,9 @@ def _build_thread_context_document(
         f"Usage Database: {_thread_db_path()}",
         f"Context Fingerprint: {fingerprint}",
         f"Applicable GPT Instruction Files: {len(rows)}",
+        "",
+        "## Terminal MCP core behavior",
+        _core_behavior_prompt(),
         "",
         "## Mandatory GPT instructions",
     ]
@@ -3466,6 +3531,9 @@ def _build_startup_instructions() -> str:
         f"GPT Home: {_gpt_home()}",
         f"Usage Database: {_thread_db_path()}",
         "",
+        "## Terminal MCP core behavior",
+        _core_behavior_prompt(),
+        "",
         "## Mandatory .GPT instructions",
     ]
     for path, content in rows:
@@ -3808,7 +3876,7 @@ async def agent_sync(
     session_id: str = "default",
     cwd: str | None = None,
 ) -> str:
-    """Run one explicit sequential orchestration sync; interrupt steering may cancel and dispatch in one cycle."""
+    """Run one durable orchestration scheduler tick with zero or one physical ChatGPT request."""
     if gate := await _chat_agent_gate(session_id, cwd):
         return gate
     try:
@@ -3930,7 +3998,9 @@ def main() -> None:
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
         chat_watchdog = ChatWatchdog(watchdog_config)
         set_chat_agent_runtime_ensure(chat_watchdog.ensure_background_runtime)
-        install_usage_dashboard(app, GPT_STORE, chat_watchdog)
+        install_usage_dashboard(
+            app, GPT_STORE, chat_watchdog, get_chat_agent_coordinator()
+        )
         install_chat_watchdog_lifespan(app, chat_watchdog)
         install_chat_agent_lifespan(app, get_chat_agent_service())
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
