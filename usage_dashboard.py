@@ -98,7 +98,12 @@ def _parse_positive_int(value: str | None, default: int, maximum: int) -> int:
     return max(1, min(parsed, maximum))
 
 
-def install_usage_dashboard(app: Any, store: GPTThreadStore, watchdog: ChatWatchdog | None = None) -> None:
+def install_usage_dashboard(
+    app: Any,
+    store: GPTThreadStore,
+    watchdog: ChatWatchdog | None = None,
+    agent_coordinator: Any | None = None,
+) -> None:
     """Mount the live usage dashboard into an existing Starlette/FastMCP app."""
 
     existing_paths = {getattr(route, "path", "") for route in app.routes}
@@ -109,6 +114,25 @@ def install_usage_dashboard(app: Any, store: GPTThreadStore, watchdog: ChatWatch
         if not _authorized(request):
             return _unauthorized_page()
         return _security_headers(FileResponse(ASSET_DIR / "index.html", media_type="text/html"))
+
+    async def agents_page(request: Request) -> Response:
+        if agent_coordinator is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not _authorized(request):
+            return _unauthorized_page()
+        return _security_headers(
+            FileResponse(ASSET_DIR / "agents.html", media_type="text/html")
+        )
+
+    async def agents_api(request: Request) -> Response:
+        if agent_coordinator is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not _authorized(request):
+            return _security_headers(
+                JSONResponse({"error": "unauthorized"}, status_code=401)
+            )
+        snapshot = await asyncio.to_thread(agent_coordinator.dashboard_snapshot)
+        return _security_headers(JSONResponse(snapshot))
 
     async def dashboard_login(request: Request) -> Response:
         expected = _dashboard_token()
@@ -256,6 +280,8 @@ def install_usage_dashboard(app: Any, store: GPTThreadStore, watchdog: ChatWatch
         asset_map = {
             "dashboard.css": (ASSET_DIR / "dashboard.css", "text/css"),
             "dashboard.js": (ASSET_DIR / "dashboard.js", "text/javascript"),
+            "agents.css": (ASSET_DIR / "agents.css", "text/css"),
+            "agents.js": (ASSET_DIR / "agents.js", "text/javascript"),
         }
         selected = asset_map.get(name)
         if selected is None:
@@ -270,6 +296,9 @@ def install_usage_dashboard(app: Any, store: GPTThreadStore, watchdog: ChatWatch
         [
             Route("/dashboard", dashboard_page, methods=["GET"]),
             Route("/dashboard/", dashboard_page, methods=["GET"]),
+            Route("/dashboard/agents", agents_page, methods=["GET"]),
+            Route("/dashboard/agents/", agents_page, methods=["GET"]),
+            Route("/dashboard/agents/api", agents_api, methods=["GET"]),
             Route("/dashboard/login", dashboard_login, methods=["POST"]),
             Route("/dashboard/logout", dashboard_logout, methods=["POST"]),
             Route("/dashboard/api", dashboard_api, methods=["GET"]),

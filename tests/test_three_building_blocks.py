@@ -168,9 +168,15 @@ def test_ledger_owns_schema_and_evidence_columns(tmp_path):
             "purpose",
             "next_attempt_at",
         } <= columns
-        assert "next_check_at" in task_columns
-        assert {"creation_request_id", "creation_user_message_id"} <= agent_columns
-        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "9"
+        assert {"next_check_at", "gateway_operation_id"} <= task_columns
+        assert {
+            "creation_request_id",
+            "creation_user_message_id",
+            "gateway_agent_id",
+            "gateway_control_operation_id",
+        } <= agent_columns
+        assert "gateway_operation_id" in columns
+        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "10"
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 

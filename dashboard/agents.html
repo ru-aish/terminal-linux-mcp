@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#d9d4c8">
+  <title>Terminal MCP · Agent dispatch</title>
+  <link rel="stylesheet" href="/dashboard/assets/agents.css">
+  <script src="/dashboard/assets/agents.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to agent status</a>
+  <div class="shell">
+    <header class="masthead">
+      <a class="identity" href="/dashboard/agents" aria-label="Terminal MCP agent dispatch">
+        <span class="signal" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>Terminal MCP</strong><small>Agent dispatch</small></span>
+      </a>
+      <nav aria-label="Dashboard sections">
+        <a href="/dashboard">Usage</a>
+        <a href="/dashboard/agents" aria-current="page">Agents</a>
+      </nav>
+      <div id="connection" class="connection" data-state="loading" aria-live="polite">
+        <i></i><span>Loading</span>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="dispatch-head">
+        <div>
+          <p class="eyebrow">One shared backend rail · five managed children</p>
+          <h1>Every request has a place in line.</h1>
+          <p class="intro">This board separates local orchestration state from physical ChatGPT requests. More agents add queue time, never request pressure.</p>
+        </div>
+        <div class="next-slot" aria-labelledby="nextSlotLabel">
+          <span id="nextSlotLabel">Next eligible request</span>
+          <strong id="nextSlot">—</strong>
+          <small id="generatedAt">Not updated</small>
+        </div>
+      </section>
+
+      <section class="capacity" aria-label="Agent capacity and queue totals">
+        <article><span>Active children</span><strong id="activeChildren">—</strong><small id="capacityLimit">of 5 slots</small></article>
+        <article><span>Queued operations</span><strong id="queuedOperations">—</strong><small>durable request work</small></article>
+        <article><span>Terminal agents</span><strong id="terminalAgents">—</strong><small>completed, failed, cancelled</small></article>
+        <article><span>Requests · 24h</span><strong id="requestCount">—</strong><small id="rateLimitedCount">— rate limited</small></article>
+      </section>
+
+      <section class="rail-section" aria-labelledby="railTitle">
+        <div class="section-head">
+          <div><p class="eyebrow">Dispatch rail</p><h2 id="railTitle">What the gateway will do next</h2></div>
+          <span class="legend"><i class="read"></i>read <i class="heavy"></i>heavy <i class="cleanup"></i>cleanup</span>
+        </div>
+        <ol id="operationRail" class="operation-rail" aria-live="polite">
+          <li class="empty">No queued provider operations.</li>
+        </ol>
+      </section>
+
+      <div class="split">
+        <section class="circuit-section" aria-labelledby="circuitTitle">
+          <div class="section-head compact"><div><p class="eyebrow">Circuit board</p><h2 id="circuitTitle">Backend pressure</h2></div></div>
+          <div id="circuits" class="circuits"><p class="empty">No circuit records yet.</p></div>
+        </section>
+
+        <section class="request-section" aria-labelledby="requestTitle">
+          <div class="section-head compact"><div><p class="eyebrow">Physical calls</p><h2 id="requestTitle">Latest request events</h2></div></div>
+          <ol id="requestRail" class="request-rail"><li class="empty">No requests recorded.</li></ol>
+        </section>
+      </div>
+
+      <section class="agent-section" aria-labelledby="agentTitle">
+        <div class="section-head agent-heading">
+          <div><p class="eyebrow">Durable tree</p><h2 id="agentTitle">Agents and tasks</h2></div>
+          <label><span class="sr-only">Filter agents</span><input id="agentFilter" type="search" placeholder="Filter title, state, or ID" autocomplete="off"></label>
+        </div>
+        <div id="agentList" class="agent-list" aria-live="polite"><p class="empty">No agents registered.</p></div>
+      </section>
+
+      <section class="principle" aria-labelledby="principleTitle">
+        <p class="eyebrow">How to read this board</p>
+        <h2 id="principleTitle">Local state is instant. Canonical state waits for the rail.</h2>
+        <div>
+          <p><strong>UNKNOWN is safe.</strong> An inactive stream or <code>running=false</code> does not prove completion.</p>
+          <p><strong>Mutations are staged.</strong> Create and continue are verified in later scheduler ticks.</p>
+          <p><strong>429 is shared.</strong> The circuit stops the affected lane instead of trying another child.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Auto-refresh every 5 seconds</span>
+      <form method="post" action="/dashboard/logout"><button type="submit">Lock dashboard</button></form>
+    </footer>
+  </div>
+</body>
+</html>
