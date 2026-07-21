@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 
 from chat_internal_client import (
+    CHAT_RENDERER_BRIDGE_JS,
     InternalChatClient,
     RuntimeNotReadyError,
     RuntimeProtocolError,
@@ -41,6 +42,16 @@ def test_renderer_selection_accepts_sandbox_devtools_and_prefers_plain_main():
     plain = target("http://127.0.0.1:5175/", target_id="plain")
     selected = select_main_renderer_target([sandbox, plain])
     assert selected.target_id == "plain"
+
+
+def test_renderer_selection_uses_configured_webview_port():
+    alternate = target("http://127.0.0.1:5188/", target_id="alternate")
+    selected = select_main_renderer_target(
+        [alternate], expected_webview_port=5188
+    )
+    assert selected.target_id == "alternate"
+    with pytest.raises(RuntimeNotReadyError, match="auxiliary"):
+        select_main_renderer_target([alternate])
 
 
 def test_renderer_selection_rejects_avatar_only_target():
@@ -774,11 +785,7 @@ def test_mutation_confirmation_uses_bounded_single_readback():
 
 
 def test_owned_stream_marker_is_age_bounded_but_cancel_handle_is_retained():
-    module_source = Path(InternalChatClient.__module__.replace(".", "/") + ".py")
-    if not module_source.exists():
-        module_source = Path(__file__).resolve().parents[1] / "chat_internal_client.py"
-    source = module_source.read_text()
-
+    source = CHAT_RENDERER_BRIDGE_JS + inspect.getsource(InternalChatClient)
     assert "Date.now() - startedAt <= 120000" in source
     assert "owned_stream:ownedStreamActive" in source
     assert "if (!streams.has(id)) return {cancelled:false" in source

@@ -13,9 +13,11 @@ from chat_agent_orchestrator import CoordinatorConfig
 from chat_gateway import (
     ChatGateway,
     CircuitConfig,
+    CircuitState,
     FakeBackend,
     FakeClock,
     GatewayConfig,
+    InfrastructureError,
     LaneLimit,
     AgentState,
     OperationState,
@@ -407,3 +409,45 @@ def test_completed_child_reopens_for_new_parent_instruction(tmp_path):
         operation.type is OperationType.CONTINUE
         for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
     )
+
+
+def test_runtime_outage_pauses_agents_without_consuming_retry_budget(tmp_path):
+    coordinator, gateway, backend, clock, _runtime = make_coordinator(tmp_path)
+    parent = run(coordinator.register_parent("parent-chat"))
+    run(
+        coordinator.spawn(
+            parent["agent_id"],
+            "Wait through a shared renderer outage.",
+            idempotency_key="runtime-outage-child",
+        )
+    )
+    gateway_id = next(
+        agent.id
+        for agent in gateway.ledger.list_agents()
+        if agent.conversation_id is None
+    )
+    backend.queue("create_thread", InfrastructureError("renderer is unavailable"))
+
+    outage = run(coordinator.sync_once())
+    assert outage["outcome"] == "infrastructure-outage"
+    assert outage["circuit_state"] == CircuitState.OPEN.value
+    create = next(
+        item
+        for item in gateway.ledger.list_operations(state=OperationState.PENDING)
+        if item.type is OperationType.CREATE
+    )
+    assert create.attempts == 0
+    assert gateway.ledger.get_agent(gateway_id).state is AgentState.CREATING
+
+    clock.advance(1)
+    probe = run(coordinator.sync_once())
+    assert probe["operation_type"] == OperationType.RECOVERY_PROBE.value
+    assert probe["physical_requests"] == 1
+    assert backend.calls[-1].method == "health"
+    assert gateway.runtime_circuit() is CircuitState.PACED
+
+    clock.advance(1)
+    resumed = run(coordinator.sync_once())
+    assert resumed["operation_type"] == OperationType.CREATE.value
+    assert resumed["outcome"] == "success"
+    assert sum(call.method == "create_thread" for call in backend.calls) == 2

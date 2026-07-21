@@ -15,10 +15,9 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
-import httpx
 
 from conversation_gateway import ConversationGateway, DeliveryState
 from durable_ledger import DurableLedger
@@ -1111,6 +1110,7 @@ class ChatWatchdog:
         config: ChatWatchdogConfig,
         *,
         adapter_factory: Callable[[], ChatAdapter] | None = None,
+        runtime_ensure: Callable[[], Awaitable[Any]] | None = None,
         clock: Callable[[], float] = time.time,
     ):
         self.config = config
@@ -1138,6 +1138,7 @@ class ChatWatchdog:
                 f"only {CODEX_INTERNAL_ADAPTER_NAME!r} is supported"
             )
         self.clock = clock
+        self._runtime_ensure = runtime_ensure
         self._task: asyncio.Task[None] | None = None
         self._scan_lock = asyncio.Lock()
         self._runtime_launch_lock = asyncio.Lock()
@@ -1235,6 +1236,35 @@ class ChatWatchdog:
         if not self._uses_managed_runtime:
             return False
         initial = await self._probe_managed_runtime()
+        if self._runtime_ensure is not None:
+            if initial.ready:
+                self._runtime["runtime_state"] = "ready"
+                return False
+            attempt = {
+                "at": _utc_now(),
+                "attempted": True,
+                "started": False,
+                "action": "service-recover",
+                "initial_reason": initial.reason,
+                "reason": "",
+            }
+            self._runtime["last_app_start"] = attempt
+            self._runtime["runtime_state"] = "recovering"
+            try:
+                await self._runtime_ensure()
+            except Exception as exc:
+                attempt["reason"] = sanitize_runtime_error(exc)
+                self._runtime["runtime_state"] = "runtime_unavailable"
+                raise RuntimeUnavailableError(attempt["reason"]) from exc
+            final = await self._probe_managed_runtime()
+            if not final.ready:
+                attempt["reason"] = final.reason or "runtime service recovered without a ready renderer"
+                self._runtime["runtime_state"] = "runtime_not_ready"
+                raise RuntimeNotReadyError(attempt["reason"])
+            attempt["started"] = True
+            attempt["ready_at"] = _utc_now()
+            self._runtime["runtime_state"] = "ready"
+            return True
         if initial.ready:
             self._runtime["runtime_state"] = "ready"
             return False

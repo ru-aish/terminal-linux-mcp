@@ -41,8 +41,9 @@ class CircuitManager:
         lane: Lane,
         operation_type: OperationType,
         now: float,
+        scope: str | None = None,
     ) -> tuple[bool, Optional[float], CircuitRecord]:
-        scope = scope_for_lane(lane)
+        scope = scope or scope_for_lane(lane)
         record = self.ledger.get_circuit(connection, scope=scope, now=now)
 
         if record.state is CircuitState.PACED:
@@ -171,6 +172,59 @@ class CircuitManager:
             probe_failures=failures,
             half_open_successes=0,
             last_success_at=None,
+            paced_started_at=None,
+            last_attempt_at=None,
+            updated_at=now,
+        )
+        self.ledger.save_circuit(connection, record)
+        return record
+
+    def record_outage(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: str,
+        now: float,
+    ) -> CircuitRecord:
+        """Open a shared infrastructure circuit without consuming work retries."""
+        return self.record_rate_limit(connection, scope=scope, now=now)
+
+    def pause(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: str,
+        now: float,
+    ) -> CircuitRecord:
+        record = self.ledger.get_circuit(connection, scope=scope, now=now)
+        record = replace(
+            record,
+            state=CircuitState.OPEN,
+            opened_at=now,
+            retry_at=None,
+            half_open_successes=0,
+            last_attempt_at=None,
+            updated_at=now,
+        )
+        self.ledger.save_circuit(connection, record)
+        return record
+
+    def resume(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scope: str,
+        now: float,
+    ) -> CircuitRecord:
+        record = self.ledger.get_circuit(connection, scope=scope, now=now)
+        record = replace(
+            record,
+            state=CircuitState.CLOSED,
+            opened_at=None,
+            retry_at=None,
+            probe_failures=0,
+            half_open_successes=0,
+            last_success_at=now,
             paced_started_at=None,
             last_attempt_at=None,
             updated_at=now,

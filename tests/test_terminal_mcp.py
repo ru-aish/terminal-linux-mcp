@@ -4,7 +4,6 @@ import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import mcp
@@ -19,6 +18,8 @@ EXPECTED_TOOLS = [
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
     "run_agy_yolo", "start_agy_yolo",
+    "chat_runtime_status", "chat_runtime_health", "chat_runtime_control",
+    "chat_runtime_logs", "chat_runtime_circuit",
     "agent_projects_list", "agent_project_get", "agent_project_threads",
     "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
     "agent_tail", "agent_send", "agent_wait", "agent_sync", "agent_children",
@@ -771,3 +772,104 @@ def test_agent_send_preserves_legacy_positional_parameter_order():
         "cwd",
     ]
     assert parameters[7] == "purpose"
+
+
+def test_chat_runtime_control_pauses_recovers_and_resumes(tmp_path, monkeypatch):
+    from chat_gateway import CircuitState
+
+    project = tmp_path / "runtime-control-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    session_id = "runtime-control-thread"
+    run(terminal_mcp.bootstrap_thread(session_id, str(project), max_chars=100000))
+
+    class CircuitRecord:
+        scope = "runtime"
+        opened_at = None
+        retry_at = None
+        probe_failures = 0
+        half_open_successes = 0
+        last_success_at = None
+        updated_at = 1.0
+
+        def __init__(self):
+            self.state = CircuitState.CLOSED
+
+    class Ledger:
+        def __init__(self):
+            self.record = CircuitRecord()
+
+        def list_circuits(self):
+            return [self.record]
+
+    class Gateway:
+        def __init__(self):
+            self.ledger = Ledger()
+            self.transitions = []
+
+        def pause_runtime(self):
+            self.transitions.append("pause")
+            self.ledger.record.state = CircuitState.OPEN
+            return self.ledger.record.state
+
+        def resume_runtime(self):
+            self.transitions.append("resume")
+            self.ledger.record.state = CircuitState.CLOSED
+            return self.ledger.record.state
+
+    class Controller:
+        def __init__(self):
+            self.actions = []
+
+        async def health(self):
+            return {"ready": True, "webview": {"ready": True}}
+
+        async def restart(self, *, wait=True):
+            self.actions.append(("restart", wait))
+            return {"action": "restart", "health": await self.health()}
+
+    class Service:
+        def __init__(self):
+            self.wakes = 0
+
+        def wake(self):
+            self.wakes += 1
+
+    gateway = Gateway()
+    controller = Controller()
+    service = Service()
+    monkeypatch.setattr(terminal_mcp, "get_chat_gateway", lambda: gateway)
+    monkeypatch.setattr(
+        terminal_mcp, "get_chat_runtime_controller", lambda: controller
+    )
+    monkeypatch.setattr(terminal_mcp, "get_chat_agent_service", lambda: service)
+
+    health = json.loads(
+        run(
+            terminal_mcp.chat_runtime_health(
+                session_id=session_id, cwd=str(project)
+            )
+        )
+    )
+    assert health["ready"] is True
+
+    result = json.loads(
+        run(
+            terminal_mcp.chat_runtime_control(
+                "restart", wait=True, session_id=session_id, cwd=str(project)
+            )
+        )
+    )
+    assert controller.actions == [("restart", True)]
+    assert gateway.transitions == ["pause", "resume"]
+    assert result["circuits"]["runtime"]["state"] == "CLOSED"
+    assert service.wakes == 1
+
+    paused = json.loads(
+        run(
+            terminal_mcp.chat_runtime_circuit(
+                "pause", session_id=session_id, cwd=str(project)
+            )
+        )
+    )
+    assert paused["runtime"]["state"] == "OPEN"

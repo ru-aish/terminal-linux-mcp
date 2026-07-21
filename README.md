@@ -525,6 +525,13 @@ The regression suite verifies:
 - filesystem and background-process lifecycle
 - bearer authentication
 
+## Dedicated ChatGPT runtime
+
+For multi-day subagent workloads, run ChatGPT Desktop under its own supervised
+user service rather than as a child of Terminal MCP. The runtime circuit, MCP
+control tools, installation order, fault-injection tests, and rollback procedure
+are documented in [`docs/chat-runtime-supervisor.md`](docs/chat-runtime-supervisor.md).
+
 ## Troubleshooting
 
 ### Fresh Linux machine or missing `venv`/`pip`

@@ -11,7 +11,12 @@ from .backend import BackendAdapter
 from .circuit_breaker import CircuitManager, JitterFunction, scope_for_lane
 from .clock import Clock, SystemClock
 from .config import GatewayConfig
-from .errors import BackendError, MalformedBackendResponse, RateLimitError
+from .errors import (
+    BackendError,
+    InfrastructureError,
+    MalformedBackendResponse,
+    RateLimitError,
+)
 from .ledger import SQLiteLedger
 from .models import (
     AgentRecord,
@@ -31,6 +36,7 @@ from .rate_limiter import DurableRateLimiter
 from .status_reducer import reduce_snapshot
 
 RetryJitter = Callable[[float, str, int], float]
+RUNTIME_CIRCUIT_SCOPE = "runtime"
 
 
 @dataclass(frozen=True)
@@ -338,6 +344,26 @@ class ChatGateway:
     def tick_sync(self) -> TickResult:
         return asyncio.run(self.tick())
 
+    def runtime_circuit(self) -> CircuitState:
+        with self.ledger.transaction() as connection:
+            return self.ledger.get_circuit(
+                connection, scope=RUNTIME_CIRCUIT_SCOPE, now=self.clock.now()
+            ).state
+
+    def pause_runtime(self) -> CircuitState:
+        now = self.clock.now()
+        with self.ledger.transaction(immediate=True) as connection:
+            return self.circuits.pause(
+                connection, scope=RUNTIME_CIRCUIT_SCOPE, now=now
+            ).state
+
+    def resume_runtime(self) -> CircuitState:
+        now = self.clock.now()
+        with self.ledger.transaction(immediate=True) as connection:
+            return self.circuits.resume(
+                connection, scope=RUNTIME_CIRCUIT_SCOPE, now=now
+            ).state
+
     def next_eligible_at(self) -> Optional[float]:
         """Return the earliest durable request slot without claiming work."""
 
@@ -346,21 +372,35 @@ class ChatGateway:
         if not pending:
             return None
         circuits = {record.scope: record for record in self.ledger.list_circuits()}
+        runtime = circuits.get(RUNTIME_CIRCUIT_SCOPE)
         candidates: list[float] = []
         with self.ledger.transaction() as connection:
             for operation in pending:
+                runtime_probe = _is_runtime_probe(operation)
                 eligible = max(now, operation.due_at)
-                rate = self.rate_limiter.check(connection, lane=operation.lane, now=now)
-                if rate.next_at is not None:
-                    eligible = max(eligible, rate.next_at)
-                circuit = circuits.get(scope_for_lane(operation.lane))
-                if circuit is not None and circuit.retry_at is not None:
-                    if circuit.state in {
-                        CircuitState.OPEN,
-                        CircuitState.HALF_OPEN,
-                        CircuitState.PACED,
-                    }:
-                        eligible = max(eligible, circuit.retry_at)
+                if runtime is not None and runtime.state in {
+                    CircuitState.OPEN,
+                    CircuitState.HALF_OPEN,
+                }:
+                    if runtime.retry_at is None:
+                        if not runtime_probe:
+                            continue
+                    else:
+                        eligible = max(eligible, runtime.retry_at)
+                if not runtime_probe:
+                    rate = self.rate_limiter.check(
+                        connection, lane=operation.lane, now=now
+                    )
+                    if rate.next_at is not None:
+                        eligible = max(eligible, rate.next_at)
+                    circuit = circuits.get(scope_for_lane(operation.lane))
+                    if circuit is not None and circuit.retry_at is not None:
+                        if circuit.state in {
+                            CircuitState.OPEN,
+                            CircuitState.HALF_OPEN,
+                            CircuitState.PACED,
+                        }:
+                            eligible = max(eligible, circuit.retry_at)
                 candidates.append(eligible)
         return min(candidates) if candidates else None
 
@@ -393,27 +433,49 @@ class ChatGateway:
                 ):
                     continue
 
-                rate = self.rate_limiter.check(
+                runtime_probe = _is_runtime_probe(operation)
+                runtime_allowed, runtime_next, runtime_circuit = self.circuits.admit(
                     connection,
                     lane=operation.lane,
+                    operation_type=(
+                        OperationType.RECOVERY_PROBE
+                        if runtime_probe
+                        else operation.type
+                    ),
                     now=now,
+                    scope=RUNTIME_CIRCUIT_SCOPE,
                 )
-                if not rate.allowed:
-                    if rate.next_at is not None:
-                        blocked_times.append(rate.next_at)
+                observed_state = runtime_circuit.state.value
+                if not runtime_allowed:
+                    if runtime_next is not None:
+                        blocked_times.append(runtime_next)
                     continue
 
-                allowed, circuit_next, circuit = self.circuits.admit(
-                    connection,
-                    lane=operation.lane,
-                    operation_type=operation.type,
-                    now=now,
-                )
-                observed_state = circuit.state.value
-                if not allowed:
-                    if circuit_next is not None:
-                        blocked_times.append(circuit_next)
-                    continue
+                reservation_scope = RUNTIME_CIRCUIT_SCOPE
+                circuit = runtime_circuit
+                if not runtime_probe:
+                    rate = self.rate_limiter.check(
+                        connection,
+                        lane=operation.lane,
+                        now=now,
+                    )
+                    if not rate.allowed:
+                        if rate.next_at is not None:
+                            blocked_times.append(rate.next_at)
+                        continue
+
+                    allowed, circuit_next, circuit = self.circuits.admit(
+                        connection,
+                        lane=operation.lane,
+                        operation_type=operation.type,
+                        now=now,
+                    )
+                    observed_state = circuit.state.value
+                    if not allowed:
+                        if circuit_next is not None:
+                            blocked_times.append(circuit_next)
+                        continue
+                    reservation_scope = scope_for_lane(operation.lane)
 
                 claim_token = f"{self.instance_id}:{uuid.uuid4().hex}"
                 if not self.ledger.claim_operation(
@@ -428,7 +490,7 @@ class ChatGateway:
                     connection,
                     operation_id=operation.id,
                     lane=operation.lane,
-                    circuit_scope=scope_for_lane(operation.lane),
+                    circuit_scope=reservation_scope,
                     now=now,
                 )
                 claimed = self.ledger.get_operation_tx(connection, operation.id)
@@ -438,7 +500,7 @@ class ChatGateway:
                         operation=claimed,
                         request_event_id=event_id,
                         claim_token=claim_token,
-                        circuit_scope=scope_for_lane(operation.lane),
+                        circuit_scope=reservation_scope,
                     ),
                     None,
                     circuit.state.value,
@@ -460,12 +522,20 @@ class ChatGateway:
         if operation.type is OperationType.RECOVERY_PROBE:
             source_operation_id = payload.get("source_operation_id")
             probe_action = str(payload.get("probe_action", "get_thread"))
+            if probe_action == "health":
+                health_value = await self.backend.health()
+                return _DispatchResult(
+                    health_value,
+                    OperationType.RECOVERY_PROBE,
+                    {"scope": str(payload.get("scope") or RUNTIME_CIRCUIT_SCOPE)},
+                    None,
+                )
             if probe_action == "get_thread":
-                value = await self.backend.get_thread(
+                snapshot_value = await self.backend.get_thread(
                     conversation_id=str(payload["conversation_id"])
                 )
                 return _DispatchResult(
-                    value,
+                    snapshot_value,
                     OperationType.INSPECT,
                     {"conversation_id": payload["conversation_id"]},
                     None,
@@ -984,10 +1054,12 @@ class ChatGateway:
         finished_at: float,
     ) -> TickResult:
         backend_error = _normalize_error(error)
+        infrastructure_outage = isinstance(backend_error, InfrastructureError)
         rate_limited = isinstance(backend_error, RateLimitError) or (
             backend_error.status_code == 429
         )
         next_at: Optional[float] = None
+        result_scope = reservation.circuit_scope
         with self.ledger.transaction(immediate=True) as connection:
             operation = self.ledger.get_operation_tx(
                 connection, reservation.operation.id
@@ -999,14 +1071,57 @@ class ChatGateway:
                 connection,
                 event_id=reservation.request_event_id,
                 finished_at=finished_at,
-                outcome="RATE_LIMITED" if rate_limited else "ERROR",
+                outcome=(
+                    "INFRASTRUCTURE_OUTAGE"
+                    if infrastructure_outage
+                    else "RATE_LIMITED"
+                    if rate_limited
+                    else "ERROR"
+                ),
                 status_code=backend_error.status_code,
                 error_class=type(backend_error).__name__,
                 is_rate_limit=rate_limited,
                 details={"message": str(backend_error)[:500]},
             )
 
-            if rate_limited:
+            if infrastructure_outage:
+                result_scope = RUNTIME_CIRCUIT_SCOPE
+                if _is_runtime_probe(operation):
+                    circuit = self.circuits.record_probe_error(
+                        connection,
+                        scope=RUNTIME_CIRCUIT_SCOPE,
+                        now=finished_at,
+                    )
+                    self.ledger.fail_operation(
+                        connection,
+                        operation_id=operation.id,
+                        now=finished_at,
+                        error=str(backend_error),
+                    )
+                else:
+                    circuit = self.circuits.record_outage(
+                        connection,
+                        scope=RUNTIME_CIRCUIT_SCOPE,
+                        now=finished_at,
+                    )
+                    self.ledger.requeue_operation(
+                        connection,
+                        operation_id=operation.id,
+                        due_at=circuit.retry_at or finished_at,
+                        now=finished_at,
+                        error=str(backend_error),
+                        increment_attempts=False,
+                    )
+                next_at = circuit.retry_at
+                self._ensure_recovery_probe(
+                    connection,
+                    scope=RUNTIME_CIRCUIT_SCOPE,
+                    failed_operation=operation,
+                    due_at=next_at or finished_at,
+                    now=finished_at,
+                    generation=circuit.opened_at or finished_at,
+                )
+            elif rate_limited:
                 circuit = self.circuits.record_rate_limit(
                     connection,
                     scope=reservation.circuit_scope,
@@ -1097,10 +1212,16 @@ class ChatGateway:
             operation_type=reservation.operation.type.value,
             lane=reservation.operation.lane.value,
             physical_requests=1,
-            circuit_state=self._circuit_state(reservation.circuit_scope),
+            circuit_state=self._circuit_state(result_scope),
             next_eligible_at=next_at,
             agent_id=reservation.operation.agent_id,
-            outcome="rate-limited" if rate_limited else "error",
+            outcome=(
+                "infrastructure-outage"
+                if infrastructure_outage
+                else "rate-limited"
+                if rate_limited
+                else "error"
+            ),
             error=f"{type(backend_error).__name__}: {backend_error}",
         )
 
@@ -1218,6 +1339,12 @@ class ChatGateway:
             payload["scope"] = scope
             payload.setdefault("generation", operation.created_at)
             return payload
+        if scope == RUNTIME_CIRCUIT_SCOPE:
+            return {
+                "scope": scope,
+                "probe_action": "health",
+                "generation": self.clock.now(),
+            }
         if scope != "conversation":
             return {
                 "scope": scope,
@@ -1311,6 +1438,14 @@ def _require_mutation(value: Any, operation: str) -> MutationResult:
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _is_runtime_probe(operation: OperationRecord) -> bool:
+    return (
+        operation.type is OperationType.RECOVERY_PROBE
+        and str(operation.payload.get("scope") or "") == RUNTIME_CIRCUIT_SCOPE
+        and str(operation.payload.get("probe_action") or "") == "health"
+    )
 
 
 def _probe_lane(payload: Mapping[str, Any], fallback: Lane) -> Lane:

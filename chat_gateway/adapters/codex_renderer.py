@@ -8,56 +8,24 @@ from threading import Lock
 from typing import Any, Mapping, Sequence
 from urllib.request import urlopen
 
-from ..errors import BackendError, MalformedBackendResponse, RateLimitError
+from ..renderer_bridge import CHAT_RENDERER_BRIDGE_JS
+from ..renderer_target import RendererTargetError, select_main_renderer_target
+from ..errors import (
+    BackendError,
+    InfrastructureError,
+    MalformedBackendResponse,
+    RateLimitError,
+)
 from ..models import MutationResult, ThreadSnapshot, TurnSnapshot
 
-_BRIDGE = r"""
-const gatewayClientKey = Symbol.for('chat-backend-gateway.renderer.client.v1');
-const gatewayRuntimeKey = Symbol.for('chat-backend-gateway.renderer.runtime.v1');
+_BRIDGE = (
+    CHAT_RENDERER_BRIDGE_JS
+    + r"""
+const gatewayRuntimeKey = Symbol.for('chat-backend-gateway.renderer.runtime.v2');
 window[gatewayRuntimeKey] ||= {handles:new Map(), nodes:new Map()};
 const gatewayRuntime = window[gatewayRuntimeKey];
-const methodNames = (value) => {
-  const names = new Set();
-  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return names;
-  try { for (const name of Object.getOwnPropertyNames(value)) names.add(name); } catch {}
-  try {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype) for (const name of Object.getOwnPropertyNames(prototype)) names.add(name);
-  } catch {}
-  return names;
-};
-const isClient = (value) => {
-  const names = methodNames(value);
-  return ['get','startCompletionStream','delete','listProjectConversations'].every((name) => names.has(name));
-};
-const resolveClient = () => {
-  if (isClient(window[gatewayClientKey])) return window[gatewayClientKey];
-  const candidates = [];
-  for (const symbol of Object.getOwnPropertySymbols(window)) {
-    try { candidates.push(window[symbol]); } catch {}
-  }
-  for (const name of Object.getOwnPropertyNames(window)) {
-    let value;
-    try { value = window[name]; } catch { continue; }
-    candidates.push(value);
-    if (value && typeof value === 'object') {
-      let keys = [];
-      try { keys = Object.getOwnPropertyNames(value).slice(0, 250); } catch {}
-      for (const childName of keys) {
-        try { candidates.push(value[childName]); } catch {}
-      }
-    }
-  }
-  const client = candidates.find(isClient);
-  if (!client) throw new Error('ChatGPT renderer client was not discoverable');
-  window[gatewayClientKey] = client;
-  return client;
-};
-const plain = (value) => {
-  if (value === undefined) return null;
-  try { return JSON.parse(JSON.stringify(value)); } catch { return value; }
-};
 """
+)
 
 
 @dataclass(frozen=True)
@@ -83,14 +51,18 @@ class CodexRendererBackend:
         model_slug: str = "gpt-5.6-terra",
         stream_start_timeout: float = 30.0,
         cdp_timeout: float = 45.0,
+        webview_port: int = 5175,
     ) -> None:
         self.cdp_endpoint = cdp_endpoint.rstrip("/")
         self.model_slug = model_slug.strip()
         self.stream_start_timeout = stream_start_timeout
         self.cdp_timeout = cdp_timeout
+        self.webview_port = int(webview_port)
         self._lock = Lock()
         if not self.model_slug:
             raise ValueError("model_slug cannot be empty")
+        if not 1 <= self.webview_port <= 65535:
+            raise ValueError("webview_port must be between 1 and 65535")
 
     @classmethod
     def from_environment(cls) -> "CodexRendererBackend":
@@ -103,7 +75,23 @@ class CodexRendererBackend:
                 os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
             ),
             cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
+            webview_port=int(os.environ.get("CHAT_GATEWAY_WEBVIEW_PORT", "5175")),
         )
+
+    async def health(self) -> Mapping[str, Any]:
+        expression = f"""
+        (async () => {{
+          {_BRIDGE}
+          const resolved = await resolveClient();
+          return plain({{ready:true, diagnostics:resolved.diagnostics || {{}}}});
+        }})()
+        """
+        payload = self._evaluate(expression)
+        if not isinstance(payload, Mapping) or payload.get("ready") is not True:
+            raise InfrastructureError(
+                "ChatGPT renderer client readiness returned false"
+            )
+        return payload
 
     async def create_thread(
         self,
@@ -120,7 +108,8 @@ class CodexRendererBackend:
         expression = f"""
         (async () => {{
           {_BRIDGE}
-          const client = resolveClient();
+          const resolved = await resolveClient();
+          const client = resolved.client;
           const text = {json.dumps(prompt)};
           const projectId = {json.dumps(project_id)};
           const userMessageId = {json.dumps(user_message_id)};
@@ -209,7 +198,8 @@ class CodexRendererBackend:
         expression = f"""
         (async () => {{
           {_BRIDGE}
-          const client = resolveClient();
+          const resolved = await resolveClient();
+          const client = resolved.client;
           const id = {json.dumps(conversation_id)};
           const raw = await client.get(id);
           const currentNode = raw && (raw.current_node || raw.currentNode);
@@ -232,7 +222,8 @@ class CodexRendererBackend:
         expression = f"""
         (async () => {{
           {_BRIDGE}
-          const client = resolveClient();
+          const resolved = await resolveClient();
+          const client = resolved.client;
           const id = {json.dumps(conversation_id)};
           const parent = gatewayRuntime.nodes.get(id);
           if (!parent) throw new Error('no cached canonical parent node; call get_thread before continue_thread');
@@ -289,7 +280,8 @@ class CodexRendererBackend:
         expression = f"""
         (async () => {{
           {_BRIDGE}
-          const client = resolveClient();
+          const resolved = await resolveClient();
+          const client = resolved.client;
           const id = {json.dumps(conversation_id)};
           const handle = gatewayRuntime.handles.get(id);
           if (handle && typeof handle.cancel === 'function') await handle.cancel();
@@ -306,7 +298,8 @@ class CodexRendererBackend:
         expression = f"""
         (async () => {{
           {_BRIDGE}
-          const client = resolveClient();
+          const resolved = await resolveClient();
+          const client = resolved.client;
           const id = {json.dumps(conversation_id)};
           const result = await client.delete(id);
           gatewayRuntime.handles.delete(id);
@@ -323,7 +316,8 @@ class CodexRendererBackend:
         expression = f"""
         (async () => {{
           {_BRIDGE}
-          const client = resolveClient();
+          const resolved = await resolveClient();
+          const client = resolved.client;
           const result = await client.listProjectConversations({{
             projectId:{json.dumps(project_id)},limit:50,cursor:null,ownedOnly:true
           }});
@@ -358,21 +352,27 @@ class CodexRendererBackend:
         return tuple(snapshots)
 
     def _target(self) -> _Target:
-        with urlopen(f"{self.cdp_endpoint}/json/list", timeout=5.0) as response:
-            targets = json.load(response)
+        try:
+            with urlopen(f"{self.cdp_endpoint}/json/list", timeout=5.0) as response:
+                targets = json.load(response)
+        except Exception as error:
+            raise InfrastructureError(
+                f"ChatGPT CDP endpoint is unavailable: {type(error).__name__}: {error}"
+            ) from error
         if not isinstance(targets, list):
-            raise BackendError("CDP target list was not a list", transient=True)
-        for item in targets:
-            if not isinstance(item, Mapping) or item.get("type") != "page":
-                continue
-            websocket_url = item.get("webSocketDebuggerUrl")
-            if websocket_url:
-                return _Target(
-                    websocket_url=str(websocket_url),
-                    title=str(item.get("title") or ""),
-                    url=str(item.get("url") or ""),
-                )
-        raise BackendError("no CDP page target is available", transient=True)
+            raise InfrastructureError("ChatGPT CDP target list was not a list")
+        try:
+            target = select_main_renderer_target(
+                [dict(item) for item in targets if isinstance(item, Mapping)],
+                expected_webview_port=self.webview_port,
+            )
+        except RendererTargetError as error:
+            raise InfrastructureError(str(error)) from error
+        return _Target(
+            websocket_url=target.websocket_url,
+            title=target.title,
+            url=target.url,
+        )
 
     def _evaluate(self, expression: str, *, timeout: float | None = None) -> Any:
         try:
@@ -410,9 +410,7 @@ class CodexRendererBackend:
                     if message.get("id") != identifier:
                         continue
                     if "error" in message:
-                        raise BackendError(
-                            "CDP Runtime.evaluate failed", transient=True
-                        )
+                        raise InfrastructureError("CDP Runtime.evaluate failed")
                     result = message.get("result")
                     if not isinstance(result, Mapping):
                         raise MalformedBackendResponse("CDP result was not an object")
@@ -430,9 +428,13 @@ class CodexRendererBackend:
                         )
                         if "Too many requests" in description:
                             raise RateLimitError(description)
+                        if _is_infrastructure_message(description):
+                            raise InfrastructureError(description)
                         raise BackendError(description, transient=True)
                     return remote.get("value")
             except RateLimitError:
+                raise
+            except InfrastructureError:
                 raise
             except BackendError:
                 raise
@@ -440,9 +442,26 @@ class CodexRendererBackend:
                 message = f"{type(error).__name__}: {error}"
                 if "Too many requests" in message:
                     raise RateLimitError(message) from error
-                raise BackendError(message, transient=True) from error
+                raise InfrastructureError(message) from error
             finally:
                 connection.close()
+
+
+def _is_infrastructure_message(message: str) -> bool:
+    normalized = message.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "normal-chat client unavailable",
+            "renderer client was not discoverable",
+            "renderer client readiness",
+            "render frame was disposed",
+            "websocket",
+            "connection timed out",
+            "target closed",
+            "session closed",
+        )
+    )
 
 
 def make_backend() -> CodexRendererBackend:

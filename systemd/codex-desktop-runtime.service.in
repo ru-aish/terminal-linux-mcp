@@ -1,0 +1,20 @@
+[Unit]
+Description=Dedicated ChatGPT desktop runtime supervisor
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPOSITORY@
+EnvironmentFile=-%h/.config/terminal-mcp/chat-runtime.env
+Environment=PYTHONUNBUFFERED=1
+Environment=KDE_APPLICATIONS_AS_SCOPE=0
+ExecStart=@PYTHON@ @REPOSITORY@/chat_runtime_supervisor.py
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+TimeoutStopSec=30s
+OOMPolicy=stop
+
+[Install]
+WantedBy=default.target

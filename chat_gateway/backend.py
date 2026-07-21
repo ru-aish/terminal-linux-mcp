@@ -10,6 +10,8 @@ from .models import MutationResult, ThreadSnapshot, TurnSnapshot
 
 
 class BackendAdapter(Protocol):
+    async def health(self) -> Mapping[str, Any]: ...
+
     async def create_thread(
         self,
         *,
@@ -50,6 +52,15 @@ class CallableBackend:
     cancel: AsyncOrSyncCallable
     delete: AsyncOrSyncCallable
     list_project: AsyncOrSyncCallable
+    health_: Optional[AsyncOrSyncCallable] = None
+
+    async def health(self) -> Mapping[str, Any]:
+        if self.health_ is None:
+            return {"ready": True}
+        value = await _invoke(self.health_)
+        if not isinstance(value, Mapping):
+            raise MalformedBackendResponse("health returned a non-mapping")
+        return value
 
     async def create_thread(
         self,
@@ -157,6 +168,14 @@ class FakeBackend:
         self.threads[snapshot.conversation_id] = snapshot
         if project_id and snapshot.conversation_id not in self.projects[project_id]:
             self.projects[project_id].append(snapshot.conversation_id)
+
+    async def health(self) -> Mapping[str, Any]:
+        scripted = self._record("health", {})
+        if scripted is not None:
+            if not isinstance(scripted, Mapping):
+                raise MalformedBackendResponse("scripted health is not a mapping")
+            return scripted
+        return {"ready": True}
 
     def _record(self, method: str, arguments: Mapping[str, Any]) -> Optional[Any]:
         self.calls.append(BackendCall(method, dict(arguments)))

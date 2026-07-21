@@ -42,6 +42,7 @@ from chat_agent_orchestrator import (
 from gateway_agent_orchestrator import GatewayChatAgentCoordinator
 from chat_gateway import ChatGateway, GatewayConfig, SQLiteLedger
 from chat_gateway.adapters.codex_renderer import CodexRendererBackend
+from chat_runtime_controller import ChatRuntimeController
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -106,7 +107,26 @@ CHAT_AGENT_STALE_SECONDS = max(
 _CHAT_AGENT_COORDINATOR: ChatAgentCoordinator | None = None
 _CHAT_AGENT_SERVICE: ChatAgentService | None = None
 _CHAT_GATEWAY: ChatGateway | None = None
+_CHAT_RUNTIME_CONTROLLER: ChatRuntimeController | None = None
 _CHAT_AGENT_RUNTIME_ENSURE: Callable[[], Awaitable[Any]] | None = None
+
+
+def get_chat_runtime_controller() -> ChatRuntimeController:
+    global _CHAT_RUNTIME_CONTROLLER
+    if _CHAT_RUNTIME_CONTROLLER is None:
+        _CHAT_RUNTIME_CONTROLLER = ChatRuntimeController()
+    return _CHAT_RUNTIME_CONTROLLER
+
+
+def _chat_runtime_webview_port() -> int:
+    value = os.environ.get(
+        "MCP_CHAT_RUNTIME_WEBVIEW_URL", "http://127.0.0.1:5175/index.html"
+    )
+    parsed = urlsplit(value)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if not 1 <= port <= 65535:
+        raise ValueError("MCP_CHAT_RUNTIME_WEBVIEW_URL has an invalid port")
+    return port
 
 
 def set_chat_agent_runtime_ensure(
@@ -123,6 +143,7 @@ async def _chat_agent_runtime_factory():
     async with InternalChatClient(
         os.environ.get("MCP_CHAT_WATCHDOG_CDP", DEFAULT_CODEX_CDP_ENDPOINT),
         timeout=float(os.environ.get("MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS", "10")),
+        webview_port=_chat_runtime_webview_port(),
         stream_timeout_seconds=max(30, int(os.environ.get("MCP_CHAT_WATCHDOG_STREAM_TIMEOUT_SECONDS", "3600"))),
         preferred_model=os.environ.get("MCP_CHAT_WATCHDOG_MODEL", ""),
         thinking_effort=os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
@@ -152,6 +173,7 @@ def get_chat_gateway() -> ChatGateway:
                 os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
             ),
             cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
+            webview_port=_chat_runtime_webview_port(),
         )
         _CHAT_GATEWAY = ChatGateway(
             SQLiteLedger(CHAT_GATEWAY_DB_PATH),
@@ -3623,6 +3645,134 @@ def _conversation_id_input(value: str) -> str:
     return value
 
 
+def _runtime_circuit_payload() -> dict[str, Any]:
+    gateway = get_chat_gateway()
+    records = [
+        {
+            "scope": record.scope,
+            "state": record.state.value,
+            "opened_at": record.opened_at,
+            "retry_at": record.retry_at,
+            "probe_failures": record.probe_failures,
+            "half_open_successes": record.half_open_successes,
+            "last_success_at": record.last_success_at,
+            "updated_at": record.updated_at,
+        }
+        for record in gateway.ledger.list_circuits()
+    ]
+    runtime = next((item for item in records if item["scope"] == "runtime"), None)
+    return {"runtime": runtime or {"scope": "runtime", "state": "CLOSED"}, "all": records}
+
+
+@mcp.tool()
+async def chat_runtime_status(
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Return dedicated ChatGPT service, layered health, and gateway circuit state."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(
+            {
+                **(await get_chat_runtime_controller().status()),
+                "circuits": _runtime_circuit_payload(),
+            }
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def chat_runtime_health(
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Probe webview, CDP renderer, and the normal-chat client without mutation."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(await get_chat_runtime_controller().health())
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def chat_runtime_control(
+    action: str,
+    wait: bool = True,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Start, stop, restart, or recover the dedicated ChatGPT runtime service."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    selected = action.strip().lower()
+    if selected not in {"start", "stop", "restart", "recover"}:
+        return _chat_agent_error(ValueError("action must be start, stop, restart, or recover"))
+    gateway = get_chat_gateway()
+    try:
+        gateway.pause_runtime()
+        controller = get_chat_runtime_controller()
+        if selected == "start":
+            result = await controller.start(wait=wait)
+        elif selected == "stop":
+            result = await controller.stop()
+        elif selected == "restart":
+            result = await controller.restart(wait=wait)
+        else:
+            result = await controller.recover()
+        health = result.get("health") if isinstance(result, dict) else None
+        if selected != "stop" and isinstance(health, dict) and health.get("ready"):
+            gateway.resume_runtime()
+            get_chat_agent_service().wake()
+        return _chat_agent_json({"result": result, "circuits": _runtime_circuit_payload()})
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def chat_runtime_logs(
+    lines: int = 200,
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Return bounded logs from the dedicated ChatGPT runtime service."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        return _chat_agent_json(await get_chat_runtime_controller().logs(lines=lines))
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
+async def chat_runtime_circuit(
+    action: str = "status",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Inspect, pause, or resume the shared ChatGPT infrastructure circuit."""
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    selected = action.strip().lower()
+    if selected not in {"status", "pause", "resume"}:
+        return _chat_agent_error(ValueError("action must be status, pause, or resume"))
+    try:
+        gateway = get_chat_gateway()
+        if selected == "pause":
+            gateway.pause_runtime()
+        elif selected == "resume":
+            health = await get_chat_runtime_controller().health()
+            if not health.get("ready"):
+                raise RuntimeError("cannot resume agent requests while ChatGPT runtime is unhealthy")
+            gateway.resume_runtime()
+            get_chat_agent_service().wake()
+        return _chat_agent_json(_runtime_circuit_payload())
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
 @mcp.tool()
 async def agent_projects_list(
     limit: int = 20,
@@ -3974,6 +4124,8 @@ PUBLIC_TOOL_ORDER = (
     "read_file", "watch_image", "write_file", "replace_in_file", "apply_patch", "list_dir", "stat_path",
     "make_dir", "copy_path", "move_path", "run_codex_yolo", "start_codex_yolo",
     "run_agy_yolo", "start_agy_yolo",
+    "chat_runtime_status", "chat_runtime_health", "chat_runtime_control",
+    "chat_runtime_logs", "chat_runtime_circuit",
     "agent_projects_list", "agent_project_get", "agent_project_threads",
     "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
     "agent_tail", "agent_send", "agent_wait", "agent_sync", "agent_children",
@@ -3996,8 +4148,12 @@ def main() -> None:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
-        chat_watchdog = ChatWatchdog(watchdog_config)
-        set_chat_agent_runtime_ensure(chat_watchdog.ensure_background_runtime)
+        runtime_controller = get_chat_runtime_controller()
+        chat_watchdog = ChatWatchdog(
+            watchdog_config,
+            runtime_ensure=runtime_controller.ensure_ready,
+        )
+        set_chat_agent_runtime_ensure(runtime_controller.ensure_ready)
         install_usage_dashboard(
             app, GPT_STORE, chat_watchdog, get_chat_agent_coordinator()
         )

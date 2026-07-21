@@ -30,6 +30,13 @@ class BackendError(GatewayError):
         self.permanent = permanent
 
 
+class InfrastructureError(BackendError):
+    """Shared local-runtime outage that pauses all backend operations."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, transient=True, permanent=False)
+
+
 class RateLimitError(BackendError):
     def __init__(self, message: str = "too many requests") -> None:
         super().__init__(message, status_code=429, transient=True, permanent=False)

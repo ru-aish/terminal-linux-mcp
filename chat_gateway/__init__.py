@@ -13,6 +13,7 @@ from .errors import (
     CapacityError,
     ConfigurationError,
     GatewayError,
+    InfrastructureError,
     MalformedBackendResponse,
     RateLimitError,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "FakeClock",
     "GatewayConfig",
     "GatewayError",
+    "InfrastructureError",
     "Lane",
     "LaneLimit",
     "MalformedBackendResponse",
