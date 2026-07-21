@@ -34,6 +34,10 @@ class ChatRuntimeControllerConfig:
 
     @classmethod
     def from_env(cls) -> "ChatRuntimeControllerConfig":
+        internal_timeout = os.environ.get(
+            "MCP_CHAT_RUNTIME_INTERNAL_TIMEOUT",
+            os.environ.get("MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS", "90"),
+        )
         return cls(
             service_name=os.environ.get(
                 "MCP_CHAT_RUNTIME_SERVICE", "codex-desktop-runtime.service"
@@ -50,9 +54,7 @@ class ChatRuntimeControllerConfig:
             or "http://127.0.0.1:5175/index.html",
             internal_timeout_seconds=max(
                 1.0,
-                float(
-                    os.environ.get("MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS", "10")
-                ),
+                float(internal_timeout),
             ),
             recovery_timeout_seconds=max(
                 5.0,

@@ -32,6 +32,7 @@ class SupervisorConfig:
     webview_url: str
     startup_grace_seconds: float = 45.0
     probe_interval_seconds: float = 10.0
+    health_timeout_seconds: float = 90.0
     failure_threshold: int = 3
     restart_backoff_seconds: float = 5.0
     stop_timeout_seconds: float = 20.0
@@ -78,6 +79,9 @@ class SupervisorConfig:
             ),
             probe_interval_seconds=max(
                 0.5, float(os.environ.get("CHAT_RUNTIME_PROBE_INTERVAL", "10"))
+            ),
+            health_timeout_seconds=max(
+                5.0, float(os.environ.get("CHAT_RUNTIME_HEALTH_TIMEOUT", "90"))
             ),
             failure_threshold=max(
                 1, int(os.environ.get("CHAT_RUNTIME_FAILURE_THRESHOLD", "3"))
@@ -248,7 +252,7 @@ class ChatRuntimeSupervisor:
                 service_name="codex-desktop-runtime.service",
                 cdp_endpoint=self.config.cdp_endpoint,
                 webview_url=self.config.webview_url,
-                internal_timeout_seconds=min(10.0, self.config.probe_interval_seconds),
+                internal_timeout_seconds=self.config.health_timeout_seconds,
             )
         )
         return await controller.health()
@@ -259,34 +263,49 @@ class ChatRuntimeSupervisor:
         except TimeoutError:
             pass
 
+    def cleanup(self) -> None:
+        """Remove every runtime artifact owned by this application identity."""
+        self._stop_generated_scopes()
+        self._clear_stale_runtime_markers()
+
     def _stop_generated_scopes(self) -> None:
-        completed = subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "list-units",
-                "--type=scope",
-                "--all",
-                "--plain",
-                "--no-legend",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
         pattern = re.compile(rf"^app-{re.escape(self.config.app_id)}-[0-9]+\.scope$")
-        for line in completed.stdout.splitlines():
-            unit = line.split(maxsplit=1)[0] if line.strip() else ""
-            if not pattern.fullmatch(unit):
-                continue
-            subprocess.run(
-                ["systemctl", "--user", "stop", unit],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=15,
+        empty_passes = 0
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and empty_passes < 2:
+            completed = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "list-units",
+                    "--type=scope",
+                    "--all",
+                    "--plain",
+                    "--no-legend",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
                 check=False,
             )
+            units = [
+                line.split(maxsplit=1)[0]
+                for line in completed.stdout.splitlines()
+                if line.strip() and pattern.fullmatch(line.split(maxsplit=1)[0])
+            ]
+            if not units:
+                empty_passes += 1
+                time.sleep(0.1)
+                continue
+            empty_passes = 0
+            for unit in units:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", unit],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                    check=False,
+                )
 
     def _clear_stale_runtime_markers(self) -> None:
         for path in (
@@ -339,16 +358,25 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate environment configuration and exit",
     )
+    parser.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="stop adopted application scopes and remove stale runtime markers",
+    )
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
     config = SupervisorConfig.from_env()
+    supervisor = ChatRuntimeSupervisor(config)
     if args.check_config:
         print(json.dumps(asdict(config), sort_keys=True, default=str))
         return 0
-    return asyncio.run(ChatRuntimeSupervisor(config).run())
+    if args.cleanup:
+        supervisor.cleanup()
+        return 0
+    return asyncio.run(supervisor.run())
 
 
 if __name__ == "__main__":

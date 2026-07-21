@@ -8,12 +8,45 @@ from pathlib import Path
 
 import pytest
 
+import chat_runtime_supervisor
 from chat_gateway.adapters import codex_renderer
 from chat_internal_client import CHAT_RENDERER_BRIDGE_JS
 from chat_runtime_controller import (
     ChatRuntimeControllerConfig,
 )
 from chat_runtime_supervisor import ChatRuntimeSupervisor, SupervisorConfig
+
+
+def test_supervisor_uses_configured_health_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[ChatRuntimeControllerConfig] = []
+
+    class FakeController:
+        def __init__(self, config: ChatRuntimeControllerConfig) -> None:
+            captured.append(config)
+
+        async def health(self) -> dict[str, object]:
+            return {"ready": True}
+
+    monkeypatch.setattr(
+        chat_runtime_supervisor, "ChatRuntimeController", FakeController
+    )
+    config = SupervisorConfig(
+        command=(sys.executable, "-c", "pass"),
+        app_id="codex-timeout-test",
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "runtime",
+        status_path=tmp_path / "status.json",
+        cdp_endpoint="http://127.0.0.1:19924",
+        webview_url="http://127.0.0.1:15177/index.html",
+        health_timeout_seconds=75,
+    )
+    supervisor = ChatRuntimeSupervisor(config)
+
+    assert asyncio.run(supervisor._default_health_probe()) == {"ready": True}
+    assert len(captured) == 1
+    assert captured[0].internal_timeout_seconds == 75
 
 
 def test_gateway_adapter_reuses_deep_renderer_resolver() -> None:
@@ -23,6 +56,17 @@ def test_gateway_adapter_reuses_deep_renderer_resolver() -> None:
     assert "const resolved = await resolveClient();" in inspect.getsource(
         codex_renderer.CodexRendererBackend.create_thread
     )
+
+
+def test_controller_reads_runtime_internal_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MCP_CHAT_RUNTIME_INTERNAL_TIMEOUT", "87")
+    monkeypatch.setenv("MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS", "12")
+
+    config = ChatRuntimeControllerConfig.from_env()
+
+    assert config.internal_timeout_seconds == 87
 
 
 def test_controller_rejects_non_loopback_endpoints() -> None:
@@ -79,6 +123,64 @@ def test_supervisor_forces_single_ownership_environment(tmp_path: Path) -> None:
         assert await asyncio.wait_for(task, timeout=5) == 0
 
     asyncio.run(scenario())
+
+
+def test_supervisor_cleanup_stops_only_matching_generated_scopes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    listings = iter(
+        [
+            "app-codex-owned-123.scope loaded active running owned\n"
+            "app-other-456.scope loaded active running other\n",
+            "",
+            "",
+        ]
+    )
+
+    class Completed:
+        def __init__(self, stdout: str = "") -> None:
+            self.stdout = stdout
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+        if "list-units" in command:
+            return Completed(next(listings))
+        return Completed()
+
+    monkeypatch.setattr(chat_runtime_supervisor.subprocess, "run", fake_run)
+    config = SupervisorConfig(
+        command=(sys.executable, "-c", "pass"),
+        app_id="codex-owned",
+        state_dir=tmp_path / "state",
+        runtime_dir=tmp_path / "runtime",
+        status_path=tmp_path / "status.json",
+        cdp_endpoint="http://127.0.0.1:19925",
+        webview_url="http://127.0.0.1:15178/index.html",
+    )
+    config.state_dir.mkdir()
+    config.runtime_dir.mkdir()
+    for path in (
+        config.state_dir / "app.pid",
+        config.state_dir / "webview.pid",
+        config.runtime_dir / "launch-action.sock",
+    ):
+        path.write_text("stale", encoding="utf-8")
+
+    ChatRuntimeSupervisor(config).cleanup()
+
+    assert calls[0][:4] == ["systemctl", "--user", "list-units", "--type=scope"]
+    assert ["systemctl", "--user", "stop", "app-codex-owned-123.scope"] in calls
+    assert not any("app-other-456.scope" in command for command in calls[1:])
+    assert not any(
+        path.exists()
+        for path in (
+            config.state_dir / "app.pid",
+            config.state_dir / "webview.pid",
+            config.runtime_dir / "launch-action.sock",
+        )
+    )
 
 
 def test_supervisor_restarts_whole_generation_after_health_threshold(

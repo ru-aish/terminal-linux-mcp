@@ -21,10 +21,13 @@ Terminal MCP never launches individual ChatGPT windows or owns part of the
 ChatGPT process tree. The services communicate only through loopback webview/CDP
 health checks and `systemctl --user` lifecycle operations.
 
-`KDE_APPLICATIONS_AS_SCOPE=0` is set both in the unit and by the supervisor. It
-prevents KDE from moving Electron into an `app-codex-desktop-*.scope`. The
-supervisor also stops matching generated scopes during recovery as a defensive
-fallback.
+`KDE_APPLICATIONS_AS_SCOPE=0` is set both in the unit and by the supervisor as
+a best-effort request. Some KDE versions still move Electron and its app server
+into an `app-codex-desktop-*.scope`. The runtime explicitly adopts that scope:
+normal recovery stops it, and idempotent `ExecStartPre`/`ExecStopPost` cleanup
+removes it even when the supervisor is killed before its Python shutdown path
+runs. The generated scope is therefore a subordinate implementation detail, not
+an independent lifecycle owner.
 
 ## Health and recovery
 
@@ -40,6 +43,13 @@ failed probes before replacing a generation. Recovery terminates the launcher's
 entire process group, stops any matching generated application scope, removes
 validated stale PID/socket markers, waits for a bounded backoff, and starts one
 new generation.
+
+The normal-chat client can take substantially longer than CDP to become usable
+while plugins and MCP status initialize. `CHAT_RUNTIME_HEALTH_TIMEOUT` therefore
+controls the timeout for one complete renderer/client health probe independently
+from `CHAT_RUNTIME_PROBE_INTERVAL`. Keep it long enough for a cold start; the
+default is 90 seconds. Probes remain sequential, so slow discovery cannot create
+an overlapping retry storm.
 
 The gateway has a separate global `runtime` circuit. Infrastructure failures do
 not spend an agent's retry budget and do not terminalize the agent. The original

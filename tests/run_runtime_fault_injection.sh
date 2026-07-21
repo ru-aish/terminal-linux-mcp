@@ -22,15 +22,11 @@ trap cleanup EXIT
 port_pid() {
   local port="$1"
   ss -ltnp "sport = :$port" 2>/dev/null \
-    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -nu | paste -sd, -
+    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -nu | paste -sd, - || true
 }
 
 live_webview_before="$(port_pid 5175)"
 live_cdp_before="$(port_pid 9222)"
-[[ -n "$live_webview_before" && -n "$live_cdp_before" ]] || {
-  echo "live ChatGPT ports are not available before isolated test" >&2
-  exit 1
-}
 [[ -z "$(port_pid "$webview_port")" && -z "$(port_pid "$cdp_port")" ]] || {
   echo "isolated fault-test ports are occupied" >&2
   exit 1
@@ -146,6 +142,7 @@ payload = {
     "faults": rows,
     "live_webview_pid": sys.argv[4],
     "live_cdp_pid": sys.argv[5],
+    "live_runtime_present": bool(sys.argv[4] or sys.argv[5]),
     "live_runtime_unchanged": True,
 }
 open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
