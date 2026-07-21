@@ -134,6 +134,46 @@ def test_normalize_conversation_uses_only_active_visible_branch():
     assert payload["running"] is False
 
 
+
+def test_normalize_conversation_separates_hidden_raw_leaf_from_visible_leaf():
+    raw = {
+        "id": "conversation",
+        "current_node": "hidden-tail",
+        "mapping": {
+            "root": {"parent": None, "message": None},
+            "u-node": {
+                "parent": "root",
+                "message": message("u-message", "user", "task"),
+            },
+            "a-visible": {
+                "parent": "u-node",
+                "message": message(
+                    "a-message", "assistant", "visible result", end_turn=True
+                ),
+            },
+            "hidden-tail": {
+                "parent": "a-visible",
+                "message": message(
+                    "hidden-message",
+                    "assistant",
+                    "internal metadata",
+                    hidden=True,
+                ),
+            },
+        },
+    }
+
+    payload = normalize_conversation_payload(raw, "conversation")
+
+    assert payload["current_node"] == "hidden-tail"
+    assert payload["visible_current_node"] == "a-visible"
+    assert [turn["node_id"] for turn in payload["turns"]] == [
+        "u-node",
+        "a-visible",
+    ]
+    assert payload["state_verified"] is True
+
+
 def test_normalize_conversation_reports_running_and_owned_stream():
     raw = {
         "current_node": "a-node",

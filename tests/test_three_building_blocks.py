@@ -155,6 +155,24 @@ def test_reducer_exact_marker_matrix_and_contradictions():
     assert reduce_snapshot({"completion_marker": marker}, {**snap(), "current_node": "other"}).state is ReducedState.UNKNOWN
 
 
+
+def test_reducer_uses_visible_leaf_while_preserving_raw_current_node():
+    snapshot = _canonical_snapshot(current_node="hidden-tail")
+    snapshot["visible_current_node"] = "a"
+    snapshot["turns"][0]["node_id"] = "a"
+    snapshot["turns"][0]["key"] = "assistant-message-id"
+
+    reduction = reduce_snapshot({"completion_marker": "DONE"}, snapshot)
+
+    assert reduction.state is ReducedState.STOPPED_INCOMPLETE
+    assert reduction.actions == (ActionType.SEND_CONTINUATION,)
+
+    contradictory = {**snapshot, "visible_current_node": "other-visible-node"}
+    assert reduce_snapshot(
+        {"completion_marker": "DONE"}, contradictory
+    ).state is ReducedState.UNKNOWN
+
+
 def test_ledger_owns_schema_and_evidence_columns(tmp_path):
     ledger = DurableLedger(tmp_path / "ledger.sqlite")
     with ledger.connect() as db:

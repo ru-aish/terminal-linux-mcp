@@ -1244,6 +1244,31 @@ def test_canonical_decision_matrix_is_fail_closed():
     ).state is ThreadDecisionState.UNKNOWN
 
 
+
+def test_hidden_raw_leaf_does_not_block_visible_thread_classification():
+    snapshot = replace(
+        canonical_snapshot(),
+        current_node="hidden-tail",
+        visible_current_node="a-terminal",
+    )
+
+    decision = classify_thread_state(
+        snapshot,
+        task_start_index=0,
+        completion_marker="DONE_I_HAVE_COMPLETED_ALL_THE_STEPS",
+    )
+
+    assert decision.state is ThreadDecisionState.STOPPED_INCOMPLETE
+    assert decision.can_continue is True
+
+    contradictory = replace(snapshot, visible_current_node="different-visible-node")
+    assert classify_thread_state(
+        contradictory,
+        task_start_index=0,
+        completion_marker="DONE_I_HAVE_COMPLETED_ALL_THE_STEPS",
+    ).state is ThreadDecisionState.UNKNOWN
+
+
 def test_old_or_user_marker_never_completes_current_generation():
     marker = "DONE_I_HAVE_COMPLETED_ALL_THE_STEPS"
     snapshot = ThreadSnapshot(

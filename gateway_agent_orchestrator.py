@@ -1153,6 +1153,7 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
             "conversation_id": snapshot.get("conversation_id"),
             "running": bool(snapshot.get("running")),
             "current_node": snapshot.get("current_node"),
+            "visible_current_node": snapshot.get("visible_current_node"),
             "turn_count": len(turns) if isinstance(turns, list) else 0,
             "latest": latest,
         }

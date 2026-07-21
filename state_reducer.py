@@ -91,13 +91,24 @@ def reduce_snapshot(
             "conversation has no verified turns; refusing an unsafe write",
         )
     current_node = str(snapshot.get("current_node") or "")
+    visible_current_node = str(snapshot.get("visible_current_node") or current_node)
     latest = turns[-1] if isinstance(turns[-1], dict) else {}
-    latest_key = str(latest.get("key") or latest.get("node_id") or latest.get("id") or "")
+    latest_key = str(
+        latest.get("node_id") or latest.get("key") or latest.get("id") or ""
+    )
     role = str(latest.get("role") or "").casefold()
     status = str(latest.get("status") or "").casefold()
     end_turn = latest.get("end_turn")
-    if snapshot.get("canonical") and (not current_node or (latest_key and latest_key != current_node)):
-        return Reduction(ReducedState.UNKNOWN, (ActionType.NO_ACTION,), "canonical node and latest turn disagree")
+    if snapshot.get("canonical") and (
+        not current_node
+        or not visible_current_node
+        or (latest_key and latest_key != visible_current_node)
+    ):
+        return Reduction(
+            ReducedState.UNKNOWN,
+            (ActionType.NO_ACTION,),
+            "canonical visible node and latest turn disagree",
+        )
     if (snapshot.get("stale") or str(task.get("status") or "") == "stale") and (
         snapshot.get("active_stream") or snapshot.get("running") or status in _RUNNING
     ):

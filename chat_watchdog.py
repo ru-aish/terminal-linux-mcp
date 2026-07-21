@@ -173,6 +173,7 @@ class ThreadSnapshot:
     reason: str = ""
     turns: tuple[ConversationTurn, ...] = ()
     current_node: str = ""
+    visible_current_node: str = ""
     canonical: bool = False
     state_verified: bool = False
     update_time: float | None = None
@@ -475,8 +476,9 @@ def classify_thread_state(
         {"completion_marker": completion_marker,
          "status": "stopped_incomplete" if not snapshot.canonical else ""},
         {"state_verified": verified, "canonical": snapshot.canonical,
-         "current_node": snapshot.current_node, "running": snapshot.running,
-         "active_stream": snapshot.active_stream,
+         "current_node": snapshot.current_node,
+         "visible_current_node": snapshot.visible_current_node,
+         "running": snapshot.running, "active_stream": snapshot.active_stream,
          "turns": turns},
     )
     if reduction.state is ReducedState.COMPLETED:
@@ -972,6 +974,7 @@ class CodexInternalChatAdapter:
             reason=str(payload.get("reason") or ""),
             turns=turns,
             current_node=str(payload.get("current_node") or ""),
+            visible_current_node=str(payload.get("visible_current_node") or ""),
             canonical=True,
             state_verified=bool(payload.get("state_verified")),
             update_time=float(payload["update_time"])
@@ -1463,6 +1466,7 @@ class ChatWatchdog:
             "last_assistant_hash": snapshot.assistant_hash,
             "last_transcript_hash": snapshot.transcript_hash,
             "current_node": snapshot.current_node,
+            "visible_current_node": snapshot.visible_current_node,
             "canonical": snapshot.canonical,
             "state_verified": snapshot.state_verified,
             "conversation_update_time": snapshot.update_time,

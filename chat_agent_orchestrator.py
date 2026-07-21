@@ -363,6 +363,9 @@ class ChatAgentCoordinator:
         latest = normalized_turns[-1] if normalized_turns else {}
         payload = {
             "current_node": str(snapshot.get("current_node") or ""),
+            "visible_current_node": str(
+                snapshot.get("visible_current_node") or snapshot.get("current_node") or ""
+            ),
             "turn_count": len(normalized_turns),
             "running": bool(snapshot.get("running")),
             "active_stream": bool(snapshot.get("active_stream")),

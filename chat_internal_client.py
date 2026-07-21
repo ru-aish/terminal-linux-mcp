@@ -256,7 +256,10 @@ def normalize_conversation_payload(
         )
     }
     visible_turns = [turn for turn in active_branch if turn["role"] in {"user", "assistant"}]
-    latest = active_branch[-1] if active_branch else None
+    visible_current_node = (
+        str(visible_turns[-1].get("node_id") or "") if visible_turns else ""
+    )
+    latest = visible_turns[-1] if visible_turns else None
     status = str(latest.get("status") or "").casefold() if latest else ""
     canonical_running = bool(
         latest
@@ -272,6 +275,7 @@ def normalize_conversation_payload(
         "title": str(conversation.get("title") or ""),
         "project_id": str(conversation.get("gizmo_id") or "") or None,
         "current_node": current_node,
+        "visible_current_node": visible_current_node,
         "canonical": True,
         "state_verified": valid and bool(active_branch),
         "reason": "" if valid else "active branch is cyclic or incomplete",
