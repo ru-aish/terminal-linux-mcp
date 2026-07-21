@@ -2420,7 +2420,23 @@ class ChatAgentService:
         self.coordinator.prepare_local_work()
         due_at = self.coordinator.next_due_at()
         if due_at is None or (not force and due_at > _now()):
-            result = {"status": "idle", "write_count": 0, "inspected": []}
+            if hasattr(self.coordinator, "gateway"):
+                result = {
+                    "status": "idle",
+                    "write_count": 0,
+                    "physical_requests": 0,
+                    "selected_operation": None,
+                    "operation_type": None,
+                    "lane": None,
+                    "circuit_state": "CLOSED",
+                    "next_eligible_at": due_at,
+                    "agent_id": None,
+                    "outcome": None,
+                    "error": None,
+                    "inspected": [],
+                }
+            else:
+                result = {"status": "idle", "write_count": 0, "inspected": []}
         else:
             result = await self.coordinator.sync_once(force=force)
         self.state.update(last_sync_at=_now(), last_result=result, last_error="")

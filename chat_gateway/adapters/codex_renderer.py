@@ -1,0 +1,565 @@
+from __future__ import annotations
+
+import json
+import os
+import uuid
+from dataclasses import dataclass
+from threading import Lock
+from typing import Any, Mapping, Sequence
+from urllib.request import urlopen
+
+from ..errors import BackendError, MalformedBackendResponse, RateLimitError
+from ..models import MutationResult, ThreadSnapshot, TurnSnapshot
+
+_BRIDGE = r"""
+const gatewayClientKey = Symbol.for('chat-backend-gateway.renderer.client.v1');
+const gatewayRuntimeKey = Symbol.for('chat-backend-gateway.renderer.runtime.v1');
+window[gatewayRuntimeKey] ||= {handles:new Map(), nodes:new Map()};
+const gatewayRuntime = window[gatewayRuntimeKey];
+const methodNames = (value) => {
+  const names = new Set();
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return names;
+  try { for (const name of Object.getOwnPropertyNames(value)) names.add(name); } catch {}
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype) for (const name of Object.getOwnPropertyNames(prototype)) names.add(name);
+  } catch {}
+  return names;
+};
+const isClient = (value) => {
+  const names = methodNames(value);
+  return ['get','startCompletionStream','delete','listProjectConversations'].every((name) => names.has(name));
+};
+const resolveClient = () => {
+  if (isClient(window[gatewayClientKey])) return window[gatewayClientKey];
+  const candidates = [];
+  for (const symbol of Object.getOwnPropertySymbols(window)) {
+    try { candidates.push(window[symbol]); } catch {}
+  }
+  for (const name of Object.getOwnPropertyNames(window)) {
+    let value;
+    try { value = window[name]; } catch { continue; }
+    candidates.push(value);
+    if (value && typeof value === 'object') {
+      let keys = [];
+      try { keys = Object.getOwnPropertyNames(value).slice(0, 250); } catch {}
+      for (const childName of keys) {
+        try { candidates.push(value[childName]); } catch {}
+      }
+    }
+  }
+  const client = candidates.find(isClient);
+  if (!client) throw new Error('ChatGPT renderer client was not discoverable');
+  window[gatewayClientKey] = client;
+  return client;
+};
+const plain = (value) => {
+  if (value === undefined) return null;
+  try { return JSON.parse(JSON.stringify(value)); } catch { return value; }
+};
+"""
+
+
+@dataclass(frozen=True)
+class _Target:
+    websocket_url: str
+    title: str
+    url: str
+
+
+class CodexRendererBackend:
+    """Optional adapter for the locally running ChatGPT/Codex desktop renderer.
+
+    The adapter is self-contained and does not import, mutate, or communicate
+    with Terminal MCP. One method invocation performs one app-client backend
+    operation. The model slug is configured rather than fetched, preventing a
+    hidden model-catalogue request during creation.
+    """
+
+    def __init__(
+        self,
+        *,
+        cdp_endpoint: str = "http://127.0.0.1:9222",
+        model_slug: str = "gpt-5.6-terra",
+        stream_start_timeout: float = 30.0,
+        cdp_timeout: float = 45.0,
+    ) -> None:
+        self.cdp_endpoint = cdp_endpoint.rstrip("/")
+        self.model_slug = model_slug.strip()
+        self.stream_start_timeout = stream_start_timeout
+        self.cdp_timeout = cdp_timeout
+        self._lock = Lock()
+        if not self.model_slug:
+            raise ValueError("model_slug cannot be empty")
+
+    @classmethod
+    def from_environment(cls) -> "CodexRendererBackend":
+        return cls(
+            cdp_endpoint=os.environ.get(
+                "CHAT_GATEWAY_CDP_ENDPOINT", "http://127.0.0.1:9222"
+            ),
+            model_slug=os.environ.get("CHAT_GATEWAY_MODEL_SLUG", "gpt-5.6-terra"),
+            stream_start_timeout=float(
+                os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
+            ),
+            cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
+        )
+
+    async def create_thread(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        title: str,
+        idempotency_key: str,
+    ) -> MutationResult:
+        del (
+            idempotency_key
+        )  # Provider request has a stable generated message ID instead.
+        user_message_id = str(uuid.uuid4())
+        expression = f"""
+        (async () => {{
+          {_BRIDGE}
+          const client = resolveClient();
+          const text = {json.dumps(prompt)};
+          const projectId = {json.dumps(project_id)};
+          const userMessageId = {json.dumps(user_message_id)};
+          const request = {{
+            action:'next',
+            model:{json.dumps(self.model_slug)},
+            messages:[{{
+              id:userMessageId,
+              author:{{role:'user'}},
+              content:{{content_type:'text',parts:[text]}},
+              create_time:Date.now()/1000,
+              end_turn:null,
+              metadata:{{}},
+              recipient:'all',
+              status:'finished_successfully',
+              weight:1
+            }}],
+            supported_encodings:['v1'],
+            timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,
+            timezone_offset_min:new Date().getTimezoneOffset()
+          }};
+          if (projectId) {{
+            request.gizmo_id = projectId;
+            request.conversation_mode = {{kind:'gizmo_interaction',gizmo_id:projectId}};
+          }}
+          let conversationId = '';
+          let handle = null;
+          let settled = false;
+          const started = await new Promise((resolve, reject) => {{
+            const timer = setTimeout(() => {{
+              if (settled) return;
+              settled = true;
+              reject(new Error('conversation id was not observed before timeout'));
+            }}, {int(self.stream_start_timeout * 1000)});
+            const observe = (value) => {{
+              const candidate = value && (value.message || value.data || value);
+              const possibleId = value && (value.conversation_id || value.conversationId)
+                || candidate && (candidate.conversation_id || candidate.conversationId);
+              if (possibleId) conversationId = String(possibleId);
+              if (conversationId) {{
+                if (candidate && candidate.id) gatewayRuntime.nodes.set(conversationId, String(candidate.id));
+                if (handle) gatewayRuntime.handles.set(conversationId, handle);
+                if (!settled) {{ settled = true; clearTimeout(timer); resolve(true); }}
+              }}
+            }};
+            const fail = (error) => {{
+              if (!settled) {{ settled = true; clearTimeout(timer); reject(error); }}
+            }};
+            const complete = (value) => {{ observe(value); if (conversationId) gatewayRuntime.handles.delete(conversationId); }};
+            try {{
+              const pending = client.startCompletionStream({{
+                request,
+                onEvent:observe,
+                onUpdate:observe,
+                onComplete:complete,
+                onError:fail,
+                onRecoverableError:()=>{{}}
+              }});
+              Promise.resolve(pending).then((value) => {{
+                handle = value;
+                observe(value);
+                if (conversationId) gatewayRuntime.handles.set(conversationId, value);
+              }}, fail);
+            }} catch (error) {{ fail(error); }}
+          }});
+          return plain({{
+            accepted:!!started,
+            conversation_id:conversationId,
+            message_id:userMessageId,
+            running:true,
+            title_requested:{json.dumps(title)}
+          }});
+        }})()
+        """
+        payload = self._evaluate(expression, timeout=max(self.cdp_timeout, 35.0))
+        if not isinstance(payload, Mapping):
+            raise MalformedBackendResponse("renderer creation returned a non-object")
+        return MutationResult(
+            accepted=bool(payload.get("accepted")),
+            conversation_id=_optional_string(payload.get("conversation_id")),
+            message_id=_optional_string(payload.get("message_id")),
+            running=bool(payload.get("running", True)),
+        )
+
+    async def get_thread(self, *, conversation_id: str) -> ThreadSnapshot:
+        expression = f"""
+        (async () => {{
+          {_BRIDGE}
+          const client = resolveClient();
+          const id = {json.dumps(conversation_id)};
+          const raw = await client.get(id);
+          const currentNode = raw && (raw.current_node || raw.currentNode);
+          if (currentNode) gatewayRuntime.nodes.set(id, String(currentNode));
+          return plain(raw);
+        }})()
+        """
+        raw = self._evaluate(expression)
+        return _normalize_conversation(raw, conversation_id)
+
+    async def continue_thread(
+        self,
+        *,
+        conversation_id: str,
+        message: str,
+        idempotency_key: str,
+    ) -> MutationResult:
+        del idempotency_key
+        user_message_id = str(uuid.uuid4())
+        expression = f"""
+        (async () => {{
+          {_BRIDGE}
+          const client = resolveClient();
+          const id = {json.dumps(conversation_id)};
+          const parent = gatewayRuntime.nodes.get(id);
+          if (!parent) throw new Error('no cached canonical parent node; call get_thread before continue_thread');
+          const userMessageId = {json.dumps(user_message_id)};
+          const request = {{
+            action:'next',
+            conversation_id:id,
+            parent_message_id:parent,
+            model:{json.dumps(self.model_slug)},
+            messages:[{{
+              id:userMessageId,
+              author:{{role:'user'}},
+              content:{{content_type:'text',parts:[{json.dumps(message)}]}},
+              create_time:Date.now()/1000,
+              end_turn:null,
+              metadata:{{}},recipient:'all',status:'finished_successfully',weight:1
+            }}],
+            supported_encodings:['v1'],
+            timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,
+            timezone_offset_min:new Date().getTimezoneOffset()
+          }};
+          let handle = null;
+          const started = await new Promise((resolve,reject) => {{
+            let settled=false;
+            const timer=setTimeout(()=>{{if(!settled){{settled=true;reject(new Error('continuation did not start before timeout'));}}}}, {int(self.stream_start_timeout * 1000)});
+            const observe=(value)=>{{
+              const candidate=value&&(value.message||value.data||value);
+              if(candidate&&candidate.id) gatewayRuntime.nodes.set(id,String(candidate.id));
+              if(!settled){{settled=true;clearTimeout(timer);resolve(true);}}
+            }};
+            const fail=(error)=>{{if(!settled){{settled=true;clearTimeout(timer);reject(error);}}}};
+            const complete=(value)=>{{observe(value);gatewayRuntime.handles.delete(id);}};
+            try{{
+              const pending=client.startCompletionStream({{request,onEvent:observe,onUpdate:observe,onComplete:complete,onError:fail,onRecoverableError:()=>{{}}}});
+              Promise.resolve(pending).then((value)=>{{handle=value;gatewayRuntime.handles.set(id,value);observe(value);}},fail);
+            }}catch(error){{fail(error);}}
+          }});
+          return plain({{accepted:!!started,conversation_id:id,message_id:userMessageId,running:true}});
+        }})()
+        """
+        payload = self._evaluate(expression, timeout=max(self.cdp_timeout, 35.0))
+        if not isinstance(payload, Mapping):
+            raise MalformedBackendResponse(
+                "renderer continuation returned a non-object"
+            )
+        return MutationResult(
+            accepted=bool(payload.get("accepted")),
+            conversation_id=conversation_id,
+            message_id=_optional_string(payload.get("message_id")),
+            running=bool(payload.get("running", True)),
+        )
+
+    async def cancel_thread(self, *, conversation_id: str) -> MutationResult:
+        expression = f"""
+        (async () => {{
+          {_BRIDGE}
+          const client = resolveClient();
+          const id = {json.dumps(conversation_id)};
+          const handle = gatewayRuntime.handles.get(id);
+          if (handle && typeof handle.cancel === 'function') await handle.cancel();
+          else if (typeof client.cancelStream === 'function') await client.cancelStream(id);
+          else throw new Error('renderer cancellation is unavailable');
+          gatewayRuntime.handles.delete(id);
+          return {{accepted:true,conversation_id:id,running:false}};
+        }})()
+        """
+        payload = self._evaluate(expression)
+        return _mutation_from_payload(payload, conversation_id, "cancel")
+
+    async def delete_thread(self, *, conversation_id: str) -> MutationResult:
+        expression = f"""
+        (async () => {{
+          {_BRIDGE}
+          const client = resolveClient();
+          const id = {json.dumps(conversation_id)};
+          const result = await client.delete(id);
+          gatewayRuntime.handles.delete(id);
+          gatewayRuntime.nodes.delete(id);
+          return plain({{accepted:result?.success !== false,conversation_id:id,running:false,result}});
+        }})()
+        """
+        payload = self._evaluate(expression)
+        return _mutation_from_payload(payload, conversation_id, "delete")
+
+    async def list_project_threads(
+        self, *, project_id: str
+    ) -> Sequence[ThreadSnapshot]:
+        expression = f"""
+        (async () => {{
+          {_BRIDGE}
+          const client = resolveClient();
+          const result = await client.listProjectConversations({{
+            projectId:{json.dumps(project_id)},limit:50,cursor:null,ownedOnly:true
+          }});
+          return plain(result);
+        }})()
+        """
+        payload = self._evaluate(expression)
+        if not isinstance(payload, Mapping):
+            raise MalformedBackendResponse("project listing returned a non-object")
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise MalformedBackendResponse("project listing items are missing")
+        snapshots: list[ThreadSnapshot] = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            conversation_id = _optional_string(
+                item.get("id") or item.get("conversation_id")
+            )
+            if not conversation_id:
+                continue
+            snapshots.append(
+                ThreadSnapshot(
+                    conversation_id=conversation_id,
+                    found=True,
+                    running=False,
+                    turns=(),
+                    title=str(item.get("title") or ""),
+                    current_node=str(item.get("current_node") or ""),
+                )
+            )
+        return tuple(snapshots)
+
+    def _target(self) -> _Target:
+        with urlopen(f"{self.cdp_endpoint}/json/list", timeout=5.0) as response:
+            targets = json.load(response)
+        if not isinstance(targets, list):
+            raise BackendError("CDP target list was not a list", transient=True)
+        for item in targets:
+            if not isinstance(item, Mapping) or item.get("type") != "page":
+                continue
+            websocket_url = item.get("webSocketDebuggerUrl")
+            if websocket_url:
+                return _Target(
+                    websocket_url=str(websocket_url),
+                    title=str(item.get("title") or ""),
+                    url=str(item.get("url") or ""),
+                )
+        raise BackendError("no CDP page target is available", transient=True)
+
+    def _evaluate(self, expression: str, *, timeout: float | None = None) -> Any:
+        try:
+            import websocket
+        except ImportError as error:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "CodexRendererBackend requires the 'live' extra: pip install .[live]"
+            ) from error
+
+        with self._lock:
+            target = self._target()
+            connection = websocket.create_connection(
+                target.websocket_url,
+                timeout=timeout or self.cdp_timeout,
+                suppress_origin=True,
+            )
+            try:
+                identifier = 1
+                connection.send(
+                    json.dumps(
+                        {
+                            "id": identifier,
+                            "method": "Runtime.evaluate",
+                            "params": {
+                                "expression": expression,
+                                "returnByValue": True,
+                                "awaitPromise": True,
+                                "userGesture": False,
+                            },
+                        }
+                    )
+                )
+                while True:
+                    message = json.loads(connection.recv())
+                    if message.get("id") != identifier:
+                        continue
+                    if "error" in message:
+                        raise BackendError(
+                            "CDP Runtime.evaluate failed", transient=True
+                        )
+                    result = message.get("result")
+                    if not isinstance(result, Mapping):
+                        raise MalformedBackendResponse("CDP result was not an object")
+                    remote = result.get("result")
+                    if not isinstance(remote, Mapping):
+                        raise MalformedBackendResponse(
+                            "CDP remote result was not an object"
+                        )
+                    exception = result.get("exceptionDetails")
+                    if exception or remote.get("subtype") == "error":
+                        description = str(
+                            remote.get("description")
+                            or _exception_text(exception)
+                            or "renderer JavaScript failed"
+                        )
+                        if "Too many requests" in description:
+                            raise RateLimitError(description)
+                        raise BackendError(description, transient=True)
+                    return remote.get("value")
+            except RateLimitError:
+                raise
+            except BackendError:
+                raise
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                if "Too many requests" in message:
+                    raise RateLimitError(message) from error
+                raise BackendError(message, transient=True) from error
+            finally:
+                connection.close()
+
+
+def make_backend() -> CodexRendererBackend:
+    """Factory used by ``--adapter chat_gateway.adapters.codex_renderer:make_backend``."""
+
+    return CodexRendererBackend.from_environment()
+
+
+def _mutation_from_payload(
+    payload: Any, conversation_id: str, operation: str
+) -> MutationResult:
+    if not isinstance(payload, Mapping):
+        raise MalformedBackendResponse(f"renderer {operation} returned a non-object")
+    return MutationResult(
+        accepted=bool(payload.get("accepted")),
+        conversation_id=_optional_string(payload.get("conversation_id"))
+        or conversation_id,
+        message_id=_optional_string(payload.get("message_id")),
+        running=bool(payload.get("running", False)),
+    )
+
+
+def _normalize_conversation(raw: Any, requested_id: str) -> ThreadSnapshot:
+    if not isinstance(raw, Mapping):
+        return ThreadSnapshot(requested_id, False, False, ())
+    mapping = raw.get("mapping")
+    if not isinstance(mapping, Mapping):
+        return ThreadSnapshot(requested_id, False, False, ())
+    current_node = str(raw.get("current_node") or raw.get("currentNode") or "")
+    if not current_node or current_node not in mapping:
+        return ThreadSnapshot(
+            conversation_id=str(raw.get("id") or requested_id),
+            found=True,
+            running=False,
+            turns=(),
+            title=str(raw.get("title") or ""),
+            current_node=current_node,
+        )
+
+    reverse: list[TurnSnapshot] = []
+    cursor = current_node
+    seen: set[str] = set()
+    while cursor and cursor not in seen and len(reverse) < 10_000:
+        seen.add(cursor)
+        node = mapping.get(cursor)
+        if not isinstance(node, Mapping):
+            break
+        message = node.get("message")
+        if isinstance(message, Mapping):
+            metadata = message.get("metadata")
+            hidden = bool(
+                isinstance(metadata, Mapping)
+                and metadata.get("is_visually_hidden_from_conversation")
+            )
+            if not hidden:
+                author = message.get("author")
+                reverse.append(
+                    TurnSnapshot(
+                        message_id=str(message.get("id") or cursor),
+                        role=str(
+                            author.get("role") if isinstance(author, Mapping) else ""
+                        ),
+                        status=str(message.get("status") or ""),
+                        text=_message_text(message),
+                        end_turn=(
+                            message.get("end_turn")
+                            if isinstance(message.get("end_turn"), bool)
+                            else None
+                        ),
+                        created_at=(
+                            float(message["create_time"])
+                            if isinstance(message.get("create_time"), (int, float))
+                            else None
+                        ),
+                    )
+                )
+        cursor = str(node.get("parent") or "")
+    turns = tuple(reversed(reverse))
+    latest = turns[-1] if turns else None
+    running = bool(
+        latest
+        and latest.role == "assistant"
+        and (
+            latest.status.casefold()
+            in {"in_progress", "running", "streaming", "pending"}
+            or latest.end_turn is False
+        )
+    )
+    return ThreadSnapshot(
+        conversation_id=str(raw.get("id") or requested_id),
+        found=True,
+        running=running,
+        turns=turns,
+        title=str(raw.get("title") or ""),
+        current_node=current_node,
+    )
+
+
+def _message_text(message: Mapping[str, Any]) -> str:
+    content = message.get("content")
+    if not isinstance(content, Mapping):
+        return ""
+    parts = content.get("parts")
+    if isinstance(parts, list):
+        return "\n".join(str(part) for part in parts if isinstance(part, str))
+    text = content.get("text")
+    return str(text) if text is not None else ""
+
+
+def _exception_text(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    exception = value.get("exception")
+    if isinstance(exception, Mapping):
+        return str(exception.get("description") or exception.get("value") or "")
+    return str(value.get("text") or "")
+
+
+def _optional_string(value: Any) -> str | None:
+    return str(value) if value not in (None, "") else None
