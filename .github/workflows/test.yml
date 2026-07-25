@@ -27,11 +27,15 @@ jobs:
 
       - name: Check bootstrap interfaces
         run: |
-          bash -n start.sh setup.sh store.sh install.sh
+          bash -n start.sh setup.sh store.sh install.sh bootstrap.sh tests/test_install_workflow.sh
+          ./bootstrap.sh --help
           ./start.sh --help
           ./setup.sh --help
           ./store.sh --help
           ./install.sh --help
+
+      - name: Test secure one-line installation
+        run: tests/test_install_workflow.sh
 
       - name: Install through project setup
         env:
@@ -39,7 +43,9 @@ jobs:
         run: |
           ./setup.sh --dev
           .venv/bin/pytest --version
+          ./install.sh --configure-only
           ./store.sh --check
+          ./install.sh --check
           ./start.sh --check --local-only
 
       - name: Compile Python files

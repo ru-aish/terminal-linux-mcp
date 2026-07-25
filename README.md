@@ -146,11 +146,12 @@ For SSE or Streamable HTTP transports, the same server process exposes:
 
 The dashboard shows exact provider-reported tokens, proxy-estimated MCP text, tool-call counts and ranking, active/recent threads, time-window charts, and the newest accounting events. Exact and estimated figures stay visually and numerically separate because they can overlap.
 
-Set `MCP_DASHBOARD_TOKEN` to require the dashboard login form. The MCP bearer middleware deliberately leaves `/dashboard` to this cookie-based browser flow; `/mcp` continues to use `MCP_BEARER_TOKEN` independently. When the dashboard token is unset, the dashboard inherits the reachability of the HTTP server and any tunnel in front of it, so do not expose it publicly without another access policy.
+`install.sh` generates separate `MCP_BEARER_TOKEN` and `MCP_DASHBOARD_TOKEN` values and stores them in a mode-`600` `.env`. The MCP endpoint uses bearer authentication, while the dashboard uses its token for the browser login and HttpOnly session cookie. When the server is started directly with only `MCP_BEARER_TOKEN`, the dashboard safely falls back to that same token instead of becoming public.
 
 ## Requirements
 
 - Linux
+- An authenticated GitHub CLI (`gh auth login`) for the one-line install from this private repository
 - Optional agent CLIs used by delegated tools: Codex and/or Antigravity
 
 `store.sh` installs the remaining prerequisites. It supports Debian/Ubuntu,
@@ -160,65 +161,83 @@ uses a managed Python instead.
 
 ## Quick start
 
+Install from the private GitHub repository with one authenticated command:
+
 ```bash
-git clone https://github.com/ru-aish/terminal-linux-mcp.git
-cd terminal-linux-mcp
-./store.sh --with-ngrok
-cp .env.example .env
+gh api -H 'Accept: application/vnd.github.raw+json' \
+  repos/ru-aish/terminal-linux-mcp/contents/bootstrap.sh | bash
 ```
 
-`install.sh` is a conventional alias for the same installer:
+This installs to `~/.local/share/terminal-gpt-mcp`, prepares Python, and creates
+private MCP and dashboard tokens. Existing tokens are preserved when the command
+is run again.
+
+Start a local authenticated server:
 
 ```bash
-./install.sh --with-ngrok
+cd ~/.local/share/terminal-gpt-mcp
+./start.sh --local-only
+```
+
+To install ngrok at the same time:
+
+```bash
+gh api -H 'Accept: application/vnd.github.raw+json' \
+  repos/ru-aish/terminal-linux-mcp/contents/bootstrap.sh \
+  | bash -s -- --with-ngrok
+ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
+cd ~/.local/share/terminal-gpt-mcp
+./start.sh
+```
+
+The launcher prints the endpoint and confirms that bearer authentication is
+active. It never prints a secret automatically. Display the credentials only
+when configuring a client:
+
+```bash
+./install.sh --show-secrets
+```
+
+### Install from a checkout
+
+```bash
+gh repo clone ru-aish/terminal-linux-mcp
+cd terminal-linux-mcp
+./install.sh
+./start.sh --local-only
 ```
 
 Useful installer modes:
 
 ```bash
-./store.sh                         # runtime dependencies only
-./store.sh --dev --test            # development dependencies and test suite
-./store.sh --skip-system-packages  # user-space setup without sudo/doas
-./store.sh --check                 # readiness report without modifications
+./install.sh --with-ngrok             # dependencies, auth, and ngrok
+./install.sh --skip-system-packages   # user-space setup without sudo/doas
+./install.sh --dev --test             # development dependencies and tests
+./install.sh --configure-only         # create or repair .env secrets only
+./install.sh --check                  # dependencies plus auth readiness
 ```
 
-For a local-only server, ngrok is not required:
+`store.sh` remains the lower-level dependency installer. `setup.sh` repairs or
+recreates only the Python environment:
 
 ```bash
 ./store.sh
-./start.sh --local-only
-```
-
-`setup.sh` is the lower-level, idempotent Python environment installer. It can
-repair an existing `.venv`, or rebuild it with backup-and-rollback protection:
-
-```bash
-./setup.sh
 ./setup.sh --recreate
-./setup.sh --dev --test
 ```
 
-Generate a strong bearer token:
+### Authentication behavior
 
-```bash
-openssl rand -hex 32
-```
+Every HTTP transport requires `MCP_BEARER_TOKEN`, including loopback listeners.
+`install.sh` generates a 256-bit random token and a separate 256-bit dashboard
+token, writes them atomically, and restricts `.env` to the current user. For an
+explicit development-only exception, set `MCP_ALLOW_UNAUTHENTICATED=1`.
 
-Put the generated value in `.env`:
+### Public tunnel
 
-```dotenv
-MCP_BEARER_TOKEN=replace-with-the-generated-value
-```
-
-Authenticate ngrok once:
+Authenticate ngrok once, then start the MCP server and tunnel:
 
 ```bash
 ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
-```
-
-Start the MCP server and tunnel:
-
-```bash
 ./start.sh
 ```
 
@@ -226,23 +245,16 @@ The launcher prints both endpoints:
 
 ```text
 Local MCP endpoint: http://127.0.0.1:8011/mcp
-Public MCP endpoint: https://example.ngrok.app/mcp
 Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>
+Public MCP endpoint: https://example.ngrok.app/mcp
 ```
 
-`Ctrl+C` stops the server and the tunnel.
-
-### Local-only mode
-
-```bash
-./start.sh --local-only
-# Equivalent: MCP_SKIP_NGROK=1 ./start.sh
-```
+`Ctrl+C` stops the server and tunnel.
 
 ### Verify the endpoint
 
 ```bash
-MCP_BEARER_TOKEN='your-token' \
+MCP_BEARER_TOKEN="$(./install.sh --show-secrets | sed -n 's/^MCP_BEARER_TOKEN=//p')" \
   python scripts/smoke_test.py https://example.ngrok.app/mcp
 ```
 
@@ -267,13 +279,9 @@ Plan availability and the UI can change. Follow the current OpenAI documentation
 5. Select **Scan Tools** and review every discovered tool.
 6. Create the draft app and test it in a new chat.
 
-This repository supports a static bearer token. The Responses API can pass that token directly. ChatGPT custom apps commonly use OAuth for authenticated servers; place this MCP behind an OAuth-capable gateway or use OpenAI's Secure MCP Tunnel when the ChatGPT setup does not offer a static bearer-token option.
+This first security layer uses the project's reviewed static bearer middleware. The Responses API can pass the token directly. OpenAI recommends OAuth for production remote MCP servers and ChatGPT custom apps may require an OAuth flow; place this MCP behind an OAuth-capable gateway or use OpenAI's Secure MCP Tunnel when static bearer configuration is unavailable.
 
-Do not select unauthenticated access for a public terminal endpoint. The launcher requires one of these before starting ngrok:
-
-- `MCP_BEARER_TOKEN`
-- `NGROK_TRAFFIC_POLICY_FILE`
-- the explicit and dangerous `MCP_ALLOW_UNAUTHENTICATED_PUBLIC=1` override
+Do not select unauthenticated access for a terminal endpoint. The server requires `MCP_BEARER_TOKEN` for every HTTP transport. An ngrok Traffic Policy is an optional additional boundary, not a substitute for the MCP bearer token. `MCP_ALLOW_UNAUTHENTICATED=1` is an explicit dangerous development override.
 
 ### Responses API
 
@@ -400,16 +408,17 @@ Secrets in downstream MCP configuration are used to launch the child but are not
 
 ## Configuration
 
-Copy `.env.example` to `.env`. Important values:
+`install.sh` creates `.env` automatically. Important values:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `MCP_HOST` | `127.0.0.1` | HTTP listener address |
-| `MCP_PORT` | `8000` | HTTP listener port |
+| `MCP_PORT` | `8011` | HTTP listener port |
 | `MCP_TRANSPORT` | `streamable-http` | `stdio`, `sse`, or `streamable-http` |
 | `MCP_WORKSPACE` | `~/mcp_workspace` | Default terminal workspace |
 | `MCP_LOG_DIR` | `.run/logs` through `start.sh` | Runtime logs |
-| `MCP_BEARER_TOKEN` | empty | Required bearer token for HTTP requests |
+| `MCP_BEARER_TOKEN` | generated by `install.sh` | Required bearer token for HTTP requests |
+| `MCP_DASHBOARD_TOKEN` | generated by `install.sh` | Dashboard login token; direct starts fall back to the MCP bearer token |
 | `MCP_PROXY_IDLE_TIMEOUT` | `1800` | Downstream MCP idle timeout in seconds |
 | `MCP_SKIP_NGROK` | `0` | Set `1` for local-only mode |
 | `MCP_AUTO_SETUP` | `1` | Run `setup.sh` automatically when the Python runtime is missing or incomplete |
@@ -417,7 +426,7 @@ Copy `.env.example` to `.env`. Important values:
 | `MCP_VENV_DIR` | `.venv` | Override the virtual-environment directory |
 | `NGROK_URL` | random URL | Reserved ngrok URL/domain |
 | `NGROK_TRAFFIC_POLICY_FILE` | empty | Optional ngrok Traffic Policy |
-| `MCP_ALLOW_UNAUTHENTICATED_PUBLIC` | `0` | Dangerous public-tunnel override |
+| `MCP_ALLOW_UNAUTHENTICATED` | `0` | Dangerous development-only override for all HTTP authentication |
 | `MCP_CHAT_WATCHDOG_ENABLED` | `1` | Enable the five-minute ChatGPT task watchdog for SSE/Streamable HTTP |
 | `MCP_CHAT_WATCHDOG_ADAPTER` | `codex-internal` | Use the Codex desktop app's internal normal-chat client; no UI fallback is enabled |
 | `MCP_CHAT_WATCHDOG_QUEUE` | `~/.GPT/chat-watchdog/threads.txt` | Editable one-active-task-URL-per-line input queue; task state is reconciled into the durable ledger |
@@ -486,7 +495,7 @@ Operational migration and rollback instructions are in `docs/AGENT_GATEWAY_CUTOV
 
 1. Run under a dedicated, unprivileged Linux user.
 2. Limit `MCP_WORKSPACE` and filesystem permissions to only the directories the agent needs.
-3. Set `MCP_BEARER_TOKEN` to a unique random value and rotate it if exposed.
+3. Let `install.sh` generate the MCP and dashboard tokens; rotate both if either is exposed.
 4. Keep OpenAI tool approvals set to `always` until the workflow is thoroughly reviewed.
 5. Use `allowed_tools` to expose the smallest possible tool set.
 6. Do not place `.env`, browser profiles, logs, SSH keys, or MCP config files containing secrets in Git.
@@ -497,18 +506,20 @@ Bearer authentication protects the endpoint from anonymous requests, but it does
 
 ## Development
 
-Install development dependencies:
+Install development dependencies and authentication configuration:
 
 ```bash
-./store.sh --dev
+./install.sh --dev
 # Or, when Linux prerequisites are already installed:
 ./setup.sh --dev
+./install.sh --configure-only
 ```
 
 Run checks:
 
 ```bash
-bash -n start.sh setup.sh store.sh install.sh
+bash -n start.sh setup.sh store.sh install.sh bootstrap.sh tests/test_install_workflow.sh
+tests/test_install_workflow.sh
 .venv/bin/python -m py_compile terminal_mcp.py scripts/smoke_test.py
 .venv/bin/pytest
 ```
@@ -529,16 +540,16 @@ The regression suite verifies:
 
 ### Fresh Linux machine or missing `venv`/`pip`
 
-Run the full bootstrap installer:
+Run the full secure installer:
 
 ```bash
-./store.sh
+./install.sh
 ```
 
 If sudo access is unavailable, use the user-space path:
 
 ```bash
-./store.sh --skip-system-packages
+./install.sh --skip-system-packages
 ```
 
 The installer downloads `uv` only when no usable Python 3.11+ interpreter is
@@ -564,7 +575,11 @@ The launcher intentionally does not stop the existing process.
 
 ### `401 unauthorized`
 
-Pass the same token configured as `MCP_BEARER_TOKEN`:
+Read the generated value and pass it as a bearer token:
+
+```bash
+./install.sh --show-secrets
+```
 
 ```text
 Authorization: Bearer your-token

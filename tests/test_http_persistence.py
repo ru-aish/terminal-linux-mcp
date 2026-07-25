@@ -114,6 +114,7 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
     env = dict(**__import__("os").environ)
     env["MCP_WORKSPACE"] = str(tmp_path)
     env["MCP_LOG_DIR"] = str(tmp_path / "logs")
+    env["MCP_ALLOW_UNAUTHENTICATED"] = "1"
     env["MCP_NODE_REPL_SERVER"] = "stateful-http"
     process = subprocess.Popen(
         [
@@ -436,6 +437,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
     env = dict(**__import__("os").environ)
     env["MCP_WORKSPACE"] = str(tmp_path)
     env["MCP_LOG_DIR"] = str(tmp_path / "logs")
+    env["MCP_ALLOW_UNAUTHENTICATED"] = "1"
     env["MCP_GPT_HOME"] = str(gpt_home)
     process = subprocess.Popen(
         [
