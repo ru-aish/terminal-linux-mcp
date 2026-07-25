@@ -1,6 +1,7 @@
 .env
 .venv/
 .run/
+.service-mode
 __pycache__/
 *.py[cod]
 .pytest_cache/

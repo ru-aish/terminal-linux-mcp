@@ -492,6 +492,12 @@ class BearerAuthMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+async def healthz(_request: Any) -> Any:
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"status": "ok"})
+
+
 class PrivacyCloneProxyMiddleware:
     """Stream one dedicated public path to the offline privacy terminal."""
 
@@ -3991,11 +3997,27 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8011, help="Port for SSE/HTTP server")
     parser.add_argument("--log-level", default=os.environ.get("MCP_UVICORN_LOG_LEVEL", "info"))
     args = parser.parse_args()
+    bearer_token = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+    allow_unauthenticated = os.environ.get(
+        "MCP_ALLOW_UNAUTHENTICATED",
+        os.environ.get("MCP_ALLOW_UNAUTHENTICATED_PUBLIC", "0"),
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if args.transport in {"sse", "streamable-http"} and not bearer_token and not allow_unauthenticated:
+        parser.error(
+            "HTTP transports require MCP_BEARER_TOKEN. Run ./install.sh "
+            "--configure-only, or set MCP_ALLOW_UNAUTHENTICATED=1 only for "
+            "an explicitly accepted development risk."
+        )
+    if bearer_token and not os.environ.get("MCP_DASHBOARD_TOKEN", "").strip():
+        os.environ["MCP_DASHBOARD_TOKEN"] = bearer_token
+
     watchdog_config = ChatWatchdogConfig.from_env()
     if args.transport in ["sse", "streamable-http"]:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
+        from starlette.routing import Route
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
+        app.routes.insert(0, Route("/healthz", healthz, methods=["GET"]))
         chat_watchdog = ChatWatchdog(watchdog_config)
         set_chat_agent_runtime_ensure(chat_watchdog.ensure_background_runtime)
         install_usage_dashboard(
@@ -4003,12 +4025,11 @@ def main() -> None:
         )
         install_chat_watchdog_lifespan(app, chat_watchdog)
         install_chat_agent_lifespan(app, get_chat_agent_service())
-        bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
         if bearer_token:
             app.add_middleware(BearerAuthMiddleware, token=bearer_token)
-        elif args.host not in {"127.0.0.1", "::1", "localhost"}:
+        else:
             print(
-                "WARNING: Terminal MCP is listening beyond loopback without MCP_BEARER_TOKEN.",
+                "WARNING: HTTP authentication is disabled by explicit override.",
                 file=sys.stderr,
             )
         cors_origins = os.environ.get("MCP_CORS_ORIGINS", "*")

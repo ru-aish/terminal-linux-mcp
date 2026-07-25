@@ -38,10 +38,11 @@ while (($#)); do
   shift
 done
 
-if [[ -f "$ROOT_DIR/.env" ]]; then
+ENV_FILE="${MCP_ENV_FILE:-$ROOT_DIR/.env}"
+if [[ -f "$ENV_FILE" ]]; then
   set -a
-  # shellcheck disable=SC1091
-  source "$ROOT_DIR/.env"
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
   set +a
 fi
 
@@ -62,7 +63,8 @@ MCP_SKIP_NGROK="${MCP_SKIP_NGROK:-0}"
 MCP_AUTO_SETUP="${MCP_AUTO_SETUP:-1}"
 MCP_AUTO_INSTALL_NGROK="${MCP_AUTO_INSTALL_NGROK:-0}"
 MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:-}"
-MCP_ALLOW_UNAUTHENTICATED_PUBLIC="${MCP_ALLOW_UNAUTHENTICATED_PUBLIC:-0}"
+MCP_DASHBOARD_TOKEN="${MCP_DASHBOARD_TOKEN:-$MCP_BEARER_TOKEN}"
+MCP_ALLOW_UNAUTHENTICATED="${MCP_ALLOW_UNAUTHENTICATED:-${MCP_ALLOW_UNAUTHENTICATED_PUBLIC:-0}}"
 NGROK_BIN="${NGROK_BIN:-ngrok}"
 NGROK_UPSTREAM="${NGROK_UPSTREAM:-http://127.0.0.1:$MCP_PORT}"
 
@@ -79,7 +81,7 @@ case "$MCP_TRANSPORT" in
   *) die "unsupported MCP_TRANSPORT: $MCP_TRANSPORT" ;;
 esac
 
-export MCP_WORKSPACE MCP_LOG_DIR MCP_GPT_HOME MCP_BOOTSTRAP_MAX_CHARS MCP_GOAL_REMINDER_SECONDS MCP_WATCH_IMAGE_MAX_BYTES MCP_BEARER_TOKEN
+export MCP_WORKSPACE MCP_LOG_DIR MCP_GPT_HOME MCP_BOOTSTRAP_MAX_CHARS MCP_GOAL_REMINDER_SECONDS MCP_WATCH_IMAGE_MAX_BYTES MCP_BEARER_TOKEN MCP_DASHBOARD_TOKEN MCP_ALLOW_UNAUTHENTICATED
 mkdir -p "$MCP_RUNTIME_DIR" "$MCP_LOG_DIR"
 
 select_python() {
@@ -111,14 +113,11 @@ if [[ "$CLI_SETUP_ONLY" == 1 ]]; then
   exit 0
 fi
 
-if [[ "$MCP_SKIP_NGROK" != 1 \
-      && -z "$MCP_BEARER_TOKEN" \
-      && -z "${NGROK_TRAFFIC_POLICY_FILE:-}" \
-      && "$MCP_ALLOW_UNAUTHENTICATED_PUBLIC" != 1 ]]; then
+if [[ -z "$MCP_BEARER_TOKEN" && "$MCP_ALLOW_UNAUTHENTICATED" != 1 ]]; then
   cat >&2 <<'EOF'
-Refusing to expose a full terminal MCP without authentication.
-Set MCP_BEARER_TOKEN, configure NGROK_TRAFFIC_POLICY_FILE, or explicitly set
-MCP_ALLOW_UNAUTHENTICATED_PUBLIC=1 after accepting the risk.
+Refusing to start an HTTP terminal MCP without authentication.
+Run ./install.sh --configure-only to generate private bearer tokens, or explicitly
+set MCP_ALLOW_UNAUTHENTICATED=1 only after accepting the development risk.
 EOF
   exit 1
 fi
@@ -249,6 +248,11 @@ fi
 local_endpoint="http://$probe_host:$MCP_PORT$MCP_PATH"
 echo "Local MCP endpoint: $local_endpoint"
 echo "Server log: $SERVER_LOG"
+if [[ -n "$MCP_BEARER_TOKEN" ]]; then
+  echo 'Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>'
+else
+  echo 'WARNING: authentication is disabled by explicit override' >&2
+fi
 
 if [[ "$MCP_SKIP_NGROK" == 1 ]]; then
   echo 'ngrok disabled'
@@ -316,7 +320,7 @@ printf '\nPublic MCP endpoint: %s%s\n' "$public_url" "$MCP_PATH"
 if [[ -n "$MCP_BEARER_TOKEN" ]]; then
   echo 'Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>'
 elif [[ -n "${NGROK_TRAFFIC_POLICY_FILE:-}" ]]; then
-  echo 'Authentication: delegated to ngrok Traffic Policy'
+  echo 'Authentication: ngrok Traffic Policy only; MCP bearer auth disabled by explicit override'
 else
   echo 'WARNING: public endpoint is unauthenticated by explicit override' >&2
 fi

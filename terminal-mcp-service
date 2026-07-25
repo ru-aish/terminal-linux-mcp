@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+ROOT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+METADATA="${TERMINAL_MCP_SERVICE_METADATA:-$ROOT_DIR/.service-mode}"
+[[ -f "$METADATA" ]] || { printf 'terminal-mcp: no service metadata at %s\n' "$METADATA" >&2; exit 1; }
+
+metadata_value() {
+  awk -v key="$1" '$0 ~ "^" key "=" {sub("^[^=]*=", ""); print; exit}' "$METADATA"
+}
+
+SERVICE_MODE="$(metadata_value SERVICE_MODE)"
+SERVICE_NAME="$(metadata_value SERVICE_NAME)"
+SERVICE_ENV_FILE="$(metadata_value SERVICE_ENV_FILE)"
+case "$SERVICE_MODE" in system|user) ;; *) printf 'terminal-mcp: invalid service mode in %s\n' "$METADATA" >&2; exit 1 ;; esac
+[[ "$SERVICE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9@_.:-]*\.service$ ]] || { printf 'terminal-mcp: invalid service name\n' >&2; exit 1; }
+[[ -f "$SERVICE_ENV_FILE" ]] || { printf 'terminal-mcp: service configuration is missing at %s\n' "$SERVICE_ENV_FILE" >&2; exit 1; }
+
+SYSTEMCTL="${TERMINAL_MCP_SYSTEMCTL:-systemctl}"
+JOURNALCTL="${TERMINAL_MCP_JOURNALCTL:-journalctl}"
+SUDO="${TERMINAL_MCP_SUDO:-sudo}"
+
+read_value() {
+  awk -v key="$1" '$0 ~ "^[[:space:]]*" key "[[:space:]]*=" {sub("^[^=]*=", ""); sub("^[[:space:]]+", ""); sub("[[:space:]]+$", ""); print; exit}' "$SERVICE_ENV_FILE"
+}
+
+host="$(read_value MCP_HOST)"; host="${host:-127.0.0.1}"
+port="$(read_value MCP_PORT)"; port="${port:-8011}"
+mcp_path="$(read_value MCP_PATH)"; mcp_path="${mcp_path:-/mcp}"
+base_url="http://$host:$port"
+
+system_cmd() {
+  if [[ ${TERMINAL_MCP_TEST_EUID:-$EUID} == 0 ]]; then
+    "$@"
+  elif command -v "$SUDO" >/dev/null 2>&1; then
+    "$SUDO" "$@"
+  elif command -v doas >/dev/null 2>&1; then
+    doas "$@"
+  else
+    printf 'terminal-mcp: root, sudo, or doas is required for the system service\n' >&2
+    return 126
+  fi
+}
+
+ctl() {
+  if [[ "$SERVICE_MODE" == user ]]; then
+    "$SYSTEMCTL" --user "$@"
+  else
+    system_cmd "$SYSTEMCTL" "$@"
+  fi
+}
+
+journal() {
+  if [[ "$SERVICE_MODE" == user ]]; then
+    "$JOURNALCTL" --user "$@"
+  else
+    system_cmd "$JOURNALCTL" "$@"
+  fi
+}
+
+http_code() {
+  curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 2 --max-time 5 "$@"
+}
+
+VERIFY_DETAIL=""
+verify_http() {
+  local bearer dashboard code
+  bearer="$(read_value MCP_BEARER_TOKEN)"
+  dashboard="$(read_value MCP_DASHBOARD_TOKEN)"
+  [[ -n "$bearer" && -n "$dashboard" ]] || { VERIFY_DETAIL='service authentication token is missing'; return 1; }
+
+  code="$(http_code "$base_url$mcp_path" 2>/dev/null || true)"
+  [[ "$code" == 401 ]] || { VERIFY_DETAIL="unauthenticated MCP returned ${code:-connection error}, expected 401"; return 1; }
+
+  code="$(http_code -H "Authorization: Bearer $bearer" "$base_url/healthz" 2>/dev/null || true)"
+  [[ "$code" == 200 ]] || { VERIFY_DETAIL="authenticated health check returned ${code:-connection error}, expected 200"; return 1; }
+
+  code="$(http_code "$base_url/dashboard" 2>/dev/null || true)"
+  [[ "$code" == 401 ]] || { VERIFY_DETAIL="unauthenticated dashboard returned ${code:-connection error}, expected 401"; return 1; }
+
+  code="$(http_code -H "Authorization: Bearer $dashboard" "$base_url/dashboard" 2>/dev/null || true)"
+  [[ "$code" == 200 ]] || { VERIFY_DETAIL="authenticated dashboard returned ${code:-connection error}, expected 200"; return 1; }
+}
+
+wait_for_http() {
+  local timeout="${MCP_SERVICE_VERIFY_TIMEOUT:-30}"
+  [[ "$timeout" =~ ^[0-9]+$ ]] || { printf 'terminal-mcp: MCP_SERVICE_VERIFY_TIMEOUT must be a non-negative integer\n' >&2; return 1; }
+  local deadline=$((SECONDS + timeout))
+  VERIFY_DETAIL='service did not answer HTTP checks'
+  while true; do
+    verify_http && return 0
+    (( SECONDS >= deadline )) && break
+    sleep 0.5
+  done
+  printf 'terminal-mcp: HTTP verification failed: %s\n' "$VERIFY_DETAIL" >&2
+  return 1
+}
+
+command="${1:-status}"
+shift || true
+case "$command" in
+  status)
+    ctl status "$SERVICE_NAME" "$@"
+    ;;
+  start|stop|restart)
+    ctl "$command" "$SERVICE_NAME"
+    ;;
+  logs)
+    journal -u "$SERVICE_NAME" -f "$@"
+    ;;
+  dashboard)
+    printf '%s/dashboard\n' "$base_url"
+    ;;
+  credentials)
+    printf 'Configuration: %s\n' "$SERVICE_ENV_FILE"
+    printf 'To print credentials explicitly: %s credentials --show\n' "$0"
+    if [[ "${1:-}" == --show ]]; then
+      printf 'MCP_BEARER_TOKEN=%s\n' "$(read_value MCP_BEARER_TOKEN)"
+      printf 'MCP_DASHBOARD_TOKEN=%s\n' "$(read_value MCP_DASHBOARD_TOKEN)"
+    elif (($#)); then
+      printf 'terminal-mcp: credentials accepts only --show\n' >&2
+      exit 2
+    fi
+    ;;
+  verify)
+    ctl is-enabled --quiet "$SERVICE_NAME" || { printf 'terminal-mcp: %s is not enabled\n' "$SERVICE_NAME" >&2; exit 1; }
+    ctl is-active --quiet "$SERVICE_NAME" || { printf 'terminal-mcp: %s is not active\n' "$SERVICE_NAME" >&2; exit 1; }
+    wait_for_http
+    printf 'Service and authenticated HTTP checks passed.\n'
+    ;;
+  *)
+    printf 'Usage: %s {status|start|stop|restart|logs|dashboard|credentials|verify}\n' "$0" >&2
+    exit 2
+    ;;
+esac

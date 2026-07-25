@@ -1,0 +1,31 @@
+[Unit]
+Description=Terminal MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@PROJECT_DIR_Q@
+EnvironmentFile=@ENV_FILE_Q@
+ExecStart=@PYTHON_Q@ @SCRIPT_Q@ --transport streamable-http --host ${MCP_HOST} --port ${MCP_PORT}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+UMask=0077
+ReadWritePaths=@WRITABLE_PATHS_Q@
+
+[Install]
+WantedBy=multi-user.target
