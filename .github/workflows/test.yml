@@ -27,15 +27,18 @@ jobs:
 
       - name: Check bootstrap interfaces
         run: |
-          bash -n start.sh setup.sh store.sh install.sh bootstrap.sh tests/test_install_workflow.sh
+          bash -n start.sh setup.sh store.sh install.sh bootstrap.sh service-install.sh terminal-mcp-service tests/test_install_workflow.sh tests/test_service_workflow.sh
           ./bootstrap.sh --help
           ./start.sh --help
           ./setup.sh --help
           ./store.sh --help
           ./install.sh --help
+          ./service-install.sh --help
 
       - name: Test secure one-line installation
-        run: tests/test_install_workflow.sh
+        run: |
+          tests/test_install_workflow.sh
+          tests/test_service_workflow.sh
 
       - name: Install through project setup
         env:

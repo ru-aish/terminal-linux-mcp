@@ -492,6 +492,12 @@ class BearerAuthMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+async def healthz(_request: Any) -> Any:
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"status": "ok"})
+
+
 class PrivacyCloneProxyMiddleware:
     """Stream one dedicated public path to the offline privacy terminal."""
 
@@ -4009,7 +4015,9 @@ def main() -> None:
     if args.transport in ["sse", "streamable-http"]:
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
+        from starlette.routing import Route
         app = mcp.sse_app() if args.transport == "sse" else mcp.streamable_http_app()
+        app.routes.insert(0, Route("/healthz", healthz, methods=["GET"]))
         chat_watchdog = ChatWatchdog(watchdog_config)
         set_chat_agent_runtime_ensure(chat_watchdog.ensure_background_runtime)
         install_usage_dashboard(

@@ -69,6 +69,12 @@ def test_bearer_auth_middleware():
     assert run(invoke("Bearer correct-token"))[0]["status"] == 204
 
 
+def test_healthz_is_safe_and_minimal():
+    response = run(terminal_mcp.healthz(None))
+    assert response.status_code == 200
+    assert response.body == b'{"status":"ok"}'
+
+
 def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
     home = isolated_home(tmp_path, monkeypatch)
     (home / ".codex").mkdir()

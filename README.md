@@ -2,7 +2,10 @@
 
 An isolated experimental copy of the Terminal Linux MCP that bootstraps every model thread with GPT-specific instructions, skills, tool manifests, downstream MCP discovery, and persistent token-usage accounting.
 
-The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` starts the Streamable HTTP server and an ngrok tunnel together, prints the final MCP endpoint, and shuts both processes down cleanly.
+The normal Linux installation registers a persistent, loopback-only systemd
+daemon. The server can also run locally over stdio, SSE, or Streamable HTTP.
+The separate foreground `start.sh` launcher can optionally pair the server with
+an ngrok tunnel.
 
 > [!CAUTION]
 > This server can execute shell commands and modify files on the host. Treat it like remote shell access. Run it as a dedicated low-privilege user, require authentication, keep tool approvals enabled, and never expose it anonymously on the public internet.
@@ -150,9 +153,13 @@ The dashboard shows exact provider-reported tokens, proxy-estimated MCP text, to
 
 ## Requirements
 
-- Linux
+- Linux with systemd for the default persistent-service installation
 - An authenticated GitHub CLI (`gh auth login`) for the one-line install from this private repository
 - Optional agent CLIs used by delegated tools: Codex and/or Antigravity
+
+Non-systemd hosts can still install dependencies and authentication with
+`--no-service`, then use `./start.sh --local-only` or provide their own process
+supervisor.
 
 `store.sh` installs the remaining prerequisites. It supports Debian/Ubuntu,
 Fedora/RHEL, Arch, openSUSE, and Alpine package managers. When the operating
@@ -168,35 +175,50 @@ gh api -H 'Accept: application/vnd.github.raw+json' \
   repos/ru-aish/terminal-linux-mcp/contents/bootstrap.sh | bash
 ```
 
-This installs to `~/.local/share/terminal-gpt-mcp`, prepares Python, and creates
-private MCP and dashboard tokens. Existing tokens are preserved when the command
-is run again.
+Run the command as the non-root account that should own terminal access; the
+installer uses sudo/doas only for system integration and refuses to run the
+remote terminal daemon as root.
 
-Start a local authenticated server:
+This installs to `~/.local/share/terminal-gpt-mcp`, prepares Python, creates
+private MCP and dashboard tokens, and registers a loopback-only systemd daemon.
+`--service auto` prefers the system manager when root or usable sudo/doas is
+available and falls back to the current user's systemd manager. A system service
+starts at boot; a user service starts after login unless an administrator enables
+lingering with `loginctl enable-linger USER`. The installer starts the service and
+verifies authenticated and unauthenticated HTTP behavior before reporting
+success. Existing service secrets are preserved on reinstall.
+
+The installer places a management command in `/usr/local/bin/terminal-mcp` for
+system mode or `~/.local/bin/terminal-mcp` for user mode:
 
 ```bash
-cd ~/.local/share/terminal-gpt-mcp
-./start.sh --local-only
+terminal-mcp status
+terminal-mcp restart
+terminal-mcp logs
+terminal-mcp dashboard
+terminal-mcp credentials
+terminal-mcp credentials --show  # explicitly reveal tokens
+terminal-mcp verify
 ```
 
-To install ngrok at the same time:
+To install the optional ngrok binary at the same time:
 
 ```bash
 gh api -H 'Accept: application/vnd.github.raw+json' \
   repos/ru-aish/terminal-linux-mcp/contents/bootstrap.sh \
   | bash -s -- --with-ngrok
-ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
-cd ~/.local/share/terminal-gpt-mcp
-./start.sh
 ```
 
-The launcher prints the endpoint and confirms that bearer authentication is
-active. It never prints a secret automatically. Display the credentials only
-when configuring a client:
+The daemon remains local-only and never starts or depends on ngrok. Public
+tunnel configuration is a separate, explicit action. The installer never prints
+a secret automatically. Display credentials only when configuring a client:
 
 ```bash
-./install.sh --show-secrets
+terminal-mcp credentials --show
 ```
+
+`./install.sh --show-secrets` remains available for the checkout's foreground
+`.env`; use `terminal-mcp credentials --show` for the installed daemon.
 
 ### Install from a checkout
 
@@ -204,21 +226,26 @@ when configuring a client:
 gh repo clone ru-aish/terminal-linux-mcp
 cd terminal-linux-mcp
 ./install.sh
-./start.sh --local-only
 ```
 
 Useful installer modes:
 
 ```bash
 ./install.sh --with-ngrok             # dependencies, auth, and ngrok
+./install.sh --service system         # require a system service
+./install.sh --service user           # require a user systemd service
+./install.sh --no-service             # dependencies/auth only (CI/development)
 ./install.sh --skip-system-packages   # user-space setup without sudo/doas
 ./install.sh --dev --test             # development dependencies and tests
 ./install.sh --configure-only         # create or repair .env secrets only
 ./install.sh --check                  # dependencies plus auth readiness
 ```
 
-`store.sh` remains the lower-level dependency installer. `setup.sh` repairs or
-recreates only the Python environment:
+`--service auto` is the default. It requires an operational system or user
+systemd manager; it does not silently claim persistence on unsupported init
+systems. `--configure-only` and `--check` remain non-privileged and do not
+install a service. `store.sh` remains the lower-level dependency installer.
+`setup.sh` repairs or recreates only the Python environment:
 
 ```bash
 ./store.sh
@@ -234,7 +261,9 @@ explicit development-only exception, set `MCP_ALLOW_UNAUTHENTICATED=1`.
 
 ### Public tunnel
 
-Authenticate ngrok once, then start the MCP server and tunnel:
+The installed daemon is intentionally local-only. If a public endpoint is
+required, install/configure ngrok explicitly and run the foreground launcher
+instead of treating tunneling as part of the daemon:
 
 ```bash
 ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
@@ -412,11 +441,14 @@ Secrets in downstream MCP configuration are used to launch the child but are not
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MCP_HOST` | `127.0.0.1` | HTTP listener address |
-| `MCP_PORT` | `8011` | HTTP listener port |
+| `MCP_HOST` | `127.0.0.1` | HTTP listener address; the service installer always forces loopback |
+| `MCP_PORT` | `8011` | HTTP listener port in the generated service configuration |
+| `MCP_SERVICE_PORT` | `8011` | Port selected while installing or updating the daemon |
+| `MCP_SERVICE_VERIFY_TIMEOUT` | `30` | Seconds the management command waits for authenticated HTTP startup |
+| `MCP_SERVICE_PATH` | user-local and system binary paths | Executable search path stored for daemon subprocesses |
 | `MCP_TRANSPORT` | `streamable-http` | `stdio`, `sse`, or `streamable-http` |
 | `MCP_WORKSPACE` | `~/mcp_workspace` | Default terminal workspace |
-| `MCP_LOG_DIR` | `.run/logs` through `start.sh` | Runtime logs |
+| `MCP_LOG_DIR` | `.run/logs` for `start.sh`; conventional state/log path for the service | Runtime logs |
 | `MCP_BEARER_TOKEN` | generated by `install.sh` | Required bearer token for HTTP requests |
 | `MCP_DASHBOARD_TOKEN` | generated by `install.sh` | Dashboard login token; direct starts fall back to the MCP bearer token |
 | `MCP_PROXY_IDLE_TIMEOUT` | `1800` | Downstream MCP idle timeout in seconds |
@@ -518,8 +550,9 @@ Install development dependencies and authentication configuration:
 Run checks:
 
 ```bash
-bash -n start.sh setup.sh store.sh install.sh bootstrap.sh tests/test_install_workflow.sh
+bash -n start.sh setup.sh store.sh install.sh bootstrap.sh service-install.sh terminal-mcp-service tests/test_install_workflow.sh tests/test_service_workflow.sh
 tests/test_install_workflow.sh
+tests/test_service_workflow.sh
 .venv/bin/python -m py_compile terminal_mcp.py scripts/smoke_test.py
 .venv/bin/pytest
 ```

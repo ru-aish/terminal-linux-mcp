@@ -22,8 +22,9 @@ Bootstrap options:
   --ref REF             Git branch, tag, or commit to download (default: main)
   -h, --help            Show this help.
 
-All other options are passed to install.sh, including --with-ngrok, --test,
---skip-system-packages, and --configure-only.
+All other options are passed to install.sh, including --service, --no-service,
+--with-ngrok, --test, --skip-system-packages, and --configure-only. Normal
+installation registers and verifies a persistent loopback-only systemd service.
 EOF
 }
 

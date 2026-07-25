@@ -58,4 +58,9 @@ MCP_ENV_FILE="$custom_env" "$ROOT_DIR/install.sh" --configure-only >/dev/null
 [[ -f "$custom_env" ]] || fail 'MCP_ENV_FILE override was not created'
 [[ "$(stat -c '%a' "$custom_env")" == 600 ]] || fail 'custom environment file is not mode 600'
 
+ordered_env="$TEMP_DIR/ordered.env"
+ordered_output="$(MCP_ENV_FILE="$ordered_env" "$ROOT_DIR/install.sh" --configure-only --service user)"
+grep -Fq 'No service was installed' <<<"$ordered_output" || fail '--configure-only depends on argument order'
+[[ -f "$ordered_env" ]] || fail '--configure-only did not create ordered environment file'
+
 printf 'secure install workflow passed\n'
