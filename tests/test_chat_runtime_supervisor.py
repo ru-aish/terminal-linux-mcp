@@ -287,6 +287,52 @@ def test_gateway_create_and_continue_send_configured_high_reasoning(
         assert "client.models()" not in expression
 
 
+def test_gateway_default_model_is_canonical_high_reasoning_model(monkeypatch) -> None:
+    backend = codex_renderer.CodexRendererBackend()
+    expressions: list[str] = []
+
+    def evaluate(expression: str, *, timeout=None):
+        expressions.append(expression)
+        if "title_requested" in expression:
+            return {
+                "accepted": True,
+                "conversation_id": "conversation-1",
+                "message_id": "message-1",
+                "running": True,
+            }
+        return {
+            "accepted": True,
+            "conversation_id": "conversation-1",
+            "message_id": "message-2",
+            "running": True,
+        }
+
+    monkeypatch.setattr(backend, "_evaluate", evaluate)
+    asyncio.run(
+        backend.create_thread(
+            project_id="",
+            prompt="Create with the default high model.",
+            title="High model",
+            idempotency_key="create-default-high",
+        )
+    )
+    asyncio.run(
+        backend.continue_thread(
+            conversation_id="conversation-1",
+            message="Continue with the default high model.",
+            idempotency_key="continue-default-high",
+        )
+    )
+
+    assert backend.model_slug == "gpt-5-6-thinking"
+    assert backend.thinking_effort == "extended"
+    assert len(expressions) == 2
+    for expression in expressions:
+        assert 'model:"gpt-5-6-thinking"' in expression
+        assert 'const thinkingEffort = "extended"' in expression
+        assert "request.thinking_effort = thinkingEffort" in expression
+
+
 def test_gateway_rejects_required_reasoning_without_an_effort() -> None:
     with pytest.raises(ValueError, match="thinking_effort is required"):
         codex_renderer.CodexRendererBackend(

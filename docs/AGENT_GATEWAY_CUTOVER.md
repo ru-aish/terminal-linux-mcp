@@ -30,7 +30,7 @@ MCP_CHAT_AGENT_DB=~/.GPT/chat-agent-orchestrator.db
 MCP_CHAT_GATEWAY_DB=~/.GPT/chat-agent-gateway.db
 MCP_CHAT_AGENT_MAX_ACTIVE_CHILDREN=5
 CHAT_GATEWAY_CDP_ENDPOINT=http://127.0.0.1:9222
-CHAT_GATEWAY_MODEL_SLUG=gpt-5.6-terra
+CHAT_GATEWAY_MODEL_SLUG=gpt-5-6-thinking
 ```
 
 5. Start Terminal MCP once. Do not run the old and new coordinators concurrently against the same domain database.

@@ -41,7 +41,10 @@ from chat_agent_orchestrator import (
 )
 from gateway_agent_orchestrator import GatewayChatAgentCoordinator
 from chat_gateway import ChatGateway, GatewayConfig, SQLiteLedger
-from chat_gateway.adapters.codex_renderer import CodexRendererBackend
+from chat_gateway.adapters.codex_renderer import (
+    DEFAULT_HIGH_REASONING_MODEL,
+    CodexRendererBackend,
+)
 from chat_runtime_controller import ChatRuntimeController
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
@@ -166,9 +169,9 @@ def get_chat_gateway() -> ChatGateway:
             ),
             model_slug=os.environ.get(
                 "CHAT_GATEWAY_MODEL_SLUG",
-                os.environ.get("MCP_CHAT_WATCHDOG_MODEL", "gpt-5.6-terra"),
+                os.environ.get("MCP_CHAT_WATCHDOG_MODEL", DEFAULT_HIGH_REASONING_MODEL),
             )
-            or "gpt-5.6-terra",
+            or DEFAULT_HIGH_REASONING_MODEL,
             stream_start_timeout=float(
                 os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
             ),

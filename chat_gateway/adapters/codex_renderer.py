@@ -18,6 +18,9 @@ from ..errors import (
 )
 from ..models import MutationResult, ThreadSnapshot, TurnSnapshot
 
+DEFAULT_HIGH_REASONING_MODEL = "gpt-5-6-thinking"
+
+
 _BRIDGE = (
     CHAT_RENDERER_BRIDGE_JS
     + r"""
@@ -48,7 +51,7 @@ class CodexRendererBackend:
         self,
         *,
         cdp_endpoint: str = "http://127.0.0.1:9222",
-        model_slug: str = "gpt-5.6-terra",
+        model_slug: str = DEFAULT_HIGH_REASONING_MODEL,
         stream_start_timeout: float = 30.0,
         cdp_timeout: float = 45.0,
         webview_port: int = 5175,
@@ -83,7 +86,7 @@ class CodexRendererBackend:
             cdp_endpoint=os.environ.get(
                 "CHAT_GATEWAY_CDP_ENDPOINT", "http://127.0.0.1:9222"
             ),
-            model_slug=os.environ.get("CHAT_GATEWAY_MODEL_SLUG", "gpt-5.6-terra"),
+            model_slug=os.environ.get("CHAT_GATEWAY_MODEL_SLUG", DEFAULT_HIGH_REASONING_MODEL),
             stream_start_timeout=float(
                 os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
             ),
