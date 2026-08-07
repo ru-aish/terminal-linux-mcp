@@ -690,7 +690,38 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                         (operation_id, command["command_id"]),
                     )
                 continue
-            if gateway_agent.state in {AgentState.CREATING, AgentState.RUNNING}:
+            if gateway_agent.state is AgentState.CREATING:
+                continue
+            if gateway_agent.state is AgentState.RUNNING:
+                gateway_now = self.gateway.clock.now()
+                due_at = max(
+                    gateway_now,
+                    float(gateway_agent.next_inspection_at or gateway_now),
+                )
+                try:
+                    operation_id = self.gateway.enqueue_inspect(
+                        agent_id=gateway_id,
+                        due_at=due_at,
+                        completion_sensitive=str(command.get("purpose") or "")
+                        in {"completion", "question", "wakeup", "after_completion"},
+                    )
+                except Exception as exc:
+                    with self.repository.transaction() as db:
+                        db.execute(
+                            "UPDATE commands SET last_error=?,next_attempt_at=? WHERE command_id=?",
+                            (_safe_error(exc), _now() + 60, command["command_id"]),
+                        )
+                    continue
+                delay = max(1.0, due_at - gateway_now)
+                with self.repository.transaction() as db:
+                    db.execute(
+                        "UPDATE commands SET last_error=?,next_attempt_at=? WHERE command_id=?",
+                        (
+                            f"waiting for canonical running target read ({operation_id})",
+                            _now() + delay,
+                            command["command_id"],
+                        ),
+                    )
                 continue
             if self.gateway.latest_snapshot(gateway_id) is None:
                 try:

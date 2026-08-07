@@ -334,6 +334,158 @@ def test_command_continue_and_verification_are_separate_ticks(tmp_path):
     assert verification["physical_requests"] == 1
 
 
+def test_child_message_to_running_root_schedules_canonical_parent_inspection(tmp_path):
+    coordinator, gateway, backend, clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    parent_id = parent["agent_id"]
+    child = run(
+        coordinator.spawn(
+            parent_id,
+            "send a parent update",
+            idempotency_key="running-root-child",
+            notification_policy="notify_only",
+        )
+    )
+    child_id = child["agent"]["agent_id"]
+
+    run(coordinator.sync_once())
+    clock.advance(1)
+    run(coordinator.sync_once())
+
+    parent_gateway_id = coordinator.repository.agent(parent_id)["gateway_agent_id"]
+    with gateway.ledger.transaction(immediate=True) as db:
+        gateway.ledger.update_agent(
+            db,
+            agent_id=parent_gateway_id,
+            now=clock.now(),
+            state=AgentState.RUNNING,
+            snapshot_hash=None,
+            last_inspected_at=None,
+            next_inspection_at=None,
+        )
+
+    command = run(
+        coordinator.send(
+            child_id,
+            parent_id,
+            "child progress for the parent",
+            idempotency_key="child-to-running-root",
+        )
+    )
+    assert command["purpose"] == "progress"
+    assert command["status"] == "queued"
+
+    coordinator.prepare_local_work()
+    parent_operations = [
+        operation
+        for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
+        if operation.agent_id == parent_gateway_id
+    ]
+    assert any(
+        operation.type is OperationType.INSPECT for operation in parent_operations
+    )
+
+    inspection = run(coordinator.sync_once())
+    assert inspection["operation_type"] == OperationType.INSPECT.value
+    assert gateway.ledger.get_agent(parent_gateway_id).state is AgentState.UNKNOWN
+
+    with coordinator.repository.transaction() as db:
+        db.execute(
+            "UPDATE commands SET next_attempt_at=0 WHERE command_id=?",
+            (command["command_id"],),
+        )
+    dispatch = run(coordinator.sync_once())
+    assert dispatch["operation_type"] == OperationType.CONTINUE.value
+    with coordinator.repository.connect() as db:
+        delivered = dict(
+            db.execute(
+                "SELECT * FROM commands WHERE command_id=?", (command["command_id"],)
+            ).fetchone()
+        )
+    assert delivered["status"] == "delivered"
+    assert backend.threads["parent-chat"].turns[-2].text == "child progress for the parent"
+
+
+def test_child_completion_envelope_reaches_running_root_and_acks_events(tmp_path):
+    coordinator, gateway, backend, clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    parent_id = parent["agent_id"]
+    child = run(
+        coordinator.spawn(
+            parent_id,
+            "finish and notify the parent",
+            idempotency_key="completion-root-child",
+            notification_policy="auto_resume",
+        )
+    )
+    child_id = child["agent"]["agent_id"]
+    task_id = child["task"]["task_id"]
+
+    run(coordinator.sync_once())
+    clock.advance(1)
+    run(coordinator.sync_once())
+
+    parent_gateway_id = coordinator.repository.agent(parent_id)["gateway_agent_id"]
+    with gateway.ledger.transaction(immediate=True) as db:
+        gateway.ledger.update_agent(
+            db,
+            agent_id=parent_gateway_id,
+            now=clock.now(),
+            state=AgentState.RUNNING,
+            snapshot_hash=None,
+            last_inspected_at=None,
+            next_inspection_at=None,
+        )
+    coordinator._emit_event(
+        child_id,
+        task_id,
+        "completed",
+        {"summary": "child finished successfully"},
+        source_cursor="test-child-completed",
+    )
+
+    coordinator.prepare_local_work()
+    with coordinator.repository.connect() as db:
+        completion = dict(
+            db.execute(
+                "SELECT * FROM commands WHERE from_agent_id=? AND to_agent_id=? "
+                "AND purpose='completion' ORDER BY sequence_no DESC LIMIT 1",
+                (child_id, parent_id),
+            ).fetchone()
+        )
+    assert completion["status"] == "queued"
+    assert completion["ack_event_seq"]
+    assert "[SUBAGENT UPDATE]" in completion["message"]
+
+    inspection = run(coordinator.sync_once())
+    assert inspection["operation_type"] == OperationType.INSPECT.value
+    assert gateway.ledger.get_agent(parent_gateway_id).state is AgentState.UNKNOWN
+
+    with coordinator.repository.transaction() as db:
+        db.execute(
+            "UPDATE commands SET next_attempt_at=0 WHERE command_id=?",
+            (completion["command_id"],),
+        )
+    dispatch = run(coordinator.sync_once())
+    assert dispatch["operation_type"] == OperationType.CONTINUE.value
+
+    with coordinator.repository.connect() as db:
+        completion_status = db.execute(
+            "SELECT status FROM commands WHERE command_id=?",
+            (completion["command_id"],),
+        ).fetchone()[0]
+        acked = db.execute(
+            "SELECT last_acked_event_seq FROM subscriptions "
+            "WHERE parent_agent_id=? AND child_agent_id=?",
+            (parent_id, child_id),
+        ).fetchone()[0]
+    assert completion_status == "delivered"
+    assert int(acked) == int(completion["ack_event_seq"])
+    assert backend.threads["parent-chat"].turns[-2].text.startswith("[SUBAGENT UPDATE]")
+
+
 def test_completed_child_reopens_for_new_parent_instruction(tmp_path):
     coordinator, gateway, _backend, _clock, _runtime = make_coordinator(tmp_path)
     parent = run(coordinator.register_parent("parent-chat"))
