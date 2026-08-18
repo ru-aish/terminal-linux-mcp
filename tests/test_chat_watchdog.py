@@ -1022,10 +1022,19 @@ def test_desktop_launch_environment_inherits_only_graphical_session_fields(tmp_p
         proc_root=tmp_path,
     )
 
-    assert environment["DISPLAY"] == ":0"
-    assert environment["WAYLAND_DISPLAY"] == "wayland-0"
-    assert environment["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
-    assert "SECRET" not in environment
+    import platform
+
+    if platform.system() == "Darwin":
+        assert "DISPLAY" not in environment
+        assert "WAYLAND_DISPLAY" not in environment
+        assert "XDG_RUNTIME_DIR" not in environment
+        assert "DBUS_SESSION_BUS_ADDRESS" not in environment
+        assert "SECRET" not in environment
+    else:
+        assert environment["DISPLAY"] == ":0"
+        assert environment["WAYLAND_DISPLAY"] == "wayland-0"
+        assert environment["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
+        assert "SECRET" not in environment
 
 def test_high_quality_block_is_persisted_without_sending(tmp_path):
     async def run():

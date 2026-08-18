@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit, urlunsplit
 
+from platform_support import IS_LINUX, default_chat_agent_db, default_chat_gateway_db, default_shell
+
 from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -47,7 +49,7 @@ WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expandu
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR = Path(os.environ.get("MCP_LOG_DIR", "~/.gpt_terminal_mcp_logs")).expanduser().resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-SHELL = os.environ.get("MCP_SHELL", "/bin/bash")
+SHELL = os.environ.get("MCP_SHELL", default_shell())
 DEFAULT_TIMEOUT = int(os.environ.get("MCP_DEFAULT_TIMEOUT", "30"))
 DEFAULT_MAX_OUTPUT_CHARS = int(os.environ.get("MCP_MAX_OUTPUT_CHARS", "24000"))
 PROCESS_BUFFER_LINES = int(os.environ.get("MCP_PROCESS_BUFFER_LINES", "1000"))
@@ -65,12 +67,8 @@ TOKEN_ACCOUNTING_MAX_CHARS = int(os.environ.get("MCP_TOKEN_ACCOUNTING_MAX_CHARS"
 GOAL_REMINDER_SECONDS = int(os.environ.get("MCP_GOAL_REMINDER_SECONDS", "900"))
 NODE_REPL_MCP_SERVER = os.environ.get("MCP_NODE_REPL_SERVER", "node_repl")
 GPT_STORE = GPTThreadStore(lambda: WORKSPACE_DIR)
-CHAT_AGENT_DB_PATH = Path(
-    os.environ.get("MCP_CHAT_AGENT_DB", "~/.GPT/chat-agent-orchestrator.db")
-).expanduser().resolve()
-CHAT_GATEWAY_DB_PATH = Path(
-    os.environ.get("MCP_CHAT_GATEWAY_DB", "~/.GPT/chat-agent-gateway.db")
-).expanduser().resolve()
+CHAT_AGENT_DB_PATH = Path(os.environ.get("MCP_CHAT_AGENT_DB", str(default_chat_agent_db()))).expanduser().resolve()
+CHAT_GATEWAY_DB_PATH = Path(os.environ.get("MCP_CHAT_GATEWAY_DB", str(default_chat_gateway_db()))).expanduser().resolve()
 CHAT_AGENT_MAX_ACTIVE_CHILDREN = max(
     1, int(os.environ.get("MCP_CHAT_AGENT_MAX_ACTIVE_CHILDREN", "5"))
 )
@@ -749,8 +747,8 @@ def _safe_unit_component(value: str) -> str:
 
 
 def _systemd_workload_prefix(session_id: str, request_id: str) -> tuple[list[str], str | None]:
-    """Launch workload commands outside the MCP service cgroup when supported."""
-    if WORKLOAD_ISOLATION == "off" or shutil.which("systemd-run") is None:
+    """Launch workload commands outside the MCP service cgroup when Linux/systemd is available."""
+    if not IS_LINUX or WORKLOAD_ISOLATION == "off" or shutil.which("systemd-run") is None:
         return [], None
     unit = f"mcp-workload-{_safe_unit_component(session_id)}-{_safe_unit_component(request_id)}.scope"
     args = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}", "--slice=mcp-workloads.slice"]
@@ -778,7 +776,11 @@ async def _spawn_workload(
         except (FileNotFoundError, OSError):
             if WORKLOAD_ISOLATION == "required":
                 raise
-    if WORKLOAD_ISOLATION == "required":
+    # macOS has no systemd equivalent for per-command scopes.  The runner's
+    # start_new_session=True creates a dedicated process group, which is then
+    # terminated as a unit by _stop_workload().  Treat that as the native
+    # isolation mechanism rather than failing merely because systemd is absent.
+    if WORKLOAD_ISOLATION == "required" and IS_LINUX:
         raise RuntimeError("MCP workload isolation is required but systemd-run is unavailable")
     if shell:
         return await asyncio.create_subprocess_shell(
@@ -794,8 +796,11 @@ async def _spawn_workload(
 
 
 async def _stop_workload(process: asyncio.subprocess.Process, unit_name: str | None) -> None:
-    if unit_name and shutil.which("systemctl"):
-        control = await asyncio.create_subprocess_exec("systemctl", "--user", "stop", unit_name, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    if unit_name and IS_LINUX and shutil.which("systemctl"):
+        control = await asyncio.create_subprocess_exec(
+            "systemctl", "--user", "stop", unit_name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
         await control.wait()
     await _terminate_process_group(process)
 

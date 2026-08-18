@@ -65,10 +65,17 @@ while (($#)); do
 done
 
 mkdir -p "$RUNTIME_DIR" "$VENV_PARENT"
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$RUNTIME_DIR/setup.lock"
-  flock -w "${MCP_SETUP_LOCK_TIMEOUT:-300}" 9 || die 'another setup process is already running'
-fi
+LOCK_DIR="$RUNTIME_DIR/setup.lock.d"
+LOCK_TIMEOUT="${MCP_SETUP_LOCK_TIMEOUT:-300}"
+lock_start=$SECONDS
+while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+  if (( SECONDS - lock_start >= LOCK_TIMEOUT )); then
+    die 'another setup process is already running'
+  fi
+  sleep 1
+done
+cleanup_setup_lock() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
+trap cleanup_setup_lock EXIT
 
 python_ok() {
   local candidate=$1
@@ -124,7 +131,7 @@ create_venv() {
     log "Python's venv module is unavailable; trying uv instead"
   fi
 
-  [[ -n "$uv_bin" ]] || die 'cannot create a virtual environment. Run ./store.sh to install Linux prerequisites and a managed Python.'
+  [[ -n "$uv_bin" ]] || die 'cannot create a virtual environment. Run ./store.sh to install platform prerequisites and a managed Python.'
   "$uv_bin" python install 3.11
   "$uv_bin" venv --seed --python 3.11 "$target"
 }
@@ -156,7 +163,7 @@ fi
 SYSTEM_PYTHON="$(find_python || true)"
 UV="$(find_uv || true)"
 if [[ -z "$SYSTEM_PYTHON" && -z "$UV" ]]; then
-  die 'Python 3.11+ was not found. Run ./store.sh; it can install system prerequisites and a managed Python on Linux.'
+  die 'Python 3.11+ was not found. Run ./store.sh; it can install platform prerequisites and a managed Python.'
 fi
 
 needs_rebuild=$RECREATE
@@ -167,6 +174,7 @@ fi
 rollback_rebuild() {
   local status=$?
   trap - EXIT
+  cleanup_setup_lock
   if [[ "$SETUP_SUCCEEDED" != 1 && "$needs_rebuild" == 1 ]]; then
     rm -rf "$VENV_DIR"
     if [[ -n "$BACKUP_VENV" && -e "$BACKUP_VENV" ]]; then
@@ -229,6 +237,7 @@ SETUP_SUCCEEDED=1
 if [[ -n "$BACKUP_VENV" && -e "$BACKUP_VENV" ]]; then
   rm -rf "$BACKUP_VENV"
 fi
+cleanup_setup_lock
 trap - EXIT
 
 version="$($VENV_DIR/bin/python -c 'import sys; print(sys.version.split()[0])')"

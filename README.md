@@ -1,6 +1,6 @@
 # Terminal GPT Experimental MCP
 
-An isolated experimental copy of the Terminal Linux MCP that bootstraps every model thread with GPT-specific instructions, skills, tool manifests, downstream MCP discovery, and persistent token-usage accounting.
+An isolated Terminal MCP with native Linux and macOS runtime support that bootstraps every model thread with GPT-specific instructions, skills, tool manifests, downstream MCP discovery, and persistent token-usage accounting.
 
 The server can run locally over stdio, SSE, or Streamable HTTP. `start.sh` starts the Streamable HTTP server and an ngrok tunnel together, prints the final MCP endpoint, and shuts both processes down cleanly.
 
@@ -150,6 +150,7 @@ Set `MCP_DASHBOARD_TOKEN` to require the dashboard login form. The MCP bearer mi
 
 ## Requirements
 
+- macOS (Apple Silicon or Intel)
 - Linux
 - Optional agent CLIs used by delegated tools: Codex and/or Antigravity
 
@@ -161,8 +162,8 @@ uses a managed Python instead.
 ## Quick start
 
 ```bash
-git clone https://github.com/ru-aish/terminal-linux-mcp.git
-cd terminal-linux-mcp
+git clone https://github.com/sachinrathod11/terminal-mac_mcp.git
+cd terminal-mac_mcp
 ./store.sh --with-ngrok
 cp .env.example .env
 ```
@@ -292,7 +293,7 @@ response = client.responses.create(
         {
             "type": "mcp",
             "server_label": "terminal_linux",
-            "server_description": "A controlled Linux development terminal.",
+            "server_description": "A controlled development terminal running on the host OS.",
             "server_url": os.environ["TERMINAL_MCP_URL"],
             "authorization": os.environ["MCP_BEARER_TOKEN"],
             "require_approval": "always",
@@ -420,15 +421,15 @@ Copy `.env.example` to `.env`. Important values:
 | `MCP_ALLOW_UNAUTHENTICATED_PUBLIC` | `0` | Dangerous public-tunnel override |
 | `MCP_CHAT_WATCHDOG_ENABLED` | `1` | Enable the five-minute ChatGPT task watchdog for SSE/Streamable HTTP |
 | `MCP_CHAT_WATCHDOG_ADAPTER` | `codex-internal` | Use the Codex desktop app's internal normal-chat client; no UI fallback is enabled |
-| `MCP_CHAT_WATCHDOG_QUEUE` | `~/.GPT/chat-watchdog/threads.txt` | Editable one-active-task-URL-per-line input queue; task state is reconciled into the durable ledger |
-| `MCP_CHAT_WATCHDOG_STATE` | `~/.GPT/chat-watchdog/state.json` | Compatibility mirror and one-time import source for watchdog task state |
-| `MCP_CHAT_WATCHDOG_COMPLETED` | `~/.GPT/chat-watchdog/completed.jsonl` | Append-only task completion history |
+| `MCP_CHAT_WATCHDOG_QUEUE` | platform-native application support directory | Editable one-active-task-URL-per-line input queue; task state is reconciled into the durable ledger |
+| `MCP_CHAT_WATCHDOG_STATE` | platform-native application support directory | Compatibility mirror and one-time import source for watchdog task state |
+| `MCP_CHAT_WATCHDOG_COMPLETED` | platform-native application support directory | Append-only task completion history |
 | `MCP_CHAT_WATCHDOG_CDP` | `http://127.0.0.1:9222` | Codex desktop CDP endpoint |
 | `MCP_CHAT_WATCHDOG_INTERVAL_SECONDS` | `300` | Scheduled scan interval |
 | `MCP_CHAT_WATCHDOG_RETRY_SECONDS` | `300` | Duplicate-send cooldown |
 | `MCP_CHAT_WATCHDOG_DRY_RUN` | `0` | Inspect and report without sending |
 | `MCP_CHAT_WATCHDOG_AUTO_START_APP` | `1` | Start the desktop host when offline, or reopen its primary renderer when CDP is up but the internal client is not ready |
-| `MCP_CHAT_WATCHDOG_APP_COMMAND` | `/usr/bin/codex-desktop` | Installed Codex desktop launch command |
+| `MCP_CHAT_WATCHDOG_APP_COMMAND` | platform default | macOS uses `/usr/bin/open -a "Codex" --args`; Linux uses `/usr/bin/codex-desktop` |
 | `MCP_CHAT_WATCHDOG_APP_START_TIMEOUT_SECONDS` | `30` | Maximum time to wait for a usable primary renderer after starting or reopening the desktop host |
 | `MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS` | `10` | Timeout for CDP attachment and internal reads |
 | `MCP_CHAT_WATCHDOG_REQUIRE_HIGH` | `1` | Refuse to silently lower the requested reasoning level |
@@ -454,7 +455,7 @@ The launcher refuses to start when the selected port is already occupied. It nev
 
 When enabled, the SSE and Streamable HTTP app scans every five minutes. Each URL line is one active task instance in an ordinary saved ChatGPT conversation, not a permanent thread watch or Work task. Completion removes that task URL; adding the same URL again creates a fresh task ID and increments its task generation, resetting hashes, cooldowns, attempts, completion state, and user-turn baseline. Direct file removal and later reappearance are reconciled the same way.
 
-The default `codex-internal` adapter attaches to the installed desktop host at `127.0.0.1:9222` and calls its app-owned client for ordinary saved ChatGPT conversations directly. It does not launch Chrome, navigate conversations, read rendered transcript DOM, focus controls, type, or click, and there is no UI fallback. The desktop host must already be signed in once with the ChatGPT account that owns the queued conversations. If it is closed, the watchdog may start `/usr/bin/codex-desktop`. If CDP is up but no usable primary renderer exists, the watchdog sends the launcher's supported `--new-chat` warm-start action and waits for the internal runtime to become ready; failure remains non-destructive and sends nothing. The current build's `mcpAppSandboxDevtools=1` primary renderer is supported.
+The default `codex-internal` adapter attaches to the installed desktop host at `127.0.0.1:9222` and calls its app-owned client for ordinary saved ChatGPT conversations directly. It does not launch Chrome, navigate conversations, read rendered transcript DOM, focus controls, type, or click, and there is no UI fallback. The desktop host must already be signed in once with the ChatGPT account that owns the queued conversations. If it is closed, the watchdog launches the configured desktop host. On macOS the default is `/usr/bin/open -a "Codex" --args`; on Linux it remains `/usr/bin/codex-desktop`. If CDP is up but no usable primary renderer exists, the watchdog sends the launcher's supported `--new-chat` warm-start action and waits for the internal runtime to become ready; failure remains non-destructive and sends nothing. The current build's `mcpAppSandboxDevtools=1` primary renderer is supported.
 
 Task completion is turn-bounded. A re-added task uses the prior generation's recorded completion turn as its boundary and waits for a later user turn, so an old `DONE_I_HAVE_COMPLETED_ALL_THE_STEPS` marker cannot complete a new task. Completion is accepted only when the latest meaningful turn is an assistant turn after the current task's user baseline and contains the marker as an exact standalone line. The durable completion record includes task ID, generation, baseline turn, and completion turn before the URL is removed.
 
@@ -484,7 +485,7 @@ Operational migration and rollback instructions are in `docs/AGENT_GATEWAY_CUTOV
 
 ## Security guidance
 
-1. Run under a dedicated, unprivileged Linux user.
+1. Run under a dedicated, unprivileged OS user.
 2. Limit `MCP_WORKSPACE` and filesystem permissions to only the directories the agent needs.
 3. Set `MCP_BEARER_TOKEN` to a unique random value and rotate it if exposed.
 4. Keep OpenAI tool approvals set to `always` until the workflow is thoroughly reviewed.
@@ -501,7 +502,7 @@ Install development dependencies:
 
 ```bash
 ./store.sh --dev
-# Or, when Linux prerequisites are already installed:
+# Or, when platform prerequisites are already installed:
 ./setup.sh --dev
 ```
 
@@ -525,9 +526,27 @@ The regression suite verifies:
 - filesystem and background-process lifecycle
 - bearer authentication
 
+## macOS setup
+
+The project supports Apple Silicon and Intel macOS. A fresh machine can be bootstrapped with Homebrew:
+
+```bash
+brew install python@3.11 tmux
+cd terminal-mac_mcp
+./store.sh --dev
+./doctor.sh
+./start.sh --local-only
+```
+
+For public access, install ngrok with `./store.sh --with-ngrok` or `brew install ngrok`, configure its authentication, and start the MCP without `--local-only`. The installer never downloads the Linux ngrok archive on macOS.
+
+The terminal runner uses the user's `$SHELL` (defaulting to zsh on macOS) and process groups rather than Linux `systemd` scopes. Linux keeps the existing `systemd-run` workload isolation when available.
+
+`launchd` integration is intentionally not required for development; add it only after the normal foreground/local startup is verified.
+
 ## Troubleshooting
 
-### Fresh Linux machine or missing `venv`/`pip`
+### Fresh Linux or macOS machine / missing `venv` or `pip`
 
 Run the full bootstrap installer:
 
@@ -541,7 +560,7 @@ If sudo access is unavailable, use the user-space path:
 ./store.sh --skip-system-packages
 ```
 
-The installer downloads `uv` only when no usable Python 3.11+ interpreter is
+On macOS, the installer uses Homebrew for Python 3.11 and tmux. On Linux, it uses the existing distribution package manager. The installer downloads `uv` only when no usable Python 3.11+ interpreter is
 available. Downloads use HTTPS, retry transient failures, and support optional
 `UV_INSTALLER_SHA256` and `NGROK_SHA256` verification overrides.
 
