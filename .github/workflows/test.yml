@@ -9,11 +9,19 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.13"
 
     steps:
       - name: Check out repository
@@ -25,13 +33,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Install tmux runtime prerequisite
+        run: |
+          if [[ "${{ matrix.os }}" == macos-* ]]; then
+            brew install tmux
+          else
+            sudo apt-get update
+            sudo apt-get install -y tmux
+          fi
+
       - name: Check bootstrap interfaces
         run: |
-          bash -n start.sh setup.sh store.sh install.sh
+          bash -n start.sh setup.sh store.sh install.sh doctor.sh
           ./start.sh --help
           ./setup.sh --help
           ./store.sh --help
           ./install.sh --help
+          ./doctor.sh || true
 
       - name: Install through project setup
         env:
@@ -41,6 +59,7 @@ jobs:
           .venv/bin/pytest --version
           ./store.sh --check
           ./start.sh --check --local-only
+          ./doctor.sh || true
 
       - name: Compile Python files
         run: |

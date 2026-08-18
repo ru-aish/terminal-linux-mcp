@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import platform
 import asyncio
 import contextlib
 import hashlib
@@ -22,6 +22,14 @@ import httpx
 
 from conversation_gateway import ConversationGateway, DeliveryState
 from durable_ledger import DurableLedger
+
+from platform_support import (
+    default_chat_agent_db,
+    default_chat_watchdog_root,
+    default_codex_launch_command,
+    desktop_launch_environment as platform_desktop_launch_environment,
+    prepare_desktop_command,
+)
 
 from chat_internal_client import (
     DEFAULT_CODEX_CDP_ENDPOINT,
@@ -81,6 +89,12 @@ def desktop_launch_environment(
     proc_root: Path = Path("/proc"),
 ) -> dict[str, str]:
     """Return an app-launch environment with same-user graphical session fields."""
+    # macOS uses the logged-in GUI session and does not expose Linux /proc or
+    # X11/Wayland session variables.  The native ``open`` launcher inherits
+    # the user's GUI environment, so no synthetic DISPLAY/XDG state is needed.
+    if platform.system().lower() == "darwin":
+        return platform_desktop_launch_environment(base)
+
     environment = dict(os.environ if base is None else base)
     needs_display = not (environment.get("DISPLAY") or environment.get("WAYLAND_DISPLAY"))
     if needs_display:
@@ -1032,7 +1046,7 @@ class ChatWatchdogConfig:
     continue_message: str = DEFAULT_CONTINUE_MESSAGE
     dry_run: bool = False
     auto_start_app: bool = True
-    app_command: str = "/usr/bin/codex-desktop"
+    app_command: str = default_codex_launch_command()
     app_start_timeout_seconds: int = 30
     internal_timeout_seconds: float = 10.0
     require_high_reasoning: bool = True
@@ -1046,7 +1060,7 @@ class ChatWatchdogConfig:
 
     @classmethod
     def from_env(cls) -> "ChatWatchdogConfig":
-        root = Path(os.environ.get("MCP_CHAT_WATCHDOG_DIR", "~/.GPT/chat-watchdog")).expanduser()
+        root = default_chat_watchdog_root()
         enabled = os.environ.get("MCP_CHAT_WATCHDOG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
         adapter_mode = (
             os.environ.get("MCP_CHAT_WATCHDOG_ADAPTER", CODEX_INTERNAL_ADAPTER_NAME).strip().lower()
@@ -1071,8 +1085,7 @@ class ChatWatchdogConfig:
             in {"1", "true", "yes", "on"},
             auto_start_app=os.environ.get("MCP_CHAT_WATCHDOG_AUTO_START_APP", "1").strip().lower()
             not in {"0", "false", "no", "off"},
-            app_command=os.environ.get("MCP_CHAT_WATCHDOG_APP_COMMAND", "/usr/bin/codex-desktop").strip()
-            or "/usr/bin/codex-desktop",
+            app_command=default_codex_launch_command(),
             app_start_timeout_seconds=max(
                 1, int(os.environ.get("MCP_CHAT_WATCHDOG_APP_START_TIMEOUT_SECONDS", "30"))
             ),
@@ -1099,7 +1112,7 @@ class ChatWatchdogConfig:
             ledger_path=Path(
                 os.environ.get(
                     "MCP_CHAT_AGENT_DB",
-                    "~/.GPT/chat-agent-orchestrator.db",
+                    str(default_chat_agent_db()),
                 )
             ).expanduser(),
         )
@@ -1257,16 +1270,11 @@ class ChatWatchdog:
             error_type = RuntimeNotReadyError if initial.available else RuntimeUnavailableError
             raise error_type(attempt["reason"])
 
-        argv = shlex.split(self.config.app_command)
-        if not argv:
-            attempt["reason"] = "ChatGPT desktop command is empty"
-            raise RuntimeUnavailableError(attempt["reason"])
-        launch_argv = list(argv)
-        if initial.available and not any(
-            argument in {"--new-chat", "--quick-chat", "--prompt-chat", "--hotkey-window"}
-            for argument in launch_argv
-        ):
-            launch_argv.append("--new-chat")
+        try:
+            launch_argv = prepare_desktop_command(self.config.app_command, reopen=initial.available)
+        except ValueError as exc:
+            attempt["reason"] = str(exc)
+            raise RuntimeUnavailableError(attempt["reason"]) from exc
         attempt["attempted"] = True
         attempt["argv"] = launch_argv
         try:

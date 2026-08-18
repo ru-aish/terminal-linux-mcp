@@ -21,7 +21,7 @@ usage() {
   cat <<'EOF'
 Usage: ./store.sh [options]
 
-Bootstrap Terminal Linux MCP on a Linux machine. This script can install OS
+Bootstrap Terminal MCP on Linux or macOS. This script can install OS
 packages, install a user-local managed Python through uv when Python 3.11+ is
 missing, build the project virtual environment, and optionally install ngrok.
 
@@ -29,16 +29,18 @@ Options:
   --dev                    Install development/test dependencies.
   --test                   Install development dependencies and run tests.
   --with-ngrok             Install ngrok into ~/.local/bin when missing.
-  --skip-system-packages   Do not invoke apt/dnf/yum/pacman/zypper/apk.
+  --skip-system-packages   Do not install OS-level packages.
   --check                  Report installation readiness without changing files.
   -h, --help               Show this help.
 
 Useful environment overrides:
   UV_INSTALLER_URL         uv installer URL (default: https://astral.sh/uv/install.sh)
   UV_INSTALLER_SHA256      Optional expected SHA-256 for the uv installer script
-  NGROK_DOWNLOAD_URL       Override the architecture-specific ngrok archive URL
-  NGROK_SHA256             Optional expected SHA-256 for the ngrok archive
+  NGROK_DOWNLOAD_URL       Override an ngrok archive URL on Linux
+  NGROK_SHA256             Optional expected SHA-256 for a downloaded ngrok archive
   INSTALL_BIN_DIR          User binary directory (default: ~/.local/bin)
+
+On macOS, Homebrew is used for Python 3.11, tmux, and optional ngrok.
 EOF
 }
 
@@ -55,6 +57,26 @@ warn() {
   printf '[store] WARNING: %s\n' "$*" >&2
 }
 
+find_brew() {
+  if command -v brew >/dev/null 2>&1; then
+    command -v brew
+  elif [[ -x /opt/homebrew/bin/brew ]]; then
+    printf '%s\n' /opt/homebrew/bin/brew
+  elif [[ -x /usr/local/bin/brew ]]; then
+    printf '%s\n' /usr/local/bin/brew
+  else
+    return 1
+  fi
+}
+
+brew_install() {
+  local brew_bin
+  brew_bin="$(find_brew || true)"
+  [[ -n "$brew_bin" ]] || die 'Homebrew is required on macOS for automatic dependency installation. Install Homebrew from https://brew.sh/ and rerun this script.'
+  log "installing macOS prerequisites with Homebrew"
+  "$brew_bin" install python@3.11 tmux
+}
+
 while (($#)); do
   case "$1" in
     --dev) INSTALL_DEV=1 ;;
@@ -68,11 +90,24 @@ while (($#)); do
   shift
 done
 
-[[ "$(uname -s)" == Linux ]] || die 'this installer currently supports Linux only'
+OS_NAME="$(uname -s)"
+case "$OS_NAME" in
+  Linux|Darwin) ;;
+  *) die "unsupported operating system: $OS_NAME" ;;
+esac
 
 INSTALL_BIN_DIR="${INSTALL_BIN_DIR:-$HOME/.local/bin}"
 VENV_DIR="${MCP_VENV_DIR:-$ROOT_DIR/.venv}"
-export PATH="$INSTALL_BIN_DIR:$HOME/.cargo/bin:$PATH"
+BREW_BIN="$(find_brew || true)"
+if [[ "$OS_NAME" == "Darwin" && -n "$BREW_BIN" ]]; then
+  BREW_PREFIX="$($BREW_BIN --prefix)"
+  export PATH="$BREW_PREFIX/bin:$INSTALL_BIN_DIR:$HOME/.cargo/bin:$PATH"
+  if "$BREW_BIN" --prefix python@3.11 >/dev/null 2>&1; then
+    export PATH="$($BREW_BIN --prefix python@3.11)/bin:$PATH"
+  fi
+else
+  export PATH="$INSTALL_BIN_DIR:$HOME/.cargo/bin:$PATH"
+fi
 
 python_ok() {
   local candidate=$1
@@ -85,7 +120,7 @@ PY
 
 find_python() {
   local candidate
-  for candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
+  for candidate in python3.11 python3.12 python3.13 python3.14 python3 python; do
     if python_ok "$candidate"; then
       command -v "$candidate"
       return
@@ -115,6 +150,7 @@ find_ngrok() {
 }
 
 package_manager() {
+  [[ "$OS_NAME" == "Linux" ]] || return 1
   local manager
   for manager in apt-get dnf yum pacman zypper apk; do
     if command -v "$manager" >/dev/null 2>&1; then
@@ -152,6 +188,10 @@ run_privileged() {
 
 install_system_packages() {
   [[ "$SKIP_SYSTEM_PACKAGES" == 0 ]] || { log 'skipping system package installation'; return; }
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    brew_install
+    return
+  fi
   local manager
   manager="$(package_manager || true)"
   [[ -n "$manager" ]] || { warn 'no supported package manager found; continuing with user-space installation'; return; }
@@ -165,31 +205,31 @@ install_system_packages() {
     apt-get)
       run_privileged apt-get update
       run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        ca-certificates curl git tar gzip build-essential pkg-config \
+        ca-certificates curl git tar gzip build-essential pkg-config tmux \
         libffi-dev libssl-dev python3 python3-venv python3-pip python3-dev
       ;;
     dnf)
       run_privileged dnf install -y \
-        ca-certificates curl git tar gzip gcc gcc-c++ make pkgconf-pkg-config \
+        ca-certificates curl git tar gzip tmux gcc gcc-c++ make pkgconf-pkg-config \
         libffi-devel openssl-devel python3 python3-pip python3-devel
       ;;
     yum)
       run_privileged yum install -y \
-        ca-certificates curl git tar gzip gcc gcc-c++ make pkgconfig \
+        ca-certificates curl git tar gzip tmux gcc gcc-c++ make pkgconfig \
         libffi-devel openssl-devel python3 python3-pip python3-devel
       ;;
     pacman)
       run_privileged pacman -S --needed --noconfirm \
-        ca-certificates curl git tar gzip base-devel pkgconf libffi openssl python python-pip
+        ca-certificates curl git tar gzip tmux base-devel pkgconf libffi openssl python python-pip
       ;;
     zypper)
       run_privileged zypper --non-interactive install -y \
-        ca-certificates curl git tar gzip gcc gcc-c++ make pkg-config \
+        ca-certificates curl git tar gzip tmux gcc gcc-c++ make pkg-config \
         libffi-devel libopenssl-devel python3 python3-pip python3-devel
       ;;
     apk)
       run_privileged apk add --no-cache \
-        ca-certificates curl git tar gzip build-base pkgconf \
+        ca-certificates curl git tar gzip tmux build-base pkgconf \
         libffi-dev openssl-dev python3 py3-pip py3-virtualenv python3-dev
       ;;
   esac
@@ -212,8 +252,14 @@ verify_sha256() {
   local file=$1
   local expected=${2:-}
   [[ -n "$expected" ]] || return 0
-  command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is required for checksum verification'
-  printf '%s  %s\n' "$expected" "$file" | sha256sum --check --status || die "checksum verification failed for $file"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s  %s\n' "$expected" "$file" | sha256sum --check --status || die "checksum verification failed for $file"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] || die "checksum verification failed for $file"
+  else
+    die 'sha256sum or shasum is required for checksum verification'
+  fi
 }
 
 ensure_uv_and_python() {
@@ -252,14 +298,29 @@ ngrok_url_for_arch() {
     i386|i686) arch=386 ;;
     *) die "unsupported ngrok architecture: $arch" ;;
   esac
-  printf 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-%s.tgz\n' "$arch"
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    printf 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-%s.tgz\n' "$arch"
+  else
+    printf 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-%s.tgz\n' "$arch"
+  fi
 }
 
 ensure_ngrok() {
-  local ngrok_bin url temp_dir archive
+  local ngrok_bin url temp_dir archive brew_bin
   ngrok_bin="$(find_ngrok || true)"
   if [[ -n "$ngrok_bin" ]]; then
     log "ngrok already available: $($ngrok_bin version 2>/dev/null | head -1 || printf '%s' "$ngrok_bin")"
+    return
+  fi
+
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    brew_bin="$(find_brew || true)"
+    [[ -n "$brew_bin" ]] || die 'Homebrew is required to install ngrok on macOS. Install Homebrew or set NGROK_BIN to an existing ngrok executable.'
+    log 'installing ngrok with Homebrew'
+    "$brew_bin" install ngrok
+    ngrok_bin="$(find_ngrok || true)"
+    [[ -n "$ngrok_bin" ]] || die 'Homebrew reported success but ngrok could not be found on PATH'
+    log "ngrok installed at $ngrok_bin"
     return
   fi
 
@@ -279,10 +340,16 @@ ensure_ngrok() {
   log "installed ngrok at $INSTALL_BIN_DIR/ngrok"
 }
 
+
 check_readiness() {
   local failed=0 python_bin uv_bin ngrok_bin
-  printf 'Linux: %s\n' "$(. /etc/os-release 2>/dev/null && printf '%s %s' "${NAME:-unknown}" "${VERSION_ID:-}" || uname -sr)"
-  printf 'Package manager: %s\n' "$(package_manager || printf 'not detected')"
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    printf 'macOS: %s\n' "$(sw_vers -productVersion 2>/dev/null || uname -sr)"
+    printf 'Homebrew: %s\n' "$(find_brew || printf 'not detected')"
+  else
+    printf 'Linux: %s\n' "$(. /etc/os-release 2>/dev/null && printf '%s %s' "${NAME:-unknown}" "${VERSION_ID:-}" || uname -sr)"
+    printf 'Package manager: %s\n' "$(package_manager || printf 'not detected')"
+  fi
   python_bin="$(find_python || true)"
   uv_bin="$(find_uv || true)"
   ngrok_bin="$(find_ngrok || true)"

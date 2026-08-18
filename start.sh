@@ -63,6 +63,15 @@ MCP_AUTO_SETUP="${MCP_AUTO_SETUP:-1}"
 MCP_AUTO_INSTALL_NGROK="${MCP_AUTO_INSTALL_NGROK:-0}"
 MCP_BEARER_TOKEN="${MCP_BEARER_TOKEN:-}"
 MCP_ALLOW_UNAUTHENTICATED_PUBLIC="${MCP_ALLOW_UNAUTHENTICATED_PUBLIC:-0}"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if command -v brew >/dev/null 2>&1; then
+    export PATH="$(brew --prefix)/bin:$PATH"
+  elif [[ -x /opt/homebrew/bin/brew ]]; then
+    export PATH="/opt/homebrew/bin:$PATH"
+  elif [[ -x /usr/local/bin/brew ]]; then
+    export PATH="/usr/local/bin:$PATH"
+  fi
+fi
 NGROK_BIN="${NGROK_BIN:-ngrok}"
 NGROK_UPSTREAM="${NGROK_UPSTREAM:-http://127.0.0.1:$MCP_PORT}"
 
@@ -156,10 +165,12 @@ if [[ "$MCP_SKIP_NGROK" != 1 ]] && ! command -v "$NGROK_BIN" >/dev/null 2>&1; th
   die 'ngrok was not found. Run ./store.sh --with-ngrok, set NGROK_BIN, or use --local-only.'
 fi
 
-if command -v flock >/dev/null 2>&1; then
-  exec 8>"$MCP_RUNTIME_DIR/start.lock"
-  flock -n 8 || die 'another start.sh instance is already running'
+LOCK_DIR="$MCP_RUNTIME_DIR/start.lock.d"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  die 'another start.sh instance is already running'
 fi
+cleanup_start_lock() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
+trap cleanup_start_lock EXIT
 
 SERVER_LOG="$MCP_LOG_DIR/server.log"
 NGROK_LOG="$MCP_LOG_DIR/ngrok.log"
@@ -169,6 +180,7 @@ NGROK_PID=""
 cleanup() {
   local status=$?
   trap - EXIT INT TERM HUP
+  cleanup_start_lock
   if [[ -n "$NGROK_PID" ]] && kill -0 "$NGROK_PID" 2>/dev/null; then
     kill "$NGROK_PID" 2>/dev/null || true
     wait "$NGROK_PID" 2>/dev/null || true

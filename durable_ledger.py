@@ -34,6 +34,16 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+class _ManagedSQLiteConnection(sqlite3.Connection):
+    """SQLite connection that also closes when used as a context manager."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class DurableLedger:
     """Transactional repository for actors, tasks, commands and cursors."""
 
@@ -45,7 +55,7 @@ class DurableLedger:
         self._migrate()
 
     def connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=30)
+        db = sqlite3.connect(self.path, timeout=30, factory=_ManagedSQLiteConnection)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA journal_mode=WAL")
