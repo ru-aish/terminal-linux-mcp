@@ -153,6 +153,7 @@ class FakeAdapter:
         self.inspections = 0
         self.inspected_conversation_ids: list[str] = []
         self.restored: list[str] = []
+        self.forced_sends: list[bool] = []
 
     async def __aenter__(self):
         return self
@@ -195,11 +196,19 @@ class FakeAdapter:
             snapshot = self.snapshots.get(item.conversation_id, self.snapshot)
         return self._hydrated(snapshot)
 
-    async def send_continue(self, item, message, *, expected_current_node=""):
+    async def send_continue(
+        self,
+        item,
+        message,
+        *,
+        expected_current_node="",
+        force=False,
+    ):
         if item.conversation_id in self.send_errors:
             raise RuntimeError("simulated send failure")
         self.sent.append(message)
         self.sent_conversation_ids.append(item.conversation_id)
+        self.forced_sends.append(force)
         result = self.send_results.get(item.conversation_id, SendResult(True, True, False))
         if result.clicked and not result.parent_message_id:
             result = replace(result, parent_message_id=expected_current_node)
@@ -330,6 +339,53 @@ def test_running_draft_cooldown_and_dry_run_do_not_duplicate(tmp_path):
         dry_watchdog = make_watchdog(tmp_path / "dry", dry, dry_run=True)
         await dry_watchdog.scan_once()
         assert not dry.sent
+
+    asyncio.run(run())
+
+
+def test_forced_thread_continues_every_twenty_minutes_regardless_of_running_state(tmp_path):
+    async def run():
+        item = link()
+        now = [1000.0]
+        fake = FakeAdapter(
+            canonical_snapshot(
+                conversation_id=item.conversation_id,
+                assistant_status="in_progress",
+                assistant_end_turn=False,
+                running=True,
+            )
+        )
+        config = ChatWatchdogConfig(
+            True,
+            tmp_path / "threads.txt",
+            tmp_path / "state.json",
+            tmp_path / "done.jsonl",
+            forced_continue_conversation_ids=(item.conversation_id,),
+            forced_continue_interval_seconds=1200,
+            pre_send_confirmation_seconds=0,
+        )
+        watchdog = ChatWatchdog(
+            config,
+            adapter_factory=lambda: fake,
+            clock=lambda: now[0],
+        )
+        watchdog.add_url(item.url)
+
+        await watchdog.scan_once()
+        assert fake.sent == [DEFAULT_CONTINUE_MESSAGE]
+        assert fake.forced_sends == [True]
+
+        now[0] = 2199.0
+        before_due = await watchdog.scan_once()
+        assert fake.sent == [DEFAULT_CONTINUE_MESSAGE]
+        assert before_due["queue"]["entries"][0]["state"]["status"] == (
+            "waiting_forced_interval"
+        )
+
+        now[0] = 2200.0
+        await watchdog.scan_once()
+        assert fake.sent == [DEFAULT_CONTINUE_MESSAGE, DEFAULT_CONTINUE_MESSAGE]
+        assert fake.forced_sends == [True, True]
 
     asyncio.run(run())
 

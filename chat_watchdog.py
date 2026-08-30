@@ -382,6 +382,7 @@ class ContinuationCandidate:
     task_start_key: str
     task_start_index: int
     fairness_epoch: float
+    forced: bool = False
 
 
 @dataclass(frozen=True)
@@ -520,6 +521,7 @@ class ChatAdapter(Protocol):
         message: str,
         *,
         expected_current_node: str = "",
+        force: bool = False,
     ) -> SendResult: ...
 
     async def restore(self, conversation_id: str) -> bool: ...
@@ -989,12 +991,14 @@ class CodexInternalChatAdapter:
         message: str,
         *,
         expected_current_node: str = "",
+        force: bool = False,
     ) -> SendResult:
         delivery = await self._gateway.send(
             link.conversation_id,
             message,
             expected_current_node=expected_current_node,
-            wait_for_completion=True,
+            wait_for_completion=not force,
+            force=force,
         )
         clicked = delivery.state in {
             DeliveryState.DELIVERED,
@@ -1045,6 +1049,8 @@ class ChatWatchdogConfig:
     max_continue_attempts: int = 20
     pre_send_confirmation_seconds: float = 1.25
     ledger_path: Path | None = None
+    forced_continue_conversation_ids: tuple[str, ...] = ()
+    forced_continue_interval_seconds: int = 1200
 
     @classmethod
     def from_env(cls) -> "ChatWatchdogConfig":
@@ -1104,6 +1110,21 @@ class ChatWatchdogConfig:
                     "~/.GPT/chat-agent-orchestrator.db",
                 )
             ).expanduser(),
+            forced_continue_conversation_ids=tuple(
+                conversation_id.strip()
+                for conversation_id in os.environ.get(
+                    "MCP_CHAT_WATCHDOG_FORCED_CONTINUE_CONVERSATION_IDS", ""
+                ).split(",")
+                if conversation_id.strip()
+            ),
+            forced_continue_interval_seconds=max(
+                30,
+                int(
+                    os.environ.get(
+                        "MCP_CHAT_WATCHDOG_FORCED_CONTINUE_INTERVAL_SECONDS", "1200"
+                    )
+                ),
+            ),
         )
 
 
@@ -1712,6 +1733,62 @@ class ChatWatchdog:
             )
             return LinkObservation()
 
+        if link.conversation_id in self.config.forced_continue_conversation_ids:
+            last_continue_at = float(previous.get("last_continue_epoch", 0) or 0)
+            same_transcript = bool(previous.get("last_transcript_hash")) and (
+                str(previous.get("last_transcript_hash")) == snapshot.transcript_hash
+            )
+            if same_transcript and previous.get("status") in {
+                "continue_unconfirmed",
+                "waiting_unconfirmed_submission",
+            }:
+                self.state.update(
+                    link.conversation_id,
+                    **{
+                        **common,
+                        "status": "waiting_unconfirmed_submission",
+                        "last_error": (
+                            "the previous forced send was unconfirmed; retry is blocked "
+                            "until the transcript changes"
+                        ),
+                    },
+                )
+                return LinkObservation()
+            if (
+                last_continue_at
+                and now - last_continue_at
+                < self.config.forced_continue_interval_seconds
+            ):
+                self.state.update(
+                    link.conversation_id,
+                    **common,
+                    status="waiting_forced_interval",
+                )
+                return LinkObservation()
+            if self.config.dry_run:
+                self.state.update(
+                    link.conversation_id,
+                    **common,
+                    status="would_force_continue",
+                )
+                return LinkObservation()
+            candidate = ContinuationCandidate(
+                link=link,
+                snapshot=snapshot,
+                previous=previous,
+                common=common,
+                task_start_key="",
+                task_start_index=0,
+                fairness_epoch=last_continue_at,
+                forced=True,
+            )
+            self.state.update(
+                link.conversation_id,
+                **common,
+                status="ready_forced_continue",
+            )
+            return LinkObservation(candidate=candidate)
+
         task_start_key, task_start_index, boundary_reason = self._resolve_task_start(
             snapshot,
             previous,
@@ -1918,6 +1995,16 @@ class ChatWatchdog:
                         or "conversation transcript disappeared before send"
                     ),
                 },
+            )
+            return
+
+        if candidate.forced:
+            await self._send_forced_continue(
+                adapter,
+                candidate,
+                confirmation,
+                confirmation_common,
+                now,
             )
             return
 
@@ -2151,6 +2238,87 @@ class ChatWatchdog:
                     result.final_status
                     if result.clicked
                     else previous.get("last_continue_final_status", "")
+                ),
+                "last_error": result.reason,
+            },
+        )
+
+    async def _send_forced_continue(
+        self,
+        adapter: ChatAdapter,
+        candidate: ContinuationCandidate,
+        confirmation: ThreadSnapshot,
+        confirmation_common: dict[str, Any],
+        now: float,
+    ) -> None:
+        """Send an interval-driven continuation without consulting thread status."""
+        link = candidate.link
+        previous = candidate.previous
+        current_entries, _ = await asyncio.to_thread(self.queue.entries)
+        if not any(item.conversation_id == link.conversation_id for item in current_entries):
+            self.state.mark_not_queued(link.conversation_id)
+            return
+        try:
+            result = await adapter.send_continue(
+                link,
+                self.config.continue_message,
+                expected_current_node=confirmation.current_node,
+                force=True,
+            )
+        except Exception as exc:
+            failure = classify_runtime_error(exc)
+            self.state.update(
+                link.conversation_id,
+                **{
+                    **confirmation_common,
+                    "status": failure.state.value,
+                    "last_error": failure.reason,
+                    "continue_attempts": int(previous.get("continue_attempts", 0) or 0),
+                },
+            )
+            return
+
+        attempts = int(previous.get("continue_attempts", 0) or 0) + (
+            1 if result.clicked else 0
+        )
+        if result.clicked and not result.observed and not result.running:
+            status = "continue_unconfirmed"
+        elif result.clicked:
+            status = "forced_continue_sent"
+        else:
+            status = "forced_continue_blocked"
+        self.state.update(
+            link.conversation_id,
+            **{
+                **confirmation_common,
+                "status": status,
+                "last_continue_at": (
+                    _utc_now() if result.clicked else previous.get("last_continue_at")
+                ),
+                "last_continue_epoch": (
+                    now
+                    if result.clicked
+                    else float(previous.get("last_continue_epoch", 0) or 0)
+                ),
+                "continue_attempts": attempts,
+                "continue_observed": result.observed,
+                "quality_verified": result.quality_verified,
+                "quality_changed": result.quality_changed,
+                "quality_label": result.quality_label,
+                "last_continue_parent_node": (
+                    result.parent_message_id
+                    if result.clicked
+                    else previous.get("last_continue_parent_node", "")
+                ),
+                "last_continue_request_id": (
+                    result.request_id
+                    if result.clicked
+                    else previous.get("last_continue_request_id", "")
+                ),
+                "last_continue_user_message_id": (
+                    result.user_message_id
+                    if result.clicked
+                    else previous.get("last_continue_user_message_id", "")
                 ),
                 "last_error": result.reason,
             },

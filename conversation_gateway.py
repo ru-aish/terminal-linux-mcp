@@ -117,6 +117,7 @@ class ConversationGateway:
         expected_current_node: str,
         wait_for_completion: bool = False,
         user_message_id: str = "",
+        force: bool = False,
     ) -> DeliveryResult:
         delivery_message_id = user_message_id.strip() or str(uuid.uuid4())
         try:
@@ -141,7 +142,7 @@ class ConversationGateway:
                         reason="canonical current_node changed before send",
                         message=message,
                     )
-                if before.get("running") or before.get("active_stream"):
+                if not force and (before.get("running") or before.get("active_stream")):
                     return DeliveryResult(
                         state=DeliveryState.DEFERRED_RUNNING,
                         reason="conversation is running",
@@ -149,12 +150,17 @@ class ConversationGateway:
                         running=True,
                     )
                 try:
+                    send_kwargs = {
+                        "expected_current_node": expected_current_node,
+                        "wait_for_completion": wait_for_completion,
+                        "user_message_id": delivery_message_id,
+                    }
+                    if force:
+                        send_kwargs["force"] = True
                     result = await client.continue_thread(
                         conversation_id,
                         message,
-                        expected_current_node=expected_current_node,
-                        wait_for_completion=wait_for_completion,
-                        user_message_id=delivery_message_id,
+                        **send_kwargs,
                     )
                 except (ValueError, PermissionError) as exc:
                     return self.classify_send_exception(

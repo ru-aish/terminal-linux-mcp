@@ -1003,6 +1003,7 @@ class InternalChatClient:
         expected_current_node: str,
         wait_for_completion: bool = True,
         user_message_id: str | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
         if not expected_current_node:
             raise ValueError("expected_current_node is required")
@@ -1018,15 +1019,16 @@ class InternalChatClient:
         const expectedNode = {json.dumps(expected_current_node)};
         const text = {json.dumps(message)};
         const waitForCompletion = {json.dumps(bool(wait_for_completion))};
+        const force = {json.dumps(bool(force))};
         const beforeRaw = await client.get(conversationId);
         const before = summary(beforeRaw);
         if (!before.valid || before.currentNode !== expectedNode) return {{sent:false, running:false, reason:'canonical current_node changed before send'}};
-        if (ownedStreamActive(conversationId) || before.running) return {{sent:false, running:true, reason:'thread is running'}};
+        if (!force && (ownedStreamActive(conversationId) || before.running)) return {{sent:false, running:true, reason:'thread is running'}};
         const latest = before.latest;
         const status = String(latest && latest.status || '').toLowerCase();
         const terminal = new Set(['finished_successfully','finished_error','failed','cancelled','canceled','interrupted','incomplete']);
-        if (!latest || String(latest.author && latest.author.role || '') !== 'assistant') return {{sent:false, running:false, reason:'latest canonical message is not an assistant response'}};
-        if (!terminal.has(status) || latest.end_turn !== true) return {{sent:false, running:false, reason:'latest assistant response is not terminal'}};
+        if (!force && (!latest || String(latest.author && latest.author.role || '') !== 'assistant')) return {{sent:false, running:false, reason:'latest canonical message is not an assistant response'}};
+        if (!force && (!terminal.has(status) || latest.end_turn !== true)) return {{sent:false, running:false, reason:'latest assistant response is not terminal'}};
         const metadata = latest.metadata || {{}};
         const model = chooseModel(await client.models(), {json.dumps(self.preferred_model)}, String(metadata.model_slug || metadata.default_model_slug || ''), {json.dumps(self.thinking_effort)}, {json.dumps(self.require_high_reasoning)});
         const userMessageId = {json.dumps(delivery_message_id)};
