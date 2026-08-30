@@ -642,7 +642,7 @@ def test_wakeup_timer_materializes_once_and_uses_gateway_rail(tmp_path, monkeypa
         coordinator.schedule_wakeup(
             "parent-chat",
             wall[0] + 5,
-            prompt="Review every managed child now.",
+            prompt="continue",
             idempotency_key="parent-review",
         )
     )
@@ -691,10 +691,18 @@ def test_wakeup_timer_materializes_once_and_uses_gateway_rail(tmp_path, monkeypa
     assert tick["operation_type"] == OperationType.CONTINUE.value
     assert tick["physical_requests"] == 1
     assert backend.calls[-1].method == "continue_thread"
+    assert backend.threads["parent-chat"].turns[-2].text == "continue"
     assert (
         coordinator.repository.automation(scheduled["automation_id"])["status"]
         == "delivered"
     )
+    continue_calls = sum(call.method == "continue_thread" for call in backend.calls)
+    wall[0] += 60
+    coordinator.prepare_local_work()
+    run(coordinator.sync_once())
+    coordinator.prepare_local_work()
+    run(coordinator.sync_once())
+    assert sum(call.method == "continue_thread" for call in backend.calls) == continue_calls == 1
 
 
 def test_completion_prompt_requires_exact_marker_before_queueing(tmp_path, monkeypatch):

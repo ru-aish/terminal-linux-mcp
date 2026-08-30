@@ -472,7 +472,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 assert "thread_goal" in names
                 assert "record_token_usage" in names
                 assert "watch_image" in names
-                assert len(names) == 54
+                assert len(names) == 56
 
                 blocked = await session.call_tool(
                     "run_command",

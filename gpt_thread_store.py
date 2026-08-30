@@ -485,6 +485,21 @@ class GPTThreadStore:
                 ),
             )
 
+    def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        """Return durable bootstrap state for one thread."""
+        self._init_db()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT thread_id, cwd, context_fingerprint, context_loaded_at,
+                       bootstrap_count, created_at, updated_at
+                FROM threads
+                WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def record_usage(
         self,
         thread_id: str,

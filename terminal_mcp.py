@@ -46,6 +46,7 @@ from chat_gateway.adapters.codex_renderer import (
     CodexRendererBackend,
 )
 from chat_runtime_controller import ChatRuntimeController
+from process_completion_bot import read_process_start_ticks
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -480,6 +481,8 @@ class PersistentMcpConnection:
 
 sessions: dict[str, SessionState] = {"default": SessionState("default", WORKSPACE_DIR)}
 processes: dict[str, ProcessState] = {}
+process_continue_watchers: dict[tuple[str, str, str], str] = {}
+process_continue_tasks: set[asyncio.Task[Any]] = set()
 state_lock = asyncio.Lock()
 agent_state_lock = asyncio.Lock()
 mcp_connections: dict[tuple[str, str], PersistentMcpConnection] = {}
@@ -695,6 +698,16 @@ async def _get_session(session_id: str | None = None) -> SessionState:
         session = sessions.get(normalized)
         if session is None:
             session = SessionState(normalized, WORKSPACE_DIR)
+            if normalized != "default":
+                persisted = GPT_STORE.get_thread(normalized)
+                if persisted and persisted.get("context_loaded_at"):
+                    persisted_cwd = Path(str(persisted["cwd"])).expanduser().resolve()
+                    persisted_fingerprint = str(persisted["context_fingerprint"] or "")
+                    if persisted_cwd.is_dir() and persisted_fingerprint:
+                        session.cwd = persisted_cwd
+                        session.context_fingerprints[
+                            _context_key(persisted_cwd)
+                        ] = persisted_fingerprint
             sessions[normalized] = session
         return session
 
@@ -2299,6 +2312,210 @@ async def start_process(command: str, session_id: str = "default", cwd: str | No
         asyncio.create_task(_drain_stream(process.stderr, state.stderr_lines, "stderr_closed", state))
         session.updated_at = time.time()
         return "\n".join([f"Process ID: {process_id}", f"Session ID: {session.session_id}", f"PID: {process.pid}", f"Workload Unit: {unit_name or 'process-group'}", f"Command: {command}", f"Working Directory: {run_cwd}", "Status: running"])
+
+
+async def _finish_process_continue_watcher(
+    *,
+    watcher_key: tuple[str, str, str],
+    watcher_state: ProcessState,
+    thread_id: str,
+    idempotency_key: str,
+) -> None:
+    exit_code = await watcher_state.process.wait()
+    try:
+        if exit_code != 0:
+            watcher_state.stderr_lines.append(
+                f"Process completion bot exited with code {exit_code}; continue was not queued."
+            )
+            return
+        result = await get_chat_agent_coordinator().schedule_wakeup(
+            thread_id,
+            time.time(),
+            prompt="continue",
+            idempotency_key=idempotency_key,
+        )
+        automation_id = str(result.get("automation_id") or "")
+        watcher_state.stdout_lines.append(
+            "Target process finished; queued one continue"
+            + (f" as {automation_id}." if automation_id else ".")
+        )
+        get_chat_agent_service().wake()
+    except Exception as exc:
+        watcher_state.stderr_lines.append(
+            "Failed to queue continue after target completion: "
+            + (_chat_agent_error(exc).removeprefix("Error: "))
+        )
+    finally:
+        async with state_lock:
+            if process_continue_watchers.get(watcher_key) == watcher_state.process_id:
+                process_continue_watchers.pop(watcher_key, None)
+
+
+@mcp.tool()
+async def agent_continue_after_process(
+    process_id: str,
+    thread_id: str,
+    check_seconds: float = 5.0,
+    idempotency_key: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Wake an agent once when a managed background process finishes.
+
+    This launches a tiny Python process-completion bot. The bot does no log
+    watching: it only sleeps for ``check_seconds`` and checks whether the exact
+    Linux process execution is still present. PID start ticks are pinned so PID
+    reuse cannot make an unrelated later process count as the original run.
+    When the target finishes, one durable literal ``continue`` is queued through
+    the same agent delivery rail used by ``agent_schedule_continue``.
+    """
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        interval = float(check_seconds)
+        if not 0.05 <= interval <= 3600.0:
+            raise ValueError("check_seconds must be between 0.05 and 3600")
+        session = await _get_session(session_id)
+        run_cwd = _operation_cwd(session, cwd)
+        async with state_lock:
+            target_state = processes.get(process_id)
+        if target_state is None or target_state.session_id != session.session_id:
+            raise ValueError(
+                f"process_id is unknown or not owned by session {session.session_id}: {process_id}"
+            )
+
+        normalized_thread_id = thread_id.strip()
+        coordinator = get_chat_agent_coordinator()
+        await coordinator.automations(
+            thread_id=normalized_thread_id,
+            include_terminal=False,
+        )
+        key = idempotency_key.strip() or f"process-complete:{process_id}"
+
+        if target_state.process.returncode is not None:
+            result = await coordinator.schedule_wakeup(
+                normalized_thread_id,
+                time.time(),
+                prompt="continue",
+                idempotency_key=key,
+            )
+            get_chat_agent_service().wake()
+            return _chat_agent_json(
+                {
+                    "status": "target_already_finished",
+                    "target_process_id": process_id,
+                    "target_exit_code": target_state.process.returncode,
+                    "continue_automation": result,
+                }
+            )
+
+        start_ticks = read_process_start_ticks(target_state.process.pid)
+        if start_ticks is None:
+            await target_state.process.wait()
+            result = await coordinator.schedule_wakeup(
+                normalized_thread_id,
+                time.time(),
+                prompt="continue",
+                idempotency_key=key,
+            )
+            get_chat_agent_service().wake()
+            return _chat_agent_json(
+                {
+                    "status": "target_finished_during_attach",
+                    "target_process_id": process_id,
+                    "target_exit_code": target_state.process.returncode,
+                    "continue_automation": result,
+                }
+            )
+
+        watcher_key = (session.session_id, process_id, normalized_thread_id)
+        async with state_lock:
+            existing_id = process_continue_watchers.get(watcher_key)
+            existing = processes.get(existing_id) if existing_id else None
+            if existing is not None and existing.process.returncode is None:
+                return _chat_agent_json(
+                    {
+                        "status": "already_watching",
+                        "target_process_id": process_id,
+                        "watcher_process_id": existing.process_id,
+                        "watcher_pid": existing.process.pid,
+                        "check_seconds": interval,
+                    }
+                )
+            process_continue_watchers.pop(watcher_key, None)
+
+        watcher_id = f"procwatch-{_now_ms()}-{uuid.uuid4().hex[:8]}"
+        bot_path = Path(__file__).resolve().with_name("process_completion_bot.py")
+        bot_args = [
+            sys.executable,
+            str(bot_path),
+            "--pid",
+            str(target_state.process.pid),
+            "--start-ticks",
+            str(start_ticks),
+            "--interval-seconds",
+            str(interval),
+        ]
+        watcher_process = await asyncio.create_subprocess_exec(
+            *bot_args,
+            cwd=str(run_cwd),
+            env=_build_env(session, None),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        watcher_state = ProcessState(
+            watcher_id,
+            session.session_id,
+            f"process-completion-bot target={process_id}",
+            run_cwd,
+            watcher_process,
+        )
+        async with state_lock:
+            processes[watcher_id] = watcher_state
+            process_continue_watchers[watcher_key] = watcher_id
+        asyncio.create_task(
+            _drain_stream(
+                watcher_process.stdout,
+                watcher_state.stdout_lines,
+                "stdout_closed",
+                watcher_state,
+            )
+        )
+        asyncio.create_task(
+            _drain_stream(
+                watcher_process.stderr,
+                watcher_state.stderr_lines,
+                "stderr_closed",
+                watcher_state,
+            )
+        )
+        task = asyncio.create_task(
+            _finish_process_continue_watcher(
+                watcher_key=watcher_key,
+                watcher_state=watcher_state,
+                thread_id=normalized_thread_id,
+                idempotency_key=key,
+            )
+        )
+        process_continue_tasks.add(task)
+        task.add_done_callback(process_continue_tasks.discard)
+        return _chat_agent_json(
+            {
+                "status": "watching",
+                "target_process_id": process_id,
+                "target_pid": target_state.process.pid,
+                "watcher_process_id": watcher_id,
+                "watcher_pid": watcher_process.pid,
+                "check_seconds": interval,
+                "continue_message": "continue",
+                "idempotency_key": key,
+            }
+        )
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
 
 @mcp.tool()
 async def poll_process(
@@ -4044,6 +4261,49 @@ async def agent_schedule_wakeup(
 
 
 @mcp.tool()
+async def agent_schedule_continue(
+    thread_id: str,
+    after_seconds: float = 0.0,
+    wake_at: str = "",
+    idempotency_key: str = "",
+    session_id: str = "default",
+    cwd: str | None = None,
+) -> str:
+    """Schedule exactly one future ``continue`` message for an agent/thread.
+
+    Supply either ``after_seconds`` for a relative delay or ``wake_at`` as a Unix
+    timestamp / timezone-aware ISO-8601 timestamp. The timer is durable and
+    one-shot: once due, it queues the literal ``continue`` prompt through the
+    normal agent delivery rail and then becomes terminal after delivery.
+    """
+    if gate := await _chat_agent_gate(session_id, cwd):
+        return gate
+    try:
+        absolute = wake_at.strip()
+        delay = float(after_seconds)
+        if absolute and delay != 0.0:
+            raise ValueError("provide either after_seconds or wake_at, not both")
+        if absolute:
+            scheduled_for: str | float = absolute
+        else:
+            if delay <= 0.0:
+                raise ValueError(
+                    "after_seconds must be greater than zero when wake_at is empty"
+                )
+            scheduled_for = time.time() + delay
+        result = await get_chat_agent_coordinator().schedule_wakeup(
+            thread_id,
+            scheduled_for,
+            prompt="continue",
+            idempotency_key=idempotency_key or None,
+        )
+        get_chat_agent_service().wake()
+        return _chat_agent_json(result)
+    except Exception as exc:
+        return _chat_agent_error(exc)
+
+
+@mcp.tool()
 async def agent_queue_after_completion(
     source_thread_id: str,
     target_thread_id: str,
@@ -4233,8 +4493,8 @@ PUBLIC_TOOL_ORDER = (
     "chat_runtime_logs", "chat_runtime_circuit",
     "agent_projects_list", "agent_project_get", "agent_project_threads",
     "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
-    "agent_tail", "agent_send", "agent_schedule_wakeup",
-    "agent_queue_after_completion", "agent_automation",
+    "agent_tail", "agent_send", "agent_schedule_wakeup", "agent_schedule_continue",
+    "agent_continue_after_process", "agent_queue_after_completion", "agent_automation",
     "agent_wait", "agent_sync", "agent_children",
     "agent_subscribe", "agent_ack", "agent_cancel",
 )

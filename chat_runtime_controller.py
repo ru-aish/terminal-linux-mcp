@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import time
@@ -31,6 +32,7 @@ class ChatRuntimeControllerConfig:
     internal_timeout_seconds: float = 10.0
     recovery_timeout_seconds: float = 90.0
     poll_interval_seconds: float = 1.0
+    inhibit_path: str = "~/.local/state/codex-desktop/user-stopped"
 
     @classmethod
     def from_env(cls) -> "ChatRuntimeControllerConfig":
@@ -64,6 +66,11 @@ class ChatRuntimeControllerConfig:
                 0.2,
                 float(os.environ.get("MCP_CHAT_RUNTIME_POLL_INTERVAL", "1")),
             ),
+            inhibit_path=os.environ.get(
+                "MCP_CHAT_RUNTIME_INHIBIT_PATH",
+                "~/.local/state/codex-desktop/user-stopped",
+            ).strip()
+            or "~/.local/state/codex-desktop/user-stopped",
         )
 
     def validate(self) -> None:
@@ -157,6 +164,10 @@ class ChatRuntimeController:
         return {"action": "restart", "recovered": True, **result}
 
     async def ensure_ready(self) -> dict[str, Any]:
+        if self._recovery_inhibited():
+            raise RuntimeError(
+                "ChatGPT runtime is stopped by the user; start it from the Terminal MCP tray"
+            )
         health = await self.health()
         if health["ready"]:
             return health
@@ -168,6 +179,9 @@ class ChatRuntimeController:
                 + json.dumps(recovered or result, sort_keys=True)[:1000]
             )
         return recovered
+
+    def _recovery_inhibited(self) -> bool:
+        return Path(self.config.inhibit_path).expanduser().is_file()
 
     async def logs(self, *, lines: int = 200) -> dict[str, Any]:
         lines = min(max(int(lines), 1), 2000)

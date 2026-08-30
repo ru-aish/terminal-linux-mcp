@@ -1800,6 +1800,37 @@ def test_scheduled_sync_does_not_open_runtime_before_due(tmp_path):
     asyncio.run(run())
 
 
+def test_background_service_survives_wait_calculation_error():
+    class Coordinator:
+        def prepare_local_work(self):
+            pass
+
+        def next_due_at(self):
+            return None
+
+    async def run():
+        service = ChatAgentService(Coordinator(), interval_seconds=30)
+        calls = 0
+
+        def flaky_wait_seconds():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary scheduler error")
+            return 0.01
+
+        service._next_wait_seconds = flaky_wait_seconds
+        await service.start()
+        try:
+            await asyncio.sleep(0.05)
+            assert service._task is not None
+            assert not service._task.done()
+        finally:
+            await service.stop()
+
+    asyncio.run(run())
+
+
 def test_scheduled_sync_reads_only_due_child_once_when_unchanged(tmp_path):
     async def run():
         runtime = FakeRuntime()

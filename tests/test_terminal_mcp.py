@@ -22,8 +22,8 @@ EXPECTED_TOOLS = [
     "chat_runtime_logs", "chat_runtime_circuit",
     "agent_projects_list", "agent_project_get", "agent_project_threads",
     "agent_register_parent", "agent_spawn", "agent_status", "agent_context",
-    "agent_tail", "agent_send", "agent_schedule_wakeup",
-    "agent_queue_after_completion", "agent_automation",
+    "agent_tail", "agent_send", "agent_schedule_wakeup", "agent_schedule_continue",
+    "agent_continue_after_process", "agent_queue_after_completion", "agent_automation",
     "agent_wait", "agent_sync", "agent_children",
     "agent_subscribe", "agent_ack", "agent_cancel",
 ]
@@ -117,12 +117,22 @@ def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
     ))
     assert "Bytes Written" in allowed
 
+    # A service restart clears the in-memory session map. Durable bootstrap
+    # state must restore the session without forcing a model thread that
+    # already loaded the same instructions to bootstrap again.
+    terminal_mcp.sessions.pop("context-test", None)
+    restored = run(terminal_mcp.write_file(
+        "restored-after-restart.txt", "yes", session_id="context-test", cwd=str(project)
+    ))
+    assert "Bytes Written" in restored
+
     other_thread = run(terminal_mcp.write_file(
         "other-thread.txt", "nope", session_id="context-test-other", cwd=str(project)
     ))
     assert "GPT thread context has not been loaded" in other_thread
 
     agents.write_text("rule-two", encoding="utf-8")
+    terminal_mcp.sessions.pop("context-test", None)
     blocked = run(terminal_mcp.write_file(
         "blocked.txt", "nope", session_id="context-test", cwd=str(project)
     ))
@@ -532,6 +542,107 @@ def test_filesystem_and_process_lifecycle(tmp_path, monkeypatch):
     run(lifecycle())
 
 
+def test_process_completion_bot_queues_exactly_one_continue(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "process-wake-project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    session_id = "process-wake-thread"
+
+    class FakeCoordinator:
+        def __init__(self):
+            self.wakeup_calls = []
+
+        async def automations(self, **kwargs):
+            return {"automations": [], "options": kwargs}
+
+        async def schedule_wakeup(self, thread_id, wake_at, **kwargs):
+            call = {"thread_id": thread_id, "wake_at": wake_at, "options": kwargs}
+            self.wakeup_calls.append(call)
+            return {
+                "automation_id": "auto-process-finished",
+                "target_agent_id": thread_id,
+                "due_at": float(wake_at),
+                "status": "scheduled",
+                "options": kwargs,
+            }
+
+    class FakeService:
+        def __init__(self):
+            self.wakes = 0
+
+        def wake(self):
+            self.wakes += 1
+
+    coordinator = FakeCoordinator()
+    service = FakeService()
+    monkeypatch.setattr(terminal_mcp, "get_chat_agent_coordinator", lambda: coordinator)
+    monkeypatch.setattr(terminal_mcp, "get_chat_agent_service", lambda: service)
+
+    async def lifecycle():
+        await terminal_mcp.bootstrap_thread(
+            session_id, str(project), max_chars=100000
+        )
+        started = await terminal_mcp.start_process(
+            f"{sys.executable} -c 'import time; time.sleep(0.35)'",
+            session_id=session_id,
+            cwd=str(project),
+        )
+        process_id = next(
+            line.split(": ", 1)[1]
+            for line in started.splitlines()
+            if line.startswith("Process ID:")
+        )
+        watched = json.loads(
+            await terminal_mcp.agent_continue_after_process(
+                process_id,
+                "agent-child",
+                check_seconds=0.05,
+                idempotency_key="resume-after-process",
+                session_id=session_id,
+                cwd=str(project),
+            )
+        )
+        assert watched["status"] == "watching"
+        assert watched["continue_message"] == "continue"
+        watcher_id = watched["watcher_process_id"]
+
+        duplicate = json.loads(
+            await terminal_mcp.agent_continue_after_process(
+                process_id,
+                "agent-child",
+                check_seconds=0.05,
+                idempotency_key="resume-after-process",
+                session_id=session_id,
+                cwd=str(project),
+            )
+        )
+        assert duplicate["status"] == "already_watching"
+        assert duplicate["watcher_process_id"] == watcher_id
+
+        for _ in range(80):
+            if coordinator.wakeup_calls:
+                break
+            await asyncio.sleep(0.05)
+        assert len(coordinator.wakeup_calls) == 1
+        call = coordinator.wakeup_calls[0]
+        assert call["thread_id"] == "agent-child"
+        assert call["options"] == {
+            "prompt": "continue",
+            "idempotency_key": "resume-after-process",
+        }
+        assert service.wakes == 1
+
+        await asyncio.sleep(0.2)
+        assert len(coordinator.wakeup_calls) == 1
+        watcher_status = await terminal_mcp.poll_process(
+            watcher_id,
+            session_id=session_id,
+        )
+        assert "exited(0)" in watcher_status
+        assert "queued one continue" in watcher_status
+
+    run(lifecycle())
 
 
 def test_watch_image_returns_native_image_content(tmp_path, monkeypatch):
@@ -704,6 +815,9 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
     run(terminal_mcp.bootstrap_thread(session_id, str(project), max_chars=100000))
 
     class FakeCoordinator:
+        def __init__(self):
+            self.wakeup_calls = []
+
         async def list_projects(self, *, limit=20, cursor=None):
             return {"items": [{"id": "g-p-one", "name": "One"}], "cursor": None}
 
@@ -717,6 +831,9 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
             return {"agent": {"agent_id": agent_id, "status": "running"}}
 
         async def schedule_wakeup(self, thread_id, wake_at, **kwargs):
+            self.wakeup_calls.append(
+                {"thread_id": thread_id, "wake_at": wake_at, "options": kwargs}
+            )
             return {
                 "automation_id": "auto-wakeup",
                 "target_agent_id": thread_id,
@@ -787,6 +904,22 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
     )))
     assert wake["automation_id"] == "auto-wakeup"
 
+    monkeypatch.setattr(terminal_mcp.time, "time", lambda: 1_000.0)
+    continuation = json.loads(run(terminal_mcp.agent_schedule_continue(
+        "agent-child",
+        after_seconds=15,
+        idempotency_key="resume-once",
+        session_id=session_id,
+        cwd=str(project),
+    )))
+    assert continuation["automation_id"] == "auto-wakeup"
+    assert continuation["due_at"] == 1_015.0
+    assert coordinator.wakeup_calls[-1] == {
+        "thread_id": "agent-child",
+        "wake_at": 1_015.0,
+        "options": {"prompt": "continue", "idempotency_key": "resume-once"},
+    }
+
     completion = json.loads(run(terminal_mcp.agent_queue_after_completion(
         "agent-child",
         "agent-root",
@@ -811,7 +944,7 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
         cwd=str(project),
     )))
     assert cancelled["status"] == "cancelled"
-    assert service.wakes == 4
+    assert service.wakes == 5
 
     synced = json.loads(run(terminal_mcp.agent_sync(
         session_id=session_id, cwd=str(project)

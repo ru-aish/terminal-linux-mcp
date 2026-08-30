@@ -2719,10 +2719,12 @@ class ChatAgentService:
             except Exception as exc:
                 self.state.update(last_sync_at=_now(), last_error=_safe_error(exc))
             try:
-                await asyncio.wait_for(
-                    self._wake.wait(),
-                    timeout=self._next_wait_seconds(),
-                )
+                wait_seconds = self._next_wait_seconds()
+            except Exception as exc:
+                self.state.update(last_sync_at=_now(), last_error=_safe_error(exc))
+                wait_seconds = min(30.0, self.interval_seconds)
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=wait_seconds)
             except asyncio.TimeoutError:
                 pass
 
