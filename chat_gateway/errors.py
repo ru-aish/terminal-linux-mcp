@@ -51,4 +51,6 @@ class SubmissionUncertainError(BackendError):
     """A write may have reached the provider and must not be replayed blindly."""
 
     def __init__(self, message: str) -> None:
-        super().__init__(message, transient=False, permanent=True)
+        # Retrying the scheduler operation is safe because the direct backend
+        # turns journaled creates into reconciliation-only reads.
+        super().__init__(message, transient=True, permanent=False)

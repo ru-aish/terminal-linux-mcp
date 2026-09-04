@@ -144,15 +144,16 @@ async function findConversationByMessage(messageId,projectId){
   return {found:false,conversation_id:""};
 }
 
-async function startCompletion(params,continuation={}) {
+async function startCompletion(params,continuation={},notify=()=>{}) {
   const controller=new AbortController();
   const streamTimer=setTimeout(()=>controller.abort(),Math.max(30000,Number(params.stream_timeout_seconds||3600)*1000));
   const integrity=await prepareIntegrity();
   const body={action:"next",model:params.preferred_model||"gpt-5-6-thinking",messages:[userMessage(params.prompt??params.message,params.user_message_id)],supported_encodings:["v1"],timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,timezone_offset_min:new Date().getTimezoneOffset(),...continuation};
   if(params.thinking_effort)body.thinking_effort=params.thinking_effort;
   if(params.project_id){body.gizmo_id=params.project_id;body.conversation_mode={kind:"gizmo_interaction",gizmo_id:params.project_id};}
+  notify("submission_started");
   const response=await backendFetch("/f/conversation",{method:"POST",headers:{...integrity,"content-type":"application/json",accept:"text/event-stream"},body:JSON.stringify(body),signal:controller.signal},{read:false});
-  if(!response.ok)throw new Error(`ChatGPT completion submission failed: ${response.status}`);
+  if(!response.ok){const error=new Error(`ChatGPT completion submission failed: ${response.status}`);error.status=response.status;throw error;}
   let observedId=continuation.conversation_id||null, resolveObserved, rejectObserved;
   const observed=new Promise((resolvePromise,rejectPromise)=>{resolveObserved=resolvePromise;rejectObserved=rejectPromise;});
   if(observedId)resolveObserved(observedId);
@@ -169,7 +170,7 @@ async function startCompletion(params,continuation={}) {
   return {accepted:true,sent:true,observed:persisted,conversation_id:id,message_id:params.user_message_id,user_message_id:params.user_message_id,running:activeStreams.has(id),after_raw:after,chat_url:params.project_id?`https://chatgpt.com/g/${params.project_id}/c/${id}`:`https://chatgpt.com/c/${id}`};
 }
 
-async function dispatch(method,p) {
+async function dispatch(method,p,notify=()=>{}) {
   if(method==="health"){const auth=await readStoredAuth();const catalog=await jsonRequest("/models?iim=false&include_icons=false");return {ready:true,transport:"direct",account_id_present:Boolean(auth.accountId),desktop_required:false,model_count:Array.isArray(catalog?.models)?catalog.models.length:0};}
   if(method==="models")return jsonRequest("/models?iim=false&include_icons=false");
   if(method==="get_thread"){const value=await jsonRequest(`/conversation/${encodeURIComponent(p.conversation_id)}`);return {...value,owned_stream:activeStreams.has(p.conversation_id)};}
@@ -177,10 +178,10 @@ async function dispatch(method,p) {
   if(method==="get_project")return jsonRequest(`/gizmos/${encodeURIComponent(p.project_id)}`);
   if(method==="list_project_threads"){const q=new URLSearchParams({limit:String(p.limit||20),owned_only:String(p.owned_only!==false)});if(p.cursor)q.set("cursor",p.cursor);return jsonRequest(`/gizmos/${encodeURIComponent(p.project_id)}/conversations?${q}`);}
   if(method==="find_message")return findConversationByMessage(String(p.message_id||""),String(p.project_id||""));
-  if(method==="create_thread")return enqueueWrite(()=>startCompletion(p));
-  if(method==="continue_thread")return enqueueWrite(async()=>{const before=await jsonRequest(`/conversation/${encodeURIComponent(p.conversation_id)}`);const messages=before?.mapping&&typeof before.mapping==="object"?Object.values(before.mapping).map(node=>node?.message).filter(Boolean):[];if(messages.some(message=>String(message?.id||"")===p.user_message_id))return {sent:true,accepted:true,observed:true,running:activeStreams.has(p.conversation_id),conversation_id:p.conversation_id,message_id:p.user_message_id,user_message_id:p.user_message_id,reconciled:true};const current=String(before.current_node||before.currentNode||"");if(current!==p.expected_current_node)return {sent:false,accepted:false,running:false,reason:"canonical current_node changed before send",conversation_id:p.conversation_id,user_message_id:p.user_message_id};if(activeStreams.has(p.conversation_id)&&!p.force)return {sent:false,accepted:false,running:true,reason:"thread is running",conversation_id:p.conversation_id,user_message_id:p.user_message_id};return startCompletion(p,{conversation_id:p.conversation_id,parent_message_id:current});});
+  if(method==="create_thread")return enqueueWrite(()=>startCompletion(p,{},notify));
+  if(method==="continue_thread")return enqueueWrite(async()=>{const before=await jsonRequest(`/conversation/${encodeURIComponent(p.conversation_id)}`);const messages=before?.mapping&&typeof before.mapping==="object"?Object.values(before.mapping).map(node=>node?.message).filter(Boolean):[];if(messages.some(message=>String(message?.id||"")===p.user_message_id))return {sent:true,accepted:true,observed:true,running:activeStreams.has(p.conversation_id),conversation_id:p.conversation_id,message_id:p.user_message_id,user_message_id:p.user_message_id,reconciled:true};const current=String(before.current_node||before.currentNode||"");if(current!==p.expected_current_node)return {sent:false,accepted:false,running:false,reason:"canonical current_node changed before send",conversation_id:p.conversation_id,user_message_id:p.user_message_id};if(activeStreams.has(p.conversation_id)&&!p.force)return {sent:false,accepted:false,running:true,reason:"thread is running",conversation_id:p.conversation_id,user_message_id:p.user_message_id};return startCompletion(p,{conversation_id:p.conversation_id,parent_message_id:current},notify);});
   if(method==="cancel_thread"){const stream=activeStreams.get(p.conversation_id);if(!stream)return {cancelled:false,reason:"no direct transport-owned stream"};stream.controller.abort();return {cancelled:true,conversation_id:p.conversation_id};}
-  if(method==="delete_thread"){const response=await backendFetch(`/conversation/id/${encodeURIComponent(p.conversation_id)}`,{method:"DELETE"},{read:false});return {accepted:response.ok,conversation_id:p.conversation_id,running:false};}
+  if(method==="delete_thread"){const response=await backendFetch(`/conversation/id/${encodeURIComponent(p.conversation_id)}`,{method:"DELETE"},{read:false});if(!response.ok){const error=new Error(`ChatGPT deletion failed: ${response.status}`);error.status=response.status;throw error;}return {accepted:true,conversation_id:p.conversation_id,running:false};}
   throw new Error(`unknown direct worker method: ${method}`);
 }
 function enqueueWrite(action){const result=writeLane.then(action,action);writeLane=result.then(()=>undefined,()=>undefined);return result;}
@@ -188,6 +189,6 @@ function publicError(error){return {message:String(error?.message||error).replac
 
 installBrowserShims();
 const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
-lines.on("line",line=>{let request;try{request=JSON.parse(line);}catch{return;}if(request.method==="shutdown"){process.exit(0);return;}Promise.resolve(dispatch(request.method,request.params||{})).then(result=>process.stdout.write(`${JSON.stringify({id:request.id,ok:true,result})}\n`),error=>process.stdout.write(`${JSON.stringify({id:request.id,ok:false,error:publicError(error)})}\n`));});
+lines.on("line",line=>{let request;try{request=JSON.parse(line);}catch{return;}if(request.method==="shutdown"){process.exit(0);return;}const notify=event=>process.stdout.write(`${JSON.stringify({id:request.id,event})}\n`);Promise.resolve(dispatch(request.method,request.params||{},notify)).then(result=>process.stdout.write(`${JSON.stringify({id:request.id,ok:true,result})}\n`),error=>process.stdout.write(`${JSON.stringify({id:request.id,ok:false,error:publicError(error)})}\n`));});
 lines.on("close",()=>process.exit(0));
 process.on("SIGTERM",()=>process.exit(0));

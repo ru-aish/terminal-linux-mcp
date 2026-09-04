@@ -15,6 +15,7 @@ from chat_direct_client import (
     DirectBackendResponseError,
     DirectChatRuntimeController,
     DirectChatTransport,
+    DirectSubmissionUncertainError,
 )
 from chat_internal_client import RuntimeUnavailableError
 
@@ -144,6 +145,28 @@ lines.on('line', () => process.exit(23));
     asyncio.run(scenario())
 
 
+def test_worker_loss_after_submission_phase_is_typed_uncertain(tmp_path) -> None:
+    worker = tmp_path / "worker.mjs"
+    worker.write_text(
+        """
+import {createInterface} from 'node:readline';
+const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
+lines.on('line', line => {
+  const value=JSON.parse(line);
+  process.stdout.write(JSON.stringify({id:value.id,event:'submission_started'})+'\\n');
+  setTimeout(()=>process.exit(24),10);
+});
+"""
+    )
+
+    async def scenario() -> None:
+        transport = DirectChatTransport(worker_path=worker, timeout=2)
+        with pytest.raises(DirectSubmissionUncertainError):
+            await transport.request("create_thread", prompt="maybe accepted")
+
+    asyncio.run(scenario())
+
+
 def test_worker_error_preserves_http_status(tmp_path) -> None:
     worker = tmp_path / "worker.mjs"
     worker.write_text(
@@ -167,6 +190,71 @@ lines.on('line', line => {
             await transport.close()
 
     asyncio.run(scenario())
+
+
+def test_completion_http_429_is_preserved_by_real_worker(tmp_path, monkeypatch) -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            if self.path.endswith("/sentinel/chat-requirements/prepare"):
+                body = b"{}"
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(429)
+            self.end_headers()
+
+        def log_message(self, *_args) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _jwt(
+                        {
+                            "exp": int(time.time()) + 3600,
+                            "https://api.openai.com/auth": {
+                                "chatgpt_account_id": "account-test"
+                            },
+                        }
+                    ),
+                    "account_id": "account-test",
+                }
+            }
+        )
+    )
+    os.chmod(auth_path, 0o600)
+    monkeypatch.setenv("MCP_CHAT_DIRECT_AUTH_FILE", str(auth_path))
+    monkeypatch.setenv(
+        "MCP_CHAT_DIRECT_BASE_URL", f"http://127.0.0.1:{server.server_port}"
+    )
+
+    async def scenario() -> None:
+        transport = DirectChatTransport(timeout=5)
+        try:
+            with pytest.raises(DirectBackendResponseError) as captured:
+                await transport.request(
+                    "create_thread",
+                    prompt="rate limit",
+                    project_id="",
+                    user_message_id="message-test",
+                    _request_timeout=10,
+                )
+            assert captured.value.status_code == 429
+        finally:
+            await transport.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_runtime_stop_remains_stopped_until_explicit_start() -> None:
@@ -198,5 +286,30 @@ def test_runtime_stop_remains_stopped_until_explicit_start() -> None:
         started = await controller.start()
         assert started["health"]["ready"] is True
         assert transport.requests == 1
+
+    asyncio.run(scenario())
+
+
+def test_pause_terminates_worker_without_waiting_for_request_lock(tmp_path) -> None:
+    worker = tmp_path / "worker.mjs"
+    worker.write_text(
+        """
+import {createInterface} from 'node:readline';
+const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
+lines.on('line', () => {});
+"""
+    )
+
+    async def scenario() -> None:
+        transport = DirectChatTransport(worker_path=worker, timeout=30)
+        request = asyncio.create_task(transport.request("health"))
+        for _ in range(100):
+            if transport._process is not None:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.wait_for(transport.pause(), timeout=1)
+        with pytest.raises(RuntimeUnavailableError):
+            await request
+        assert transport.paused is True
 
     asyncio.run(scenario())

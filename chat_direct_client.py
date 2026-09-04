@@ -31,6 +31,7 @@ class DirectChatTransport:
         self._lock = asyncio.Lock()
         self._sequence = 0
         self._paused = False
+        self._active_read: asyncio.Task[bytes] | None = None
 
     async def _start(self) -> asyncio.subprocess.Process:
         current = self._process
@@ -57,7 +58,10 @@ class DirectChatTransport:
             raise RuntimeUnavailableError("direct ChatGPT transport is stopped")
         async with self._lock:
             for attempt in range(2):
+                if self._paused:
+                    raise RuntimeUnavailableError("direct ChatGPT transport is stopped")
                 process = await self._start()
+                submission_started = False
                 self._sequence += 1
                 identifier = self._sequence
                 message = json.dumps(
@@ -68,15 +72,26 @@ class DirectChatTransport:
                     assert process.stdin is not None and process.stdout is not None
                     process.stdin.write((message + "\n").encode())
                     await process.stdin.drain()
-                    raw = await asyncio.wait_for(
-                        process.stdout.readline(),
-                        timeout=max(self.timeout, request_timeout),
-                    )
-                    if not raw:
-                        raise ConnectionError("direct worker exited")
-                    response = json.loads(raw)
-                    if response.get("id") != identifier:
-                        raise RuntimeProtocolError("direct worker response id mismatch")
+                    while True:
+                        reading = asyncio.create_task(process.stdout.readline())
+                        self._active_read = reading
+                        try:
+                            raw = await asyncio.wait_for(
+                                reading,
+                                timeout=max(self.timeout, request_timeout),
+                            )
+                        finally:
+                            if self._active_read is reading:
+                                self._active_read = None
+                        if not raw:
+                            raise ConnectionError("direct worker exited")
+                        response = json.loads(raw)
+                        if response.get("id") != identifier:
+                            raise RuntimeProtocolError("direct worker response id mismatch")
+                        if response.get("event") == "submission_started":
+                            submission_started = True
+                            continue
+                        break
                     if response.get("ok") is not True:
                         error = response.get("error") or {}
                         raise DirectBackendResponseError(
@@ -84,15 +99,30 @@ class DirectChatTransport:
                             status_code=int(error["status"]) if error.get("status") else None,
                         )
                     return response.get("result")
+                except asyncio.CancelledError as exc:
+                    await self._discard_process()
+                    if self._paused:
+                        raise RuntimeUnavailableError(
+                            "direct ChatGPT request was stopped"
+                        ) from exc
+                    raise
                 except RuntimeProtocolError:
                     raise
                 except (OSError, ConnectionError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
                     await self._discard_process()
+                    if self._paused:
+                        raise RuntimeUnavailableError(
+                            "direct ChatGPT request was stopped"
+                        ) from exc
                     if attempt == 0 and method in {
                         "health", "models", "list_projects", "get_project",
                         "list_project_threads", "get_thread",
                     }:
                         continue
+                    if method in {"create_thread", "continue_thread"} and submission_started:
+                        raise DirectSubmissionUncertainError(
+                            f"direct ChatGPT submission became uncertain: {sanitize_runtime_error(exc)}"
+                        ) from exc
                     raise RuntimeUnavailableError(
                         f"direct ChatGPT worker unavailable: {sanitize_runtime_error(exc)}"
                     ) from exc
@@ -100,6 +130,10 @@ class DirectChatTransport:
 
     async def _discard_process(self) -> None:
         process, self._process = self._process, None
+        await self._terminate_process(process)
+
+    @staticmethod
+    async def _terminate_process(process: asyncio.subprocess.Process | None) -> None:
         if process is None or process.returncode is not None:
             return
         process.terminate()
@@ -122,7 +156,12 @@ class DirectChatTransport:
 
     async def pause(self) -> None:
         self._paused = True
-        await self.close()
+        # Do not wait behind a request holding _lock for a long completion.
+        process, self._process = self._process, None
+        await self._terminate_process(process)
+        reading = self._active_read
+        if reading is not None:
+            reading.cancel()
 
     def resume(self) -> None:
         self._paused = False
@@ -136,6 +175,10 @@ class DirectBackendResponseError(RuntimeProtocolError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class DirectSubmissionUncertainError(RuntimeUnavailableError):
+    """The worker began the provider POST but lost its final acknowledgement."""
 
 
 _SHARED_TRANSPORT: DirectChatTransport | None = None

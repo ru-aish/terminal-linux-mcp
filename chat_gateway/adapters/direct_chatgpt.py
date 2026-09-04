@@ -7,7 +7,11 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Mapping, Sequence
 
-from chat_direct_client import DirectBackendResponseError, DirectChatClient
+from chat_direct_client import (
+    DirectBackendResponseError,
+    DirectChatClient,
+    DirectSubmissionUncertainError,
+)
 from chat_internal_client import RuntimeProtocolError, RuntimeUnavailableError
 
 from ..errors import (
@@ -72,6 +76,9 @@ class DirectChatGPTBackend:
                     True, found, message_id, running=True,
                     metadata={"reconciled": True},
                 )
+            raise SubmissionUncertainError(
+                "pending new-thread submission is not visible yet; reconciliation will retry without POSTing"
+            )
         else:
             self._journal_put(
                 idempotency_key,
@@ -84,10 +91,13 @@ class DirectChatGPTBackend:
                 prompt, project_id=project_id, title=title, wait_for_completion=False,
                 user_message_id=message_id,
             )
-        except RuntimeUnavailableError as exc:
+        except DirectSubmissionUncertainError as exc:
             raise SubmissionUncertainError(
                 "new-thread submission became uncertain; it was not replayed"
             ) from exc
+        except RuntimeUnavailableError as exc:
+            self._journal_delete(idempotency_key)
+            raise InfrastructureError(str(exc)) from exc
         except DirectBackendResponseError as exc:
             self._journal_delete(idempotency_key)
             raise _map_response_error(exc) from exc
@@ -134,13 +144,15 @@ class DirectChatGPTBackend:
                 conversation_id, message, expected_current_node=parent,
                 wait_for_completion=False, user_message_id=message_id,
             )
-        except RuntimeUnavailableError:
+        except DirectSubmissionUncertainError:
             # Verification by stable message id is safer than replaying an
             # already-accepted continuation.
             return MutationResult(
                 True, conversation_id, message_id, running=None,
                 metadata={"submission_uncertain": True},
             )
+        except RuntimeUnavailableError as exc:
+            raise InfrastructureError(str(exc)) from exc
         except DirectBackendResponseError as exc:
             raise _map_response_error(exc) from exc
         return _mutation(payload, conversation_id)
