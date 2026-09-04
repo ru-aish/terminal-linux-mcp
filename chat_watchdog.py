@@ -1037,7 +1037,7 @@ class DirectChatAdapter(CodexInternalChatAdapter):
         timeout_seconds: float = 10.0,
         stream_timeout_seconds: int = 3600,
     ) -> None:
-        del timeout_seconds, stream_timeout_seconds
+        del timeout_seconds
         self.endpoint = "direct://chatgpt"
         self.preferred_model = preferred_model.strip()
         self.thinking_effort = thinking_effort.strip()
@@ -1046,6 +1046,7 @@ class DirectChatAdapter(CodexInternalChatAdapter):
             preferred_model=self.preferred_model,
             thinking_effort=self.thinking_effort,
             require_high_reasoning=self.require_high_reasoning,
+            stream_timeout_seconds=stream_timeout_seconds,
         )
         self._gateway = ConversationGateway(self._client_context)
         self._health: dict[str, Any] = {}

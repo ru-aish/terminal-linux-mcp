@@ -11,7 +11,11 @@ from threading import Thread
 
 import pytest
 
-from chat_direct_client import DirectChatTransport
+from chat_direct_client import (
+    DirectBackendResponseError,
+    DirectChatRuntimeController,
+    DirectChatTransport,
+)
 from chat_internal_client import RuntimeUnavailableError
 
 
@@ -136,5 +140,63 @@ lines.on('line', () => process.exit(23));
         with pytest.raises(RuntimeUnavailableError):
             await transport.request("create_thread", prompt="do not retry")
         assert starts.read_text().splitlines() == ["start"]
+
+    asyncio.run(scenario())
+
+
+def test_worker_error_preserves_http_status(tmp_path) -> None:
+    worker = tmp_path / "worker.mjs"
+    worker.write_text(
+        """
+import {createInterface} from 'node:readline';
+const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
+lines.on('line', line => {
+  const value=JSON.parse(line);
+  process.stdout.write(JSON.stringify({id:value.id,ok:false,error:{message:'limited',status:429}})+'\\n');
+});
+"""
+    )
+
+    async def scenario() -> None:
+        transport = DirectChatTransport(worker_path=worker, timeout=5)
+        try:
+            with pytest.raises(DirectBackendResponseError) as captured:
+                await transport.request("health")
+            assert captured.value.status_code == 429
+        finally:
+            await transport.close()
+
+    asyncio.run(scenario())
+
+
+def test_runtime_stop_remains_stopped_until_explicit_start() -> None:
+    class Transport:
+        paused = False
+        requests = 0
+
+        async def request(self, method: str, **_params):
+            self.requests += 1
+            return {"ready": True, "transport": "direct"}
+
+        async def pause(self):
+            self.paused = True
+
+        def resume(self):
+            self.paused = False
+
+        async def close(self):
+            return None
+
+    async def scenario() -> None:
+        transport = Transport()
+        controller = DirectChatRuntimeController()
+        controller.transport = transport
+        await controller.stop()
+        status = await controller.status()
+        assert status["ready"] is False
+        assert transport.requests == 0
+        started = await controller.start()
+        assert started["health"]["ready"] is True
+        assert transport.requests == 1
 
     asyncio.run(scenario())

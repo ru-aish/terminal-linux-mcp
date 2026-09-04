@@ -45,3 +45,10 @@ class RateLimitError(BackendError):
 class MalformedBackendResponse(BackendError):
     def __init__(self, message: str) -> None:
         super().__init__(message, transient=False, permanent=True)
+
+
+class SubmissionUncertainError(BackendError):
+    """A write may have reached the provider and must not be replayed blindly."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, transient=False, permanent=True)

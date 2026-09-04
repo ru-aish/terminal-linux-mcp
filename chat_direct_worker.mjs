@@ -125,9 +125,28 @@ async function prepareIntegrity() {
 }
 function userMessage(text,id) { return {id,author:{role:"user"},content:{content_type:"text",parts:[text]},create_time:Date.now()/1000,end_turn:null,metadata:{},recipient:"all",status:"finished_successfully",weight:1}; }
 function findConversationId(value) { const queue=[value];while(queue.length){const current=queue.pop();if(!current||typeof current!=="object")continue;const id=current.conversation_id??current.conversationId;if(typeof id==="string"&&id)return id;queue.push(...Object.values(current));}return null; }
+function containsMessage(raw,messageId){return Boolean(raw?.mapping&&typeof raw.mapping==="object"&&Object.values(raw.mapping).some(node=>String(node?.message?.id||"")===messageId));}
+async function findConversationByMessage(messageId,projectId){
+  const listing=projectId
+    ? await jsonRequest(`/gizmos/${encodeURIComponent(projectId)}/conversations?limit=50&owned_only=true`)
+    : await jsonRequest("/conversations?offset=0&limit=50&order=updated");
+  const items=Array.isArray(listing?.items)?listing.items:[];
+  for(let offset=0;offset<items.length;offset+=5){
+    const batch=items.slice(offset,offset+5);
+    const conversations=await Promise.all(batch.map(async item=>{
+      const id=String(item?.id||item?.conversation_id||"");
+      if(!id)return null;
+      try{return {id,raw:await jsonRequest(`/conversation/${encodeURIComponent(id)}`)};}catch{return null;}
+    }));
+    const found=conversations.find(value=>value&&containsMessage(value.raw,messageId));
+    if(found)return {found:true,conversation_id:found.id};
+  }
+  return {found:false,conversation_id:""};
+}
 
 async function startCompletion(params,continuation={}) {
   const controller=new AbortController();
+  const streamTimer=setTimeout(()=>controller.abort(),Math.max(30000,Number(params.stream_timeout_seconds||3600)*1000));
   const integrity=await prepareIntegrity();
   const body={action:"next",model:params.preferred_model||"gpt-5-6-thinking",messages:[userMessage(params.prompt??params.message,params.user_message_id)],supported_encodings:["v1"],timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,timezone_offset_min:new Date().getTimezoneOffset(),...continuation};
   if(params.thinking_effort)body.thinking_effort=params.thinking_effort;
@@ -137,7 +156,7 @@ async function startCompletion(params,continuation={}) {
   let observedId=continuation.conversation_id||null, resolveObserved, rejectObserved;
   const observed=new Promise((resolvePromise,rejectPromise)=>{resolveObserved=resolvePromise;rejectObserved=rejectPromise;});
   if(observedId)resolveObserved(observedId);
-  const drain=(async()=>{let buffer="";const decoder=new TextDecoder();try{for await(const chunk of response.body){buffer+=decoder.decode(chunk,{stream:true});for(;;){const at=buffer.indexOf("\n");if(at<0)break;const line=buffer.slice(0,at).trimEnd();buffer=buffer.slice(at+1);if(!line.startsWith("data: ")||line==="data: [DONE]")continue;try{observedId??=findConversationId(JSON.parse(line.slice(6)));if(observedId){activeStreams.set(observedId,{controller,done:drain});resolveObserved(observedId);}}catch{}}}if(!observedId)rejectObserved(new Error("completion stream did not expose a conversation id"));}catch(error){rejectObserved(error);throw error;}finally{if(observedId)activeStreams.delete(observedId);}})();
+  const drain=(async()=>{let buffer="";const decoder=new TextDecoder();try{for await(const chunk of response.body){buffer+=decoder.decode(chunk,{stream:true});for(;;){const at=buffer.indexOf("\n");if(at<0)break;const line=buffer.slice(0,at).trimEnd();buffer=buffer.slice(at+1);if(!line.startsWith("data: ")||line==="data: [DONE]")continue;try{observedId??=findConversationId(JSON.parse(line.slice(6)));if(observedId){activeStreams.set(observedId,{controller,done:drain});resolveObserved(observedId);}}catch{}}}if(!observedId)rejectObserved(new Error("completion stream did not expose a conversation id"));}catch(error){rejectObserved(error);throw error;}finally{clearTimeout(streamTimer);if(observedId)activeStreams.delete(observedId);}})();
   drain.catch(()=>{});
   const id=await Promise.race([observed,new Promise((_,rejectPromise)=>setTimeout(()=>rejectPromise(new Error("conversation id was not observed before timeout")),30000))]);
   if(params.wait_for_completion)await drain;
@@ -157,6 +176,7 @@ async function dispatch(method,p) {
   if(method==="list_projects"){const q=new URLSearchParams({conversations_per_gizmo:"0",limit:String(p.limit||20),owned_only:String(p.owned_only!==false)});if(p.cursor)q.set("cursor",p.cursor);return jsonRequest(`/gizmos/snorlax/sidebar?${q}`);}
   if(method==="get_project")return jsonRequest(`/gizmos/${encodeURIComponent(p.project_id)}`);
   if(method==="list_project_threads"){const q=new URLSearchParams({limit:String(p.limit||20),owned_only:String(p.owned_only!==false)});if(p.cursor)q.set("cursor",p.cursor);return jsonRequest(`/gizmos/${encodeURIComponent(p.project_id)}/conversations?${q}`);}
+  if(method==="find_message")return findConversationByMessage(String(p.message_id||""),String(p.project_id||""));
   if(method==="create_thread")return enqueueWrite(()=>startCompletion(p));
   if(method==="continue_thread")return enqueueWrite(async()=>{const before=await jsonRequest(`/conversation/${encodeURIComponent(p.conversation_id)}`);const messages=before?.mapping&&typeof before.mapping==="object"?Object.values(before.mapping).map(node=>node?.message).filter(Boolean):[];if(messages.some(message=>String(message?.id||"")===p.user_message_id))return {sent:true,accepted:true,observed:true,running:activeStreams.has(p.conversation_id),conversation_id:p.conversation_id,message_id:p.user_message_id,user_message_id:p.user_message_id,reconciled:true};const current=String(before.current_node||before.currentNode||"");if(current!==p.expected_current_node)return {sent:false,accepted:false,running:false,reason:"canonical current_node changed before send",conversation_id:p.conversation_id,user_message_id:p.user_message_id};if(activeStreams.has(p.conversation_id)&&!p.force)return {sent:false,accepted:false,running:true,reason:"thread is running",conversation_id:p.conversation_id,user_message_id:p.user_message_id};return startCompletion(p,{conversation_id:p.conversation_id,parent_message_id:current});});
   if(method==="cancel_thread"){const stream=activeStreams.get(p.conversation_id);if(!stream)return {cancelled:false,reason:"no direct transport-owned stream"};stream.controller.abort();return {cancelled:true,conversation_id:p.conversation_id};}

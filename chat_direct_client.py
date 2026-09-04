@@ -30,6 +30,7 @@ class DirectChatTransport:
         self._process: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._sequence = 0
+        self._paused = False
 
     async def _start(self) -> asyncio.subprocess.Process:
         current = self._process
@@ -51,6 +52,9 @@ class DirectChatTransport:
         return self._process
 
     async def request(self, method: str, **params: Any) -> Any:
+        request_timeout = float(params.pop("_request_timeout", self.timeout))
+        if self._paused:
+            raise RuntimeUnavailableError("direct ChatGPT transport is stopped")
         async with self._lock:
             for attempt in range(2):
                 process = await self._start()
@@ -66,7 +70,7 @@ class DirectChatTransport:
                     await process.stdin.drain()
                     raw = await asyncio.wait_for(
                         process.stdout.readline(),
-                        timeout=max(self.timeout, 130.0 if method in {"create_thread", "continue_thread"} else self.timeout),
+                        timeout=max(self.timeout, request_timeout),
                     )
                     if not raw:
                         raise ConnectionError("direct worker exited")
@@ -75,8 +79,9 @@ class DirectChatTransport:
                         raise RuntimeProtocolError("direct worker response id mismatch")
                     if response.get("ok") is not True:
                         error = response.get("error") or {}
-                        raise RuntimeProtocolError(
-                            sanitize_runtime_error(error.get("message") or "direct backend request failed")
+                        raise DirectBackendResponseError(
+                            sanitize_runtime_error(error.get("message") or "direct backend request failed"),
+                            status_code=int(error["status"]) if error.get("status") else None,
                         )
                     return response.get("result")
                 except RuntimeProtocolError:
@@ -115,6 +120,23 @@ class DirectChatTransport:
                     await process.stdin.drain()
             await self._discard_process()
 
+    async def pause(self) -> None:
+        self._paused = True
+        await self.close()
+
+    def resume(self) -> None:
+        self._paused = False
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+
+class DirectBackendResponseError(RuntimeProtocolError):
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 _SHARED_TRANSPORT: DirectChatTransport | None = None
 
@@ -135,6 +157,14 @@ class DirectChatRuntimeController:
         self.transport = get_direct_chat_transport()
 
     async def health(self) -> dict[str, Any]:
+        if self.transport.paused:
+            return {
+                "ready": False,
+                "managed_service": False,
+                "transport": "direct",
+                "stopped": True,
+                "reason": "direct ChatGPT transport is stopped",
+            }
         try:
             payload = await self.transport.request("health")
             return {**payload, "ready": bool(payload.get("ready")), "managed_service": False}
@@ -165,19 +195,22 @@ class DirectChatRuntimeController:
 
     async def start(self, *, wait: bool = True) -> dict[str, Any]:
         del wait
+        self.transport.resume()
         return {"action": "start", "health": await self.ensure_ready()}
 
     async def stop(self) -> dict[str, Any]:
-        await self.transport.close()
+        await self.transport.pause()
         return {"action": "stop", "ready": False, "managed_service": False}
 
     async def restart(self, *, wait: bool = True) -> dict[str, Any]:
         del wait
         await self.transport.close()
+        self.transport.resume()
         return {"action": "restart", "health": await self.ensure_ready()}
 
     async def recover(self) -> dict[str, Any]:
         await self.transport.close()
+        self.transport.resume()
         return {"action": "restart", "recovered": True, "health": await self.ensure_ready()}
 
     async def logs(self, *, lines: int = 200) -> dict[str, Any]:
@@ -198,11 +231,13 @@ class DirectChatClient:
         preferred_model: str = "",
         thinking_effort: str = "extended",
         require_high_reasoning: bool = True,
+        stream_timeout_seconds: int = 3600,
     ) -> None:
         self.transport = transport or get_direct_chat_transport()
         self.preferred_model = preferred_model.strip()
         self.thinking_effort = thinking_effort.strip()
         self.require_high_reasoning = bool(require_high_reasoning)
+        self.stream_timeout_seconds = max(30, int(stream_timeout_seconds))
 
     async def __aenter__(self) -> "DirectChatClient":
         await self.connect()
@@ -242,12 +277,22 @@ class DirectChatClient:
         raw = await self.transport.request("list_project_threads", project_id=project_id, limit=min(max(limit, 1), 50), cursor=cursor, owned_only=owned_only)
         return normalize_project_threads(raw, project_id)
 
+    async def find_message(self, message_id: str, *, project_id: str = "") -> str:
+        payload = await self.transport.request(
+            "find_message", message_id=message_id, project_id=project_id
+        )
+        if not isinstance(payload, dict) or not payload.get("found"):
+            return ""
+        return str(payload.get("conversation_id") or "")
+
     async def create_thread(self, prompt: str, *, project_id: str | None = None, title: str | None = None, wait_for_completion: bool = False, user_message_id: str | None = None) -> dict[str, Any]:
         payload = await self.transport.request(
             "create_thread", prompt=prompt, project_id=project_id or "", title=title or "",
             wait_for_completion=wait_for_completion, user_message_id=user_message_id or str(uuid.uuid4()),
             preferred_model=self.preferred_model, thinking_effort=self.thinking_effort,
             require_high_reasoning=self.require_high_reasoning,
+            stream_timeout_seconds=self.stream_timeout_seconds,
+            _request_timeout=(self.stream_timeout_seconds + 15 if wait_for_completion else 130),
         )
         if isinstance(payload, dict) and payload.get("after_raw") is not None:
             conversation_id = str(payload.get("conversation_id") or "")
@@ -277,6 +322,8 @@ class DirectChatClient:
             user_message_id=user_message_id or str(uuid.uuid4()), force=force,
             preferred_model=self.preferred_model, thinking_effort=self.thinking_effort,
             require_high_reasoning=self.require_high_reasoning,
+            stream_timeout_seconds=self.stream_timeout_seconds,
+            _request_timeout=(self.stream_timeout_seconds + 15 if wait_for_completion else 130),
         )
         if isinstance(payload, dict):
             payload.pop("after_raw", None)

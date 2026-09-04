@@ -81,6 +81,8 @@ def test_direct_client_continuation_uses_stable_delivery_id() -> None:
                 "preferred_model": "",
                 "thinking_effort": "extended",
                 "require_high_reasoning": True,
+                "stream_timeout_seconds": 3600,
+                "_request_timeout": 130,
             },
         )
 

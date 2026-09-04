@@ -16,6 +16,7 @@ from .errors import (
     InfrastructureError,
     MalformedBackendResponse,
     RateLimitError,
+    SubmissionUncertainError,
 )
 from .ledger import SQLiteLedger
 from .models import (
@@ -62,6 +63,7 @@ __all__ = [
     "OperationType",
     "PollingConfig",
     "RateLimitError",
+    "SubmissionUncertainError",
     "RetryConfig",
     "SQLiteLedger",
     "SystemClock",
