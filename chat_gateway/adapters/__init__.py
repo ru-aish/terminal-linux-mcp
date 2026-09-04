@@ -5,5 +5,6 @@ this package are imported only when explicitly selected by an operator.
 """
 
 from .codex_renderer import CodexRendererBackend
+from .direct_chatgpt import DirectChatGPTBackend
 
-__all__ = ["CodexRendererBackend"]
+__all__ = ["CodexRendererBackend", "DirectChatGPTBackend"]

@@ -19,6 +19,7 @@ from chat_watchdog import (
     ChatWatchdogConfig,
     DEFAULT_CONTINUE_MESSAGE,
     CodexInternalChatAdapter,
+    DirectChatAdapter,
     ModelOption,
     ThreadDecisionState,
     classify_runtime_error,
@@ -941,6 +942,7 @@ def test_auto_start_app_success_and_disabled(tmp_path, monkeypatch):
             auto_start_app=True,
             app_command="/usr/bin/codex-desktop",
             app_start_timeout_seconds=2,
+            adapter_mode="codex-internal",
         )
         watchdog = ChatWatchdog(config)
         probes = iter(
@@ -989,6 +991,7 @@ def test_auto_start_app_success_and_disabled(tmp_path, monkeypatch):
                 auto_start_app=True,
                 app_command="/usr/bin/codex-desktop",
                 app_start_timeout_seconds=2,
+                adapter_mode="codex-internal",
             )
         )
         reopen_probes = iter(
@@ -1013,6 +1016,7 @@ def test_auto_start_app_success_and_disabled(tmp_path, monkeypatch):
                 tmp_path / "ready-threads.txt",
                 tmp_path / "ready-state.json",
                 tmp_path / "ready-done.jsonl",
+                adapter_mode="codex-internal",
             )
         )
 
@@ -1031,6 +1035,7 @@ def test_auto_start_app_success_and_disabled(tmp_path, monkeypatch):
                 tmp_path / "disabled-state.json",
                 tmp_path / "disabled-done.jsonl",
                 auto_start_app=False,
+                adapter_mode="codex-internal",
             )
         )
 
@@ -1048,6 +1053,7 @@ def test_auto_start_app_success_and_disabled(tmp_path, monkeypatch):
                 tmp_path / "failed-state.json",
                 tmp_path / "failed-done.jsonl",
                 auto_start_app=True,
+                adapter_mode="codex-internal",
             )
         )
         monkeypatch.setattr(failed, "_probe_managed_runtime", unavailable_probe)
@@ -1424,7 +1430,7 @@ def test_model_policy_selects_compatible_reasoning_without_downgrade():
         )
 
 
-def test_default_adapter_is_internal_and_ui_adapters_are_rejected(tmp_path):
+def test_default_adapter_is_direct_and_ui_adapters_are_rejected(tmp_path):
     default = ChatWatchdog(
         ChatWatchdogConfig(
             False,
@@ -1433,7 +1439,7 @@ def test_default_adapter_is_internal_and_ui_adapters_are_rejected(tmp_path):
             tmp_path / "default-d",
         )
     )
-    assert isinstance(default.adapter_factory(), CodexInternalChatAdapter)
+    assert isinstance(default.adapter_factory(), DirectChatAdapter)
 
     for mode in ("legacy-desktop", "desktop", "web"):
         with pytest.raises(ValueError, match="unsupported"):

@@ -32,6 +32,7 @@ from chat_internal_client import (
     probe_runtime,
     sanitize_runtime_error,
 )
+from chat_direct_client import DirectChatClient
 
 
 DEFAULT_COMPLETION_MARKER = "DONE_I_HAVE_COMPLETED_ALL_THE_STEPS"
@@ -40,6 +41,7 @@ DEFAULT_CONTINUE_MESSAGE = (
     "Only output DONE_I_HAVE_COMPLETED_ALL_THE_STEPS after every required step is complete."
 )
 CODEX_INTERNAL_ADAPTER_NAME = "codex-internal"
+DIRECT_ADAPTER_NAME = "direct"
 CONVERSATION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 PROJECT_ID_RE = re.compile(r"^g-p-[0-9a-fA-F]{32}$")
 MAX_QUEUE_BYTES = 128 * 1024
@@ -1023,13 +1025,39 @@ class CodexInternalChatAdapter:
         return True
 
 
+class DirectChatAdapter(CodexInternalChatAdapter):
+    """Watchdog adapter backed by Terminal MCP's direct ChatGPT transport."""
+
+    def __init__(
+        self,
+        *,
+        preferred_model: str = "",
+        thinking_effort: str = "extended",
+        require_high_reasoning: bool = True,
+        timeout_seconds: float = 10.0,
+        stream_timeout_seconds: int = 3600,
+    ) -> None:
+        del timeout_seconds, stream_timeout_seconds
+        self.endpoint = "direct://chatgpt"
+        self.preferred_model = preferred_model.strip()
+        self.thinking_effort = thinking_effort.strip()
+        self.require_high_reasoning = require_high_reasoning
+        self._client = DirectChatClient(
+            preferred_model=self.preferred_model,
+            thinking_effort=self.thinking_effort,
+            require_high_reasoning=self.require_high_reasoning,
+        )
+        self._gateway = ConversationGateway(self._client_context)
+        self._health: dict[str, Any] = {}
+
+
 @dataclass(frozen=True)
 class ChatWatchdogConfig:
     enabled: bool
     queue_path: Path
     state_path: Path
     completed_path: Path
-    adapter_mode: str = CODEX_INTERNAL_ADAPTER_NAME
+    adapter_mode: str = DIRECT_ADAPTER_NAME
     cdp_endpoint: str = DEFAULT_CODEX_CDP_ENDPOINT
     scan_interval_seconds: int = 600
     retry_cooldown_seconds: int = 300
@@ -1057,8 +1085,8 @@ class ChatWatchdogConfig:
         root = Path(os.environ.get("MCP_CHAT_WATCHDOG_DIR", "~/.GPT/chat-watchdog")).expanduser()
         enabled = os.environ.get("MCP_CHAT_WATCHDOG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
         adapter_mode = (
-            os.environ.get("MCP_CHAT_WATCHDOG_ADAPTER", CODEX_INTERNAL_ADAPTER_NAME).strip().lower()
-            or CODEX_INTERNAL_ADAPTER_NAME
+            os.environ.get("MCP_CHAT_WATCHDOG_ADAPTER", DIRECT_ADAPTER_NAME).strip().lower()
+            or DIRECT_ADAPTER_NAME
         )
         return cls(
             enabled=enabled,
@@ -1156,10 +1184,18 @@ class ChatWatchdog:
                 timeout_seconds=config.internal_timeout_seconds,
                 stream_timeout_seconds=config.stream_timeout_seconds,
             )
+        elif config.adapter_mode == DIRECT_ADAPTER_NAME:
+            self.adapter_factory = lambda: DirectChatAdapter(
+                preferred_model=config.preferred_model,
+                thinking_effort=config.thinking_effort,
+                require_high_reasoning=config.require_high_reasoning,
+                timeout_seconds=config.internal_timeout_seconds,
+                stream_timeout_seconds=config.stream_timeout_seconds,
+            )
         else:
             raise ValueError(
                 f"unsupported chat watchdog adapter: {config.adapter_mode}; "
-                f"only {CODEX_INTERNAL_ADAPTER_NAME!r} is supported"
+                f"supported adapters are {DIRECT_ADAPTER_NAME!r} and {CODEX_INTERNAL_ADAPTER_NAME!r}"
             )
         self.clock = clock
         self._runtime_ensure = runtime_ensure

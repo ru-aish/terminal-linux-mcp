@@ -31,7 +31,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from gpt_thread_store import GPTThreadStore
 from usage_dashboard import install_usage_dashboard
 from chat_watchdog import ChatWatchdog, ChatWatchdogConfig, install_chat_watchdog_lifespan, parse_chat_link
-from chat_internal_client import DEFAULT_CODEX_CDP_ENDPOINT, InternalChatClient, sanitize_runtime_error
+from chat_internal_client import sanitize_runtime_error
+from chat_direct_client import DirectChatClient, DirectChatRuntimeController
 from chat_agent_orchestrator import (
     DEFAULT_AGENT_COMPLETION_MARKER,
     ChatAgentCoordinator,
@@ -41,11 +42,10 @@ from chat_agent_orchestrator import (
 )
 from gateway_agent_orchestrator import GatewayChatAgentCoordinator
 from chat_gateway import ChatGateway, GatewayConfig, SQLiteLedger
-from chat_gateway.adapters.codex_renderer import (
+from chat_gateway.adapters.direct_chatgpt import (
     DEFAULT_HIGH_REASONING_MODEL,
-    CodexRendererBackend,
+    DirectChatGPTBackend,
 )
-from chat_runtime_controller import ChatRuntimeController
 from process_completion_bot import read_process_start_ticks
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expanduser().resolve()
@@ -111,26 +111,15 @@ CHAT_AGENT_STALE_SECONDS = max(
 _CHAT_AGENT_COORDINATOR: ChatAgentCoordinator | None = None
 _CHAT_AGENT_SERVICE: ChatAgentService | None = None
 _CHAT_GATEWAY: ChatGateway | None = None
-_CHAT_RUNTIME_CONTROLLER: ChatRuntimeController | None = None
+_CHAT_RUNTIME_CONTROLLER: DirectChatRuntimeController | None = None
 _CHAT_AGENT_RUNTIME_ENSURE: Callable[[], Awaitable[Any]] | None = None
 
 
-def get_chat_runtime_controller() -> ChatRuntimeController:
+def get_chat_runtime_controller() -> DirectChatRuntimeController:
     global _CHAT_RUNTIME_CONTROLLER
     if _CHAT_RUNTIME_CONTROLLER is None:
-        _CHAT_RUNTIME_CONTROLLER = ChatRuntimeController()
+        _CHAT_RUNTIME_CONTROLLER = DirectChatRuntimeController()
     return _CHAT_RUNTIME_CONTROLLER
-
-
-def _chat_runtime_webview_port() -> int:
-    value = os.environ.get(
-        "MCP_CHAT_RUNTIME_WEBVIEW_URL", "http://127.0.0.1:5175/index.html"
-    )
-    parsed = urlsplit(value)
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    if not 1 <= port <= 65535:
-        raise ValueError("MCP_CHAT_RUNTIME_WEBVIEW_URL has an invalid port")
-    return port
 
 
 def set_chat_agent_runtime_ensure(
@@ -144,11 +133,7 @@ def set_chat_agent_runtime_ensure(
 async def _chat_agent_runtime_factory():
     if _CHAT_AGENT_RUNTIME_ENSURE is not None:
         await _CHAT_AGENT_RUNTIME_ENSURE()
-    async with InternalChatClient(
-        os.environ.get("MCP_CHAT_WATCHDOG_CDP", DEFAULT_CODEX_CDP_ENDPOINT),
-        timeout=float(os.environ.get("MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS", "10")),
-        webview_port=_chat_runtime_webview_port(),
-        stream_timeout_seconds=max(30, int(os.environ.get("MCP_CHAT_WATCHDOG_STREAM_TIMEOUT_SECONDS", "3600"))),
+    async with DirectChatClient(
         preferred_model=os.environ.get("MCP_CHAT_WATCHDOG_MODEL", ""),
         thinking_effort=os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
         require_high_reasoning=os.environ.get("MCP_CHAT_WATCHDOG_REQUIRE_HIGH", "1").strip().lower() not in {"0", "false", "no", "off"},
@@ -163,21 +148,12 @@ def get_chat_gateway() -> ChatGateway:
             database_path=str(CHAT_GATEWAY_DB_PATH),
             maximum_active_agents=max(64, CHAT_AGENT_MAX_ACTIVE_CHILDREN + 8),
         )
-        backend = CodexRendererBackend(
-            cdp_endpoint=os.environ.get(
-                "CHAT_GATEWAY_CDP_ENDPOINT",
-                os.environ.get("MCP_CHAT_WATCHDOG_CDP", DEFAULT_CODEX_CDP_ENDPOINT),
-            ),
+        backend = DirectChatGPTBackend(
             model_slug=os.environ.get(
                 "CHAT_GATEWAY_MODEL_SLUG",
                 os.environ.get("MCP_CHAT_WATCHDOG_MODEL", DEFAULT_HIGH_REASONING_MODEL),
             )
             or DEFAULT_HIGH_REASONING_MODEL,
-            stream_start_timeout=float(
-                os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
-            ),
-            cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
-            webview_port=_chat_runtime_webview_port(),
             thinking_effort=os.environ.get(
                 "CHAT_GATEWAY_THINKING_EFFORT",
                 os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
