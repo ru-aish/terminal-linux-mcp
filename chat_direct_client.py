@@ -61,6 +61,9 @@ class DirectChatTransport:
                 if self._paused:
                     raise RuntimeUnavailableError("direct ChatGPT transport is stopped")
                 process = await self._start()
+                if self._paused:
+                    await self._discard_process()
+                    raise RuntimeUnavailableError("direct ChatGPT transport is stopped")
                 submission_started = False
                 self._sequence += 1
                 identifier = self._sequence

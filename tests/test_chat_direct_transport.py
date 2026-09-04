@@ -313,3 +313,40 @@ lines.on('line', () => {});
         assert transport.paused is True
 
     asyncio.run(scenario())
+
+
+def test_pause_wins_race_with_lazy_worker_start(tmp_path) -> None:
+    worker = tmp_path / "worker.mjs"
+    worker.write_text(
+        """
+import {createInterface} from 'node:readline';
+const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
+lines.on('line', line => {
+  const value=JSON.parse(line);
+  process.stdout.write(JSON.stringify({id:value.id,ok:true,result:{ready:true}})+'\\n');
+});
+"""
+    )
+
+    async def scenario() -> None:
+        transport = DirectChatTransport(worker_path=worker, timeout=5)
+        original_start = transport._start
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_start():
+            entered.set()
+            await release.wait()
+            return await original_start()
+
+        transport._start = delayed_start  # type: ignore[method-assign]
+        request = asyncio.create_task(transport.request("health"))
+        await entered.wait()
+        await transport.pause()
+        release.set()
+        with pytest.raises(RuntimeUnavailableError, match="stopped"):
+            await request
+        assert transport.paused is True
+        assert transport._process is None
+
+    asyncio.run(scenario())
