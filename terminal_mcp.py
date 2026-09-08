@@ -47,7 +47,8 @@ WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE", "~/mcp_workspace")).expandu
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR = Path(os.environ.get("MCP_LOG_DIR", "~/.gpt_terminal_mcp_logs")).expanduser().resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-SHELL = os.environ.get("MCP_SHELL", "/bin/bash")
+IS_WINDOWS = os.name == "nt"
+SHELL = os.environ.get("MCP_SHELL", "powershell.exe" if IS_WINDOWS else "/bin/bash")
 DEFAULT_TIMEOUT = int(os.environ.get("MCP_DEFAULT_TIMEOUT", "30"))
 DEFAULT_MAX_OUTPUT_CHARS = int(os.environ.get("MCP_MAX_OUTPUT_CHARS", "24000"))
 PROCESS_BUFFER_LINES = int(os.environ.get("MCP_PROCESS_BUFFER_LINES", "1000"))
@@ -723,7 +724,7 @@ async def _terminate_process_group(process: asyncio.subprocess.Process, grace_se
     if process.returncode is not None:
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        process.terminate() if IS_WINDOWS else os.killpg(process.pid, signal.SIGTERM)
     except Exception:
         try:
             process.terminate()
@@ -735,7 +736,7 @@ async def _terminate_process_group(process: asyncio.subprocess.Process, grace_se
     except asyncio.TimeoutError:
         pass
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        process.kill() if IS_WINDOWS else os.killpg(process.pid, signal.SIGKILL)
     except Exception:
         try:
             process.kill()
@@ -767,13 +768,17 @@ async def _spawn_workload(
     args: list[str], *, shell: bool, session: SessionState, request_id: str,
     cwd: Path, env: dict[str, str] | None, stdin: int | None = None,
 ) -> tuple[asyncio.subprocess.Process, str | None]:
-    prefix, unit = _systemd_workload_prefix(session.session_id, request_id)
+    prefix, unit = ([], None) if IS_WINDOWS else _systemd_workload_prefix(session.session_id, request_id)
+    process_group_options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if IS_WINDOWS else {"start_new_session": True}
+    )
     if prefix:
         try:
             return await asyncio.create_subprocess_exec(
                 *prefix, *args, cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
+                **process_group_options,
             ), unit
         except (FileNotFoundError, OSError):
             if WORKLOAD_ISOLATION == "required":
@@ -781,15 +786,16 @@ async def _spawn_workload(
     if WORKLOAD_ISOLATION == "required":
         raise RuntimeError("MCP workload isolation is required but systemd-run is unavailable")
     if shell:
-        return await asyncio.create_subprocess_shell(
-            args[-1], cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
+        shell_args = [SHELL, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", args[-1]] if IS_WINDOWS else [SHELL, "-lc", args[-1]]
+        return await asyncio.create_subprocess_exec(
+            *shell_args, cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            executable=SHELL, start_new_session=True,
+            **process_group_options,
         ), None
     return await asyncio.create_subprocess_exec(
         *args, cwd=str(cwd), env=_build_env(session, env), stdin=stdin,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+        **process_group_options,
     ), None
 
 
@@ -2111,7 +2117,7 @@ async def run_command(
     max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS,
     env: dict[str, str] | None = None,
 ) -> str:
-    """Execute a bash command in a terminal session. Commands in the same session_id are serialized; different session_id values can run independently."""
+    """Execute a native shell command in a terminal session. Commands in the same session_id are serialized; different session_id values can run independently."""
     request_id = f"cmd-{_now_ms()}-{uuid.uuid4().hex[:8]}"
     started = time.time()
     session = await _get_session(session_id)
@@ -2124,12 +2130,21 @@ async def run_command(
             if gate:
                 return gate
             marker = f"__MCP_PWD_{uuid.uuid4().hex}__"
-            modified = (
-                f"{command}\n"
-                "__mcp_status=$?\n"
-                f"printf '\\n{marker}:%s\\n' \"$PWD\"\n"
-                "exit \"$__mcp_status\""
-            )
+            if IS_WINDOWS:
+                modified = (
+                    "$global:LASTEXITCODE = $null\n"
+                    f"& {{ {command} }}\n"
+                    "$__mcp_status = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } elseif ($?) { 0 } else { 1 }\n"
+                    f"Write-Output ('{marker}:' + (Get-Location).Path)\n"
+                    "exit $__mcp_status"
+                )
+            else:
+                modified = (
+                    f"{command}\n"
+                    "__mcp_status=$?\n"
+                    f"printf '\\n{marker}:%s\\n' \"$PWD\"\n"
+                    "exit \"$__mcp_status\""
+                )
             process, unit_name = await _spawn_workload(
                 [SHELL, "-lc", modified], shell=True, session=session, request_id=request_id,
                 cwd=run_cwd, env=env,
@@ -2246,7 +2261,7 @@ async def unset_session_env(name: str, session_id: str = "default") -> str:
 
 @mcp.tool()
 async def start_process(command: str, session_id: str = "default", cwd: str | None = None, env: dict[str, str] | None = None) -> str:
-    """Start a long-running background bash process and return a process_id."""
+    """Start a long-running background native-shell process and return a process_id."""
     session = await _get_session(session_id)
     async with session.lock:
         run_cwd = _resolve_cwd(cwd, session.cwd)
