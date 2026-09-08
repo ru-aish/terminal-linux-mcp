@@ -150,7 +150,8 @@ Set `MCP_DASHBOARD_TOKEN` to require the dashboard login form. The MCP bearer mi
 
 ## Requirements
 
-- Linux
+- Linux or Windows 10/11
+- Python 3.11 or newer
 - Optional agent CLIs used by delegated tools: Codex and/or Antigravity
 
 `store.sh` installs the remaining prerequisites. It supports Debian/Ubuntu,
@@ -231,6 +232,29 @@ Authentication: Authorization: Bearer <MCP_BEARER_TOKEN>
 ```
 
 `Ctrl+C` stops the server and the tunnel.
+
+### Windows quick start
+
+Run these commands in PowerShell (not WSL):
+
+```powershell
+git clone https://github.com/ru-aish/terminal-linux-mcp.git
+Set-Location terminal-linux-mcp
+.\setup.ps1
+Copy-Item .env.example .env
+.\start.ps1 -LocalOnly
+```
+
+For a public endpoint, install and authenticate the Windows ngrok client, set
+`MCP_BEARER_TOKEN` in `.env`, and run `.\start.ps1`. The server automatically
+uses Windows PowerShell for `run_command` and `start_process`; set `MCP_SHELL`
+to `pwsh.exe` if PowerShell 7 is preferred. The tmux-backed persistent-terminal
+tools remain Linux-only, while the normal command, background-process, file,
+MCP proxy, dashboard, and HTTP server features run natively on Windows.
+
+To intentionally run a public endpoint without MCP authentication, use
+`.\start.ps1 -AllowUnauthenticatedPublic`. This disables the bearer-token
+check for that launch and should only be used on a disposable, isolated host.
 
 ### Local-only mode
 

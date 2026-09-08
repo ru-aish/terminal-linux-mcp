@@ -335,6 +335,24 @@ def test_run_command_preserves_original_exit_code(tmp_path, monkeypatch):
     assert "Working Directory:" in result
 
 
+def test_run_command_tracks_native_shell_working_directory(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    project = tmp_path / "native-shell-project"
+    child = project / "child"
+    child.mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / ".GPT").mkdir()
+    (project / ".GPT" / "AGENTS.md").write_text("rule", encoding="utf-8")
+    thread_id = "native-shell-thread"
+    run(terminal_mcp.bootstrap_thread(thread_id=thread_id, cwd=str(project), max_chars=100000))
+
+    command = "Set-Location child" if terminal_mcp.IS_WINDOWS else "cd child"
+    result = run(terminal_mcp.run_command(command, session_id=thread_id, cwd=str(project)))
+
+    assert f"Working Directory: {child.resolve()}" in result
+    assert terminal_mcp.sessions[thread_id].cwd == child.resolve()
+
+
 def test_workload_scope_prefix_is_optional_and_sanitized(monkeypatch):
     monkeypatch.setattr(terminal_mcp, "WORKLOAD_ISOLATION", "auto")
     monkeypatch.setattr(terminal_mcp.shutil, "which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
