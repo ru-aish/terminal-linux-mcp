@@ -2073,6 +2073,201 @@ def test_selected_project_autodiscovers_only_new_project_threads(tmp_path):
     asyncio.run(run())
 
 
+def test_existing_working_mode_enrolls_running_baselined_thread_with_one_inspection(tmp_path):
+    async def run():
+        selected = project_id("f")
+        old_id = "66666666-6666-6666-6666-666666666666"
+        running = canonical_snapshot(
+            conversation_id=old_id,
+            assistant_status="in_progress",
+            assistant_end_turn=False,
+            current_node="a-running",
+            running=True,
+            update_time=1001.0,
+        )
+        fake = FakeAdapter(
+            running,
+            snapshots={old_id: running},
+            project_threads={
+                selected: [
+                    {
+                        "conversation_id": old_id,
+                        "title": "Existing running task",
+                        "project_id": selected,
+                        "current_node": "a-running",
+                        "update_time": 1001.0,
+                    }
+                ]
+            },
+        )
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "threads.txt",
+                tmp_path / "state.json",
+                tmp_path / "done.jsonl",
+                projects_path=tmp_path / "projects.json",
+                pre_send_confirmation_seconds=0,
+            ),
+            adapter_factory=lambda: fake,
+            clock=lambda: 1000.0,
+        )
+
+        await watchdog.select_project(selected, name="Existing work")
+        switched = watchdog.set_project_mode(selected, "existing_working")
+        assert switched["projects"]["items"][0]["watch_mode"] == "existing_working"
+        assert switched["projects"]["items"][0]["existing_working_initialized"] is False
+
+        result = await watchdog.scan_once(trigger="test")
+        assert fake.inspections == 1
+        assert fake.inspected_conversation_ids == [old_id]
+        assert [item["conversation_id"] for item in result["queue"]["entries"]] == [old_id]
+        state = result["queue"]["entries"][0]["state"]
+        assert state["task_source"] == f"project-watch-existing:{selected}"
+        assert state["auto_project_mode"] == "existing_working"
+        assert result["projects"]["items"][0]["existing_working_initialized"] is True
+        assert result["runtime"]["project_scan"]["physical_list_requests"] == 1
+        assert result["runtime"]["project_scan"]["physical_existing_inspect_requests"] == 1
+        assert result["runtime"]["project_scan"]["existing_working_threads_added"] == 1
+        assert result["runtime"]["project_scan"]["new_threads_added"] == 0
+
+    asyncio.run(run())
+
+
+def test_existing_working_mode_skips_unchanged_stopped_thread_until_fingerprint_changes(tmp_path):
+    async def run():
+        selected = project_id("1")
+        old_id = "77777777-7777-7777-7777-777777777777"
+        stopped = canonical_snapshot(
+            conversation_id=old_id,
+            current_node="a-stopped",
+            update_time=1000.0,
+        )
+        running = canonical_snapshot(
+            conversation_id=old_id,
+            assistant_status="in_progress",
+            assistant_end_turn=False,
+            current_node="a-new-work",
+            running=True,
+            update_time=1002.0,
+        )
+        fake = FakeAdapter(
+            stopped,
+            snapshots={old_id: stopped},
+            project_threads={
+                selected: [
+                    {
+                        "conversation_id": old_id,
+                        "title": "Existing stopped task",
+                        "project_id": selected,
+                        "current_node": "a-stopped",
+                        "update_time": 1000.0,
+                    }
+                ]
+            },
+        )
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "threads.txt",
+                tmp_path / "state.json",
+                tmp_path / "done.jsonl",
+                projects_path=tmp_path / "projects.json",
+                pre_send_confirmation_seconds=0,
+            ),
+            adapter_factory=lambda: fake,
+            clock=lambda: 1000.0,
+        )
+
+        await watchdog.select_project(selected, name="Existing work")
+        watchdog.set_project_mode(selected, "existing_working")
+
+        first = await watchdog.scan_once(trigger="test")
+        assert fake.inspections == 1
+        assert first["queue"]["entries"] == []
+        assert first["runtime"]["project_scan"]["physical_existing_inspect_requests"] == 1
+
+        second = await watchdog.scan_once(trigger="test")
+        assert fake.inspections == 1
+        assert second["queue"]["entries"] == []
+        assert second["runtime"]["project_scan"]["physical_existing_inspect_requests"] == 0
+
+        fake.snapshots[old_id] = running
+        fake.project_threads[selected][0]["current_node"] = "a-new-work"
+        fake.project_threads[selected][0]["update_time"] = 1002.0
+
+        third = await watchdog.scan_once(trigger="test")
+        assert fake.inspections == 2
+        assert [item["conversation_id"] for item in third["queue"]["entries"]] == [old_id]
+        assert third["runtime"]["project_scan"]["physical_existing_inspect_requests"] == 1
+        assert third["runtime"]["project_scan"]["existing_working_threads_added"] == 1
+
+    asyncio.run(run())
+
+
+def test_existing_working_mode_retries_only_failed_classification(tmp_path):
+    async def run():
+        selected = project_id("2")
+        good_id = "88888888-8888-8888-8888-888888888888"
+        failed_id = "99999999-9999-9999-9999-999999999999"
+        stopped = canonical_snapshot(
+            conversation_id=good_id,
+            current_node="a-stopped",
+            update_time=1000.0,
+        )
+        fake = FakeAdapter(
+            stopped,
+            snapshots={good_id: stopped},
+            inspect_errors={failed_id},
+            project_threads={
+                selected: [
+                    {
+                        "conversation_id": good_id,
+                        "title": "Classified stopped",
+                        "project_id": selected,
+                        "current_node": "a-stopped",
+                        "update_time": 1000.0,
+                    },
+                    {
+                        "conversation_id": failed_id,
+                        "title": "Retry me",
+                        "project_id": selected,
+                        "current_node": "a-unknown",
+                        "update_time": 1000.0,
+                    },
+                ]
+            },
+        )
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "threads.txt",
+                tmp_path / "state.json",
+                tmp_path / "done.jsonl",
+                projects_path=tmp_path / "projects.json",
+                pre_send_confirmation_seconds=0,
+            ),
+            adapter_factory=lambda: fake,
+            clock=lambda: 1000.0,
+        )
+
+        await watchdog.select_project(selected, name="Existing work")
+        watchdog.set_project_mode(selected, "existing_working")
+
+        first = await watchdog.scan_once(trigger="test")
+        assert fake.inspections == 2
+        assert first["projects"]["items"][0]["existing_working_initialized"] is True
+        assert "could not verify 1 existing thread" in first["projects"]["items"][0]["last_error"]
+
+        second = await watchdog.scan_once(trigger="test")
+        assert fake.inspections == 3
+        assert fake.inspected_conversation_ids.count(good_id) == 1
+        assert fake.inspected_conversation_ids.count(failed_id) == 2
+        assert second["runtime"]["project_scan"]["physical_existing_inspect_requests"] == 1
+
+    asyncio.run(run())
+
+
 def test_watchdog_project_dashboard_selects_and_removes_projects(tmp_path, monkeypatch):
     monkeypatch.setenv("MCP_DASHBOARD_TOKEN", "secret")
     monkeypatch.setenv("TEST_WATCHDOG_PROJECT_HOME", str(tmp_path / "gpt-home"))
@@ -2134,6 +2329,30 @@ def test_watchdog_project_dashboard_selects_and_removes_projects(tmp_path, monke
         assert added.status_code == 201
         assert added.json()["projects"]["items"][0]["project_id"] == project_id
         assert added.json()["projects"]["items"][0]["seen_thread_count"] == 1
+        assert added.json()["projects"]["items"][0]["watch_mode"] == "new_threads_only"
+
+        mode_denied = client.patch(
+            f"/dashboard/watchdog/projects/{project_id}",
+            json={"watch_mode": "existing_working"},
+            headers=auth,
+        )
+        assert mode_denied.status_code == 403
+
+        switched = client.patch(
+            f"/dashboard/watchdog/projects/{project_id}",
+            json={"watch_mode": "existing_working"},
+            headers=mutation,
+        )
+        assert switched.status_code == 200
+        assert switched.json()["projects"]["items"][0]["watch_mode"] == "existing_working"
+        assert switched.json()["projects"]["items"][0]["existing_working_initialized"] is False
+
+        invalid_mode = client.patch(
+            f"/dashboard/watchdog/projects/{project_id}",
+            json={"watch_mode": "everything"},
+            headers=mutation,
+        )
+        assert invalid_mode.status_code == 400
 
         removed = client.delete(
             f"/dashboard/watchdog/projects/{project_id}",

@@ -263,12 +263,31 @@ def install_usage_dashboard(
             snapshot = await watchdog.select_project(
                 str(payload.get("project_id", "")),
                 name=str(payload.get("name", "")),
+                watch_mode=str(payload.get("watch_mode", "new_threads_only")),
             )
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             return _security_headers(JSONResponse({"error": str(exc)}, status_code=400))
         except Exception as exc:
             return _security_headers(JSONResponse({"error": str(exc)}, status_code=503))
         return _security_headers(JSONResponse(snapshot, status_code=201))
+
+    async def watchdog_project_update(request: Request) -> Response:
+        if watchdog is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not watchdog_mutation_allowed(request):
+            return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
+        try:
+            payload = await request.json()
+            snapshot = await asyncio.to_thread(
+                watchdog.set_project_mode,
+                request.path_params["project_id"],
+                str(payload.get("watch_mode", "")),
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return _security_headers(JSONResponse({"error": str(exc)}, status_code=400))
+        except Exception as exc:
+            return _security_headers(JSONResponse({"error": str(exc)}, status_code=503))
+        return _security_headers(JSONResponse(snapshot))
 
     async def watchdog_project_remove(request: Request) -> Response:
         if watchdog is None:
@@ -353,6 +372,7 @@ def install_usage_dashboard(
             Route("/dashboard/watchdog/scan", watchdog_scan, methods=["POST"]),
             Route("/dashboard/watchdog/projects/available", watchdog_projects_available, methods=["GET"]),
             Route("/dashboard/watchdog/projects", watchdog_project_add, methods=["POST"]),
+            Route("/dashboard/watchdog/projects/{project_id:str}", watchdog_project_update, methods=["PATCH"]),
             Route("/dashboard/watchdog/projects/{project_id:str}", watchdog_project_remove, methods=["DELETE"]),
             Route("/dashboard/events", dashboard_events, methods=["GET"]),
             Route("/dashboard/assets/{name:str}", dashboard_asset, methods=["GET"]),

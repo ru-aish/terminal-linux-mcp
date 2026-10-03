@@ -139,6 +139,13 @@ h2 { margin: 0; font-family: var(--display); font-size: clamp(1.45rem, 6vw, 2.45
 .project-watch-row small { margin-top: 4px; color: var(--muted); font: .61rem/1.45 var(--mono); }
 .project-watch-row button { border: 1px solid var(--rule); border-radius: 9px; background: var(--surface); color: var(--ink); padding: 7px 9px; cursor: pointer; font-size: .67rem; }
 .project-watch-row button:disabled { opacity: .5; cursor: default; }
+.project-watch-selected { grid-template-columns: minmax(0, 1fr); align-items: start; }
+.project-watch-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.project-watch-mode { display: inline-flex; max-width: 100%; border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; background: var(--surface); }
+.project-watch-mode button { border: 0; border-radius: 0; padding: 7px 8px; white-space: nowrap; }
+.project-watch-mode button + button { border-left: 1px solid var(--rule); }
+.project-watch-mode button[aria-pressed="true"] { background: var(--ink); color: white; }
+.project-watch-stop { margin-left: auto; }
 .method h2 { max-width: 700px; }
 .method-grid { margin-top: 22px; display: grid; gap: 14px; color: var(--muted); font-size: .78rem; }
 .method-grid p { margin: 0; padding-top: 12px; border-top: 1px solid var(--rule); }
@@ -167,6 +174,8 @@ footer form { margin: 0; }
   .score:nth-child(even) { padding-left: 18px; }
   .score:last-child { border-right: 0; }
   .section-heading { flex-direction: row; justify-content: space-between; align-items: end; }
+  .project-watch-selected { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+  .project-watch-controls { justify-content: flex-end; }
   .chart-wrap, .chart-wrap svg { min-height: 310px; height: 310px; }
   .workbench { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: 42px; border-bottom: 1px solid var(--ink); }
   .tool-section, .event-section { border-bottom: 0; }
