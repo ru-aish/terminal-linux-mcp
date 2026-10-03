@@ -309,13 +309,17 @@
     $("watchdogEntries").innerHTML = watchdog.queue.entries.map((entry) => { const generation = entry.state?.task_generation ? ` · generation ${entry.state.task_generation}` : ""; return `<div class="watchdog-entry"><span title="${escapeHtml(entry.url)}">${escapeHtml(entry.url)}</span><small>${escapeHtml((entry.state?.status || "queued") + generation)}</small><button type="button" data-watchdog-remove="${escapeHtml(entry.conversation_id)}">Remove task</button></div>`; }).join("") || '<div class="empty-row">No active tasks.</div>';
     const projects = watchdog.projects?.items || [];
     $("watchdogSelectedProjects").innerHTML = projects.map((project) => {
-      const detail = project.last_error ? project.last_error : `${project.seen_thread_count || 0} known threads · ${project.last_scan_at ? `scanned ${relativeTime(project.last_scan_at)}` : "not scanned yet"}`;
-      return `<div class="project-watch-row"><div><strong>${escapeHtml(project.name || project.project_id)}</strong><small>${escapeHtml(detail)}</small></div><button type="button" data-watchdog-project-remove="${escapeHtml(project.project_id)}">Stop watching</button></div>`;
+      const mode = project.watch_mode === "existing_working" ? "existing_working" : "new_threads_only";
+      const modeLabel = mode === "existing_working" ? "all working threads" : "new threads only";
+      const scanDetail = project.last_scan_at ? `scanned ${relativeTime(project.last_scan_at)}` : "not scanned yet";
+      const detail = project.last_error ? `${project.last_error} · ${modeLabel}` : `${project.seen_thread_count || 0} known threads · ${scanDetail} · ${modeLabel}`;
+      const projectName = project.name || project.project_id;
+      return `<div class="project-watch-row project-watch-selected"><div><strong>${escapeHtml(projectName)}</strong><small>${escapeHtml(detail)}</small></div><div class="project-watch-controls"><div class="project-watch-mode" role="group" aria-label="Ledger mode for ${escapeHtml(projectName)}"><button type="button" data-watchdog-project-mode="${escapeHtml(project.project_id)}" data-watchdog-mode="new_threads_only" aria-pressed="${String(mode === "new_threads_only")}">New threads</button><button type="button" data-watchdog-project-mode="${escapeHtml(project.project_id)}" data-watchdog-mode="existing_working" aria-pressed="${String(mode === "existing_working")}">All working</button></div><button type="button" class="project-watch-stop" data-watchdog-project-remove="${escapeHtml(project.project_id)}">Stop watching</button></div></div>`;
     }).join("") || '<div class="empty-row">No Projects selected. General chats are never auto-added.</div>';
     const projectScan = runtime.project_scan || {};
     $("watchdogProjectStatus").textContent = projects.length
-      ? `${projects.length} selected Project${projects.length === 1 ? "" : "s"} · last watchdog Project scan used ${projectScan.physical_list_requests ?? 0} list request${projectScan.physical_list_requests === 1 ? "" : "s"} · ${projectScan.new_threads_added ?? 0} new thread${projectScan.new_threads_added === 1 ? "" : "s"} added`
-      : "Only selected Projects are scanned. General chats are ignored.";
+      ? `${projects.length} selected Project${projects.length === 1 ? "" : "s"} · last scan: ${projectScan.physical_list_requests ?? 0} list request${projectScan.physical_list_requests === 1 ? "" : "s"}, ${projectScan.physical_existing_inspect_requests ?? 0} existing-thread check${projectScan.physical_existing_inspect_requests === 1 ? "" : "s"} · ${projectScan.existing_working_threads_added ?? 0} resumed, ${projectScan.new_threads_added ?? 0} new`
+      : "Each selected Project can watch only new threads or also resume existing working threads. General chats are ignored.";
   }
 
   function renderAvailableProjects(payload) {
@@ -354,7 +358,7 @@
     try {
       $("watchdogProjectStatus").textContent = "Loading available Projects…";
       renderAvailableProjects(await watchdogRequest("/dashboard/watchdog/projects/available"));
-      $("watchdogProjectStatus").textContent = "Choose only the Projects whose new threads should enter the watchdog.";
+      $("watchdogProjectStatus").textContent = "Add a Project, then choose whether only new threads or all currently working threads should enter the ledger.";
     } catch (error) {
       $("watchdogProjectStatus").textContent = error.message;
     }
@@ -377,6 +381,27 @@
     }
   });
   $("watchdogSelectedProjects").addEventListener("click", async (event) => {
+    const modeButton = event.target.closest("[data-watchdog-project-mode]");
+    if (modeButton) {
+      if (modeButton.getAttribute("aria-pressed") === "true") return;
+      const projectId = modeButton.dataset.watchdogProjectMode;
+      const watchMode = modeButton.dataset.watchdogMode;
+      const group = modeButton.closest(".project-watch-mode");
+      const buttons = group ? [...group.querySelectorAll("button")] : [modeButton];
+      buttons.forEach((button) => { button.disabled = true; });
+      try {
+        renderWatchdog(await watchdogRequest(`/dashboard/watchdog/projects/${projectId}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ watch_mode: watchMode }),
+        }));
+      } catch (error) {
+        $("watchdogProjectStatus").textContent = error.message;
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+      return;
+    }
+
     const button = event.target.closest("[data-watchdog-project-remove]");
     if (!button) return;
     try {

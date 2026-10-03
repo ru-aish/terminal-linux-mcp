@@ -49,6 +49,11 @@ MAX_QUEUE_ENTRIES = 500
 MAX_WATCHED_PROJECTS = 50
 MAX_AVAILABLE_PROJECTS = 500
 MAX_PROJECT_DISCOVERY_PAGES = 100
+PROJECT_WATCH_MODE_NEW_THREADS = "new_threads_only"
+PROJECT_WATCH_MODE_EXISTING_WORKING = "existing_working"
+PROJECT_WATCH_MODES = frozenset(
+    {PROJECT_WATCH_MODE_NEW_THREADS, PROJECT_WATCH_MODE_EXISTING_WORKING}
+)
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -782,6 +787,15 @@ class WatchdogProjectStore:
                         "name": str(raw.get("name") or project_id),
                         "selected_at": str(raw.get("selected_at") or ""),
                         "initialized": bool(raw.get("initialized")),
+                        "watch_mode": (
+                            str(raw.get("watch_mode") or PROJECT_WATCH_MODE_NEW_THREADS)
+                            if str(raw.get("watch_mode") or PROJECT_WATCH_MODE_NEW_THREADS)
+                            in PROJECT_WATCH_MODES
+                            else PROJECT_WATCH_MODE_NEW_THREADS
+                        ),
+                        "existing_working_initialized": bool(
+                            raw.get("existing_working_initialized")
+                        ),
                         "seen_thread_count": len(seen) if isinstance(seen, list) else 0,
                         "last_scan_at": str(raw.get("last_scan_at") or ""),
                         "last_error": str(raw.get("last_error") or ""),
@@ -801,7 +815,16 @@ class WatchdogProjectStore:
                 result.append({"project_id": project_id, **dict(raw)})
             return result
 
-    def select(self, project_id: str, *, name: str, seen_thread_ids: list[str]) -> None:
+    def select(
+        self,
+        project_id: str,
+        *,
+        name: str,
+        seen_thread_ids: list[str],
+        watch_mode: str = PROJECT_WATCH_MODE_NEW_THREADS,
+    ) -> None:
+        if watch_mode not in PROJECT_WATCH_MODES:
+            raise ValueError("watch_mode must be new_threads_only or existing_working")
         with self._lock:
             payload = self._load_unlocked()
             projects = payload["projects"]
@@ -809,6 +832,9 @@ class WatchdogProjectStore:
                 current = dict(projects[project_id]) if isinstance(projects[project_id], dict) else {}
                 if name:
                     current["name"] = name[:200]
+                current.setdefault("watch_mode", PROJECT_WATCH_MODE_NEW_THREADS)
+                current.setdefault("existing_working_initialized", False)
+                current.setdefault("checked_thread_fingerprints", {})
                 projects[project_id] = current
                 self._write_unlocked(payload)
                 return
@@ -818,11 +844,30 @@ class WatchdogProjectStore:
                 "name": (name or project_id)[:200],
                 "selected_at": _utc_now(),
                 "initialized": True,
+                "watch_mode": watch_mode,
+                "existing_working_initialized": False,
+                "checked_thread_fingerprints": {},
                 "seen_thread_ids": sorted(set(seen_thread_ids)),
                 "last_scan_at": _utc_now(),
                 "last_error": "",
                 "last_new_thread_ids": [],
             }
+            self._write_unlocked(payload)
+
+    def set_mode(self, project_id: str, watch_mode: str) -> None:
+        if watch_mode not in PROJECT_WATCH_MODES:
+            raise ValueError("watch_mode must be new_threads_only or existing_working")
+        with self._lock:
+            payload = self._load_unlocked()
+            raw = payload["projects"].get(project_id)
+            if not isinstance(raw, dict):
+                raise ValueError("watchdog project was not found")
+            previous = str(raw.get("watch_mode") or PROJECT_WATCH_MODE_NEW_THREADS)
+            raw["watch_mode"] = watch_mode
+            if watch_mode == PROJECT_WATCH_MODE_EXISTING_WORKING and previous != watch_mode:
+                raw["existing_working_initialized"] = False
+                raw["checked_thread_fingerprints"] = {}
+            payload["projects"][project_id] = raw
             self._write_unlocked(payload)
 
     def remove(self, project_id: str) -> bool:
@@ -840,6 +885,8 @@ class WatchdogProjectStore:
         observed_thread_ids: list[str],
         new_thread_ids: list[str],
         error: str = "",
+        checked_thread_fingerprints: dict[str, str] | None = None,
+        existing_working_initialized: bool | None = None,
     ) -> None:
         with self._lock:
             payload = self._load_unlocked()
@@ -848,13 +895,26 @@ class WatchdogProjectStore:
                 return
             seen = {str(item) for item in raw.get("seen_thread_ids", []) if str(item)}
             seen.update(observed_thread_ids)
+            checked = raw.get("checked_thread_fingerprints")
+            checked = dict(checked) if isinstance(checked, dict) else {}
+            if checked_thread_fingerprints:
+                checked.update(
+                    {
+                        str(conversation_id): str(fingerprint)
+                        for conversation_id, fingerprint in checked_thread_fingerprints.items()
+                        if str(conversation_id) and str(fingerprint)
+                    }
+                )
             raw.update(
                 initialized=True,
                 seen_thread_ids=sorted(seen),
+                checked_thread_fingerprints=checked,
                 last_scan_at=_utc_now(),
                 last_error=error,
                 last_new_thread_ids=list(new_thread_ids),
             )
+            if existing_working_initialized is not None:
+                raw["existing_working_initialized"] = bool(existing_working_initialized)
             payload["projects"][project_id] = raw
             self._write_unlocked(payload)
 
@@ -1463,13 +1523,39 @@ class ChatWatchdog:
             cursor = next_cursor
         return items, requests
 
-    async def select_project(self, project_id: str, *, name: str = "") -> dict[str, Any]:
+    @staticmethod
+    def _project_thread_fingerprint(item: dict[str, Any]) -> str:
+        payload = {
+            "current_node": str(item.get("current_node") or ""),
+            "update_time": item.get("update_time")
+            if isinstance(item.get("update_time"), (int, float))
+            else None,
+            "archived": bool(item.get("archived")),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    async def select_project(
+        self,
+        project_id: str,
+        *,
+        name: str = "",
+        watch_mode: str = PROJECT_WATCH_MODE_NEW_THREADS,
+    ) -> dict[str, Any]:
         normalized = project_id.strip()
         if PROJECT_ID_RE.fullmatch(normalized) is None:
             raise ValueError("project_id must be a valid ChatGPT Project id")
+        if watch_mode not in PROJECT_WATCH_MODES:
+            raise ValueError("watch_mode must be new_threads_only or existing_working")
         existing = {item["project_id"]: item for item in self.projects.snapshot()["items"]}
         if normalized in existing:
-            self.projects.select(normalized, name=name, seen_thread_ids=[])
+            self.projects.select(
+                normalized,
+                name=name,
+                seen_thread_ids=[],
+                watch_mode=watch_mode,
+            )
             return self.snapshot()
         if self._uses_managed_runtime:
             await self.ensure_background_runtime()
@@ -1480,7 +1566,12 @@ class ChatWatchdog:
             for item in items
             if CONVERSATION_ID_RE.fullmatch(str(item.get("conversation_id") or ""))
         ]
-        self.projects.select(normalized, name=name, seen_thread_ids=baseline)
+        self.projects.select(
+            normalized,
+            name=name,
+            seen_thread_ids=baseline,
+            watch_mode=watch_mode,
+        )
         self._runtime["project_baseline"] = {
             "at": _utc_now(),
             "project_id": normalized,
@@ -1489,13 +1580,29 @@ class ChatWatchdog:
         }
         return self.snapshot()
 
+    def set_project_mode(self, project_id: str, watch_mode: str) -> dict[str, Any]:
+        normalized = project_id.strip()
+        if PROJECT_ID_RE.fullmatch(normalized) is None:
+            raise ValueError("project_id must be a valid ChatGPT Project id")
+        self.projects.set_mode(normalized, watch_mode)
+        self.wake()
+        return self.snapshot()
+
     def remove_project(self, project_id: str) -> bool:
         return self.projects.remove(project_id.strip())
 
-    async def _discover_selected_project_threads(self, adapter: ChatAdapter) -> list[str]:
+    async def _discover_selected_project_threads(
+        self,
+        adapter: ChatAdapter,
+    ) -> tuple[list[str], dict[str, ThreadSnapshot]]:
         records = self.projects.records()
         added_all: list[str] = []
-        requests = 0
+        new_added_ids: list[str] = []
+        existing_added_ids: list[str] = []
+        preloaded_snapshots: dict[str, ThreadSnapshot] = {}
+        list_requests = 0
+        inspect_requests = 0
+        existing_checked = 0
         failures = 0
         queued_entries, _ = self.queue.entries()
         queued_ids = {item.conversation_id for item in queued_entries}
@@ -1509,21 +1616,89 @@ class ChatWatchdog:
                     for item in project.get("seen_thread_ids", [])
                     if str(item)
                 }
+                watch_mode = str(
+                    project.get("watch_mode") or PROJECT_WATCH_MODE_NEW_THREADS
+                )
+                if watch_mode not in PROJECT_WATCH_MODES:
+                    watch_mode = PROJECT_WATCH_MODE_NEW_THREADS
+                include_existing = watch_mode == PROJECT_WATCH_MODE_EXISTING_WORKING
+                existing_initialized = bool(project.get("existing_working_initialized"))
+                full_existing_scan = include_existing and not existing_initialized
                 items, project_requests = await self._project_thread_pages(
                     adapter,
                     project_id,
-                    stop_after_seen=seen if project.get("initialized") else None,
+                    stop_after_seen=(
+                        None
+                        if full_existing_scan
+                        else seen if project.get("initialized") else None
+                    ),
                 )
-                requests += project_requests
+                list_requests += project_requests
                 current_ids: list[str] = []
-                unseen: list[tuple[str, str]] = []
+                unseen: list[tuple[str, str, str]] = []
+                checked = project.get("checked_thread_fingerprints")
+                checked = dict(checked) if isinstance(checked, dict) else {}
+                checked_updates: dict[str, str] = {}
+                inspection_failures = 0
+                added_here: list[str] = []
+                discovered_here: list[str] = []
+
                 for item in items:
                     conversation_id = str(item.get("conversation_id") or "").lower()
                     if CONVERSATION_ID_RE.fullmatch(conversation_id) is None:
                         continue
                     current_ids.append(conversation_id)
-                    if conversation_id not in seen and not item.get("archived"):
-                        unseen.append((conversation_id, str(item.get("title") or "")))
+                    title = str(item.get("title") or "")
+                    archived = bool(item.get("archived"))
+                    fingerprint = self._project_thread_fingerprint(item)
+
+                    if conversation_id not in seen and not archived:
+                        unseen.append((conversation_id, title, fingerprint))
+                        continue
+
+                    if not include_existing:
+                        continue
+                    if conversation_id in queued_ids:
+                        checked_updates[conversation_id] = fingerprint
+                        continue
+                    if archived:
+                        checked_updates[conversation_id] = fingerprint
+                        continue
+                    if not full_existing_scan and checked.get(conversation_id) == fingerprint:
+                        continue
+
+                    link = parse_chat_link(
+                        f"https://chatgpt.com/g/{project_id}/c/{conversation_id}"
+                    )
+                    try:
+                        inspect_requests += 1
+                        snapshot = await adapter.inspect(link)
+                    except Exception:
+                        inspection_failures += 1
+                        continue
+                    existing_checked += 1
+                    if not snapshot.found or not snapshot.state_verified:
+                        inspection_failures += 1
+                        continue
+                    checked_updates[conversation_id] = fingerprint
+                    if not (snapshot.running or snapshot.active_stream):
+                        continue
+
+                    self.queue.add(link.url)
+                    self.state.start_task(
+                        link,
+                        source=f"project-watch-existing:{project_id}",
+                    )
+                    self.state.update(
+                        conversation_id,
+                        title=snapshot.title or title,
+                        auto_project_id=project_id,
+                        auto_project_mode=PROJECT_WATCH_MODE_EXISTING_WORKING,
+                    )
+                    queued_ids.add(conversation_id)
+                    added_here.append(conversation_id)
+                    preloaded_snapshots[conversation_id] = snapshot
+                    existing_added_ids.append(conversation_id)
 
                 if not project.get("initialized"):
                     self.projects.record_scan(
@@ -1533,9 +1708,7 @@ class ChatWatchdog:
                     )
                     continue
 
-                added_here: list[str] = []
-                discovered_here: list[str] = []
-                for conversation_id, title in unseen:
+                for conversation_id, title, fingerprint in unseen:
                     discovered_here.append(conversation_id)
                     if conversation_id in queued_ids:
                         continue
@@ -1548,13 +1721,28 @@ class ChatWatchdog:
                         conversation_id,
                         title=title,
                         auto_project_id=project_id,
+                        auto_project_mode=watch_mode,
                     )
                     queued_ids.add(conversation_id)
                     added_here.append(conversation_id)
+                    new_added_ids.append(conversation_id)
+                    if include_existing:
+                        checked_updates[conversation_id] = fingerprint
+
+                project_error = (
+                    f"could not verify {inspection_failures} existing thread(s)"
+                    if inspection_failures
+                    else ""
+                )
                 self.projects.record_scan(
                     project_id,
                     observed_thread_ids=current_ids,
                     new_thread_ids=discovered_here,
+                    error=project_error,
+                    checked_thread_fingerprints=checked_updates,
+                    existing_working_initialized=(
+                        True if full_existing_scan else None
+                    ),
                 )
                 added_all.extend(added_here)
             except Exception as exc:
@@ -1568,12 +1756,18 @@ class ChatWatchdog:
         self._runtime["project_scan"] = {
             "at": _utc_now(),
             "selected_projects": len(records),
-            "physical_list_requests": requests,
-            "new_threads_added": len(added_all),
+            "physical_list_requests": list_requests,
+            "physical_existing_inspect_requests": inspect_requests,
+            "existing_threads_checked": existing_checked,
+            "existing_working_threads_added": len(existing_added_ids),
+            "existing_working_thread_ids": existing_added_ids,
+            "new_threads_added": len(new_added_ids),
+            "new_thread_ids": new_added_ids,
+            "threads_added": len(added_all),
+            "added_thread_ids": added_all,
             "failed_projects": failures,
-            "new_thread_ids": added_all,
         }
-        return added_all
+        return added_all, preloaded_snapshots
 
     def _reconcile_tasks(self, entries: list[ChatLink], *, source: str) -> None:
         """Synchronize persistent task generations with the editable URL file."""
@@ -1938,7 +2132,9 @@ class ChatWatchdog:
                                     last_checked_at=_utc_now(),
                                 )
                         else:
-                            await self._discover_selected_project_threads(adapter)
+                            _, project_snapshots = await self._discover_selected_project_threads(
+                                adapter
+                            )
                             entries, discovered_invalid = await asyncio.to_thread(self.queue.entries)
                             self._reconcile_tasks(entries, source=f"scan:{trigger}")
                             if discovered_invalid and not self._runtime.get("last_error"):
@@ -1964,7 +2160,11 @@ class ChatWatchdog:
                             candidates: list[tuple[float, int, ContinuationCandidate]] = []
                             owned_stream_active = False
                             for position, link in enumerate(entries):
-                                observation = await self._process_link(adapter, link)
+                                observation = await self._process_link(
+                                    adapter,
+                                    link,
+                                    snapshot=project_snapshots.get(link.conversation_id),
+                                )
                                 owned_stream_active = (
                                     owned_stream_active or observation.owned_stream_active
                                 )
@@ -2088,22 +2288,25 @@ class ChatWatchdog:
         self,
         adapter: ChatAdapter,
         link: ChatLink,
+        *,
+        snapshot: ThreadSnapshot | None = None,
     ) -> LinkObservation:
         """Inspect one queued thread and return a write candidate without sending."""
         now = self.clock()
         previous = self.state.get(link.conversation_id)
-        try:
-            snapshot = await adapter.inspect(link)
-        except Exception as exc:
-            failure = classify_runtime_error(exc)
-            self.state.update(
-                link.conversation_id,
-                url=link.url,
-                status=failure.state.value,
-                last_error=failure.reason,
-                last_checked_at=_utc_now(),
-            )
-            return LinkObservation()
+        if snapshot is None:
+            try:
+                snapshot = await adapter.inspect(link)
+            except Exception as exc:
+                failure = classify_runtime_error(exc)
+                self.state.update(
+                    link.conversation_id,
+                    url=link.url,
+                    status=failure.state.value,
+                    last_error=failure.reason,
+                    last_checked_at=_utc_now(),
+                )
+                return LinkObservation()
 
         common = self._snapshot_state(link, snapshot, previous, now=now)
         if not snapshot.found:
