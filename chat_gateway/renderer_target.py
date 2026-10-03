@@ -22,7 +22,19 @@ def _is_auxiliary_target(url: str) -> bool:
     query = parse_qs(parsed.query)
     if "/avatar-overlay" in query.get("initialRoute", []):
         return True
-    return "avatar-overlay-composition-surface" in parsed.path
+    return (
+        "avatar-overlay-composition-surface" in parsed.path
+        or parsed.path.endswith("/detached-window.html")
+    )
+
+
+def _is_official_chatgpt_renderer(url: str) -> bool:
+    parsed = urlsplit(url)
+    return (
+        parsed.scheme == "app"
+        and parsed.netloc == "-"
+        and parsed.path == "/index.html"
+    )
 
 
 def select_main_renderer_target(
@@ -33,20 +45,21 @@ def select_main_renderer_target(
     for item in pages:
         url = str(item.get("url", ""))
         parsed = urlsplit(url)
-        is_renderer = (
+        is_legacy_renderer = (
             parsed.scheme in {"http", "https"}
             and parsed.hostname in {"127.0.0.1", "localhost"}
             and parsed.port == expected_webview_port
         )
+        is_renderer = is_legacy_renderer or _is_official_chatgpt_renderer(url)
         if is_renderer and not _is_auxiliary_target(url):
             candidates.append(item)
     if not candidates:
         if pages:
             raise RendererTargetError(
-                "Codex is running, but only auxiliary renderers are available; "
+                "ChatGPT is running, but only auxiliary renderers are available; "
                 "open the main app window"
             )
-        raise RendererTargetError("Codex is running, but no renderer page is available")
+        raise RendererTargetError("ChatGPT is running, but no renderer page is available")
 
     def rank(item: dict[str, Any]) -> tuple[int, int, str]:
         url = str(item.get("url", ""))

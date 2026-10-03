@@ -412,6 +412,8 @@ class ChatGateway:
         with self.ledger.transaction(immediate=True) as connection:
             self.ledger.recover_expired_claims(connection, now)
             candidates = self.ledger.due_operations(connection, now)
+            if self._repair_orphaned_recovery_probe(connection, candidates, now):
+                candidates = self.ledger.due_operations(connection, now)
             for operation in candidates:
                 if operation.type is OperationType.PROJECT_LIST:
                     project_id = str(operation.payload["project_id"])
@@ -1285,8 +1287,37 @@ class ChatGateway:
             payload=payload,
             due_at=due_at,
             max_attempts=self.config.retry.maximum_attempts,
-            agent_id=failed_operation.agent_id,
+            agent_id=None,
         )
+
+    def _repair_orphaned_recovery_probe(
+        self,
+        connection: sqlite3.Connection,
+        candidates: Sequence[OperationRecord],
+        now: float,
+    ) -> bool:
+        """Recreate a due probe when shared circuit recovery lost its owner."""
+        for operation in candidates:
+            if operation.type is OperationType.RECOVERY_PROBE:
+                continue
+
+            for scope in (RUNTIME_CIRCUIT_SCOPE, scope_for_lane(operation.lane)):
+                circuit = self.ledger.get_circuit(connection, scope=scope, now=now)
+                if (
+                    circuit.state is CircuitState.OPEN
+                    and circuit.retry_at is not None
+                    and now >= circuit.retry_at
+                ):
+                    self._ensure_recovery_probe(
+                        connection,
+                        scope=scope,
+                        failed_operation=operation,
+                        due_at=now,
+                        now=now,
+                        generation=now,
+                    )
+                    return True
+        return False
 
     def _schedule_next_recovery_probe(
         self,
@@ -1325,7 +1356,7 @@ class ChatGateway:
             payload=payload,
             due_at=due_at,
             max_attempts=self.config.retry.maximum_attempts,
-            agent_id=previous_probe.agent_id,
+            agent_id=None,
         )
 
     def _probe_payload(

@@ -21,6 +21,9 @@ from chat_internal_client import (
 )
 
 
+DIRECT_WORKER_STREAM_LIMIT = 16 * 1024 * 1024
+
+
 class DirectChatTransport:
     """Lazy JSON-lines bridge to a Node worker owned by this MCP process."""
 
@@ -44,6 +47,7 @@ class DirectChatTransport:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                limit=DIRECT_WORKER_STREAM_LIMIT,
                 start_new_session=False,
             )
         except (OSError, ValueError) as exc:

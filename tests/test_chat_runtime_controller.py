@@ -6,6 +6,21 @@ import pytest
 from chat_runtime_controller import ChatRuntimeController, ChatRuntimeControllerConfig
 
 
+def test_official_chatgpt_embedded_renderer_is_valid_and_skips_http_probe():
+    config = ChatRuntimeControllerConfig(webview_url="app://-/index.html")
+    config.validate()
+    controller = ChatRuntimeController(config)
+
+    result = asyncio.run(controller._webview_health())
+
+    assert result == {
+        "ready": True,
+        "status_code": None,
+        "reason": "",
+        "transport": "embedded",
+    }
+
+
 def test_user_stop_inhibits_automatic_runtime_recovery(tmp_path):
     inhibit_path = tmp_path / "user-stopped"
     inhibit_path.touch()

@@ -334,7 +334,7 @@ def test_commands_are_delivered_before_unrelated_agent_monitoring(tmp_path):
     asyncio.run(run())
 
 
-def test_auto_resume_queues_parent_update_and_waits_for_parent_terminal(tmp_path):
+def test_auto_resume_suppresses_observed_progress_updates(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service, parent, child = await make_parent_and_child(
@@ -348,16 +348,27 @@ def test_auto_resume_queues_parent_update_and_waits_for_parent_terminal(tmp_path
         result = await service.sync_once()
         assert result["write_count"] == 0
         parent_status = await service.status(parent["agent_id"])
-        assert parent_status["mailbox"]["queued"] >= 1
+        assert parent_status["mailbox"].get("queued", 0) == 0
 
         waited = await service.wait(child_id)
         assert waited["events"]
 
         runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
         result = await service.sync_once()
-        assert result["write_count"] == 1
-        assert runtime.continue_calls[0][0] == "parent-chat"
-        assert "[SUBAGENT UPDATE]" in runtime.continue_calls[0][1]
+        assert result["write_count"] == 0
+        assert runtime.continue_calls == []
+
+        with service.repository.connect() as db:
+            latest_event_seq = db.execute(
+                "SELECT MAX(event_seq) FROM events WHERE agent_id=?",
+                (child_id,),
+            ).fetchone()[0]
+            acked_event_seq = db.execute(
+                "SELECT last_acked_event_seq FROM subscriptions "
+                "WHERE parent_agent_id=? AND child_agent_id=?",
+                (parent["agent_id"], child_id),
+            ).fetchone()[0]
+        assert int(acked_event_seq) == int(latest_event_seq)
 
     asyncio.run(run())
 
@@ -508,7 +519,7 @@ def test_uncertain_delivery_is_not_retried_and_later_command_runs(tmp_path):
     asyncio.run(run())
 
 
-def test_auto_resume_batches_events_and_acks_only_after_delivery(tmp_path):
+def test_auto_resume_suppresses_and_acks_multiple_observed_progress_events(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service, parent, child = await make_parent_and_child(
@@ -524,7 +535,7 @@ def test_auto_resume_batches_events_and_acks_only_after_delivery(tmp_path):
         )
         await service.sync_once()
         parent_status = await service.status(parent["agent_id"] )
-        assert parent_status["mailbox"]["queued"] == 1
+        assert parent_status["mailbox"].get("queued", 0) == 0
 
         events = (await service.wait(child_id))["events"]
         last_seq = max(event["event_seq"] for event in events)
@@ -533,9 +544,8 @@ def test_auto_resume_batches_events_and_acks_only_after_delivery(tmp_path):
 
         runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
         delivered = await service.sync_once()
-        assert delivered["write_count"] == 1
-        assert "evt-1" in runtime.continue_calls[-1][1]
-        assert "evt-2" in runtime.continue_calls[-1][1]
+        assert delivered["write_count"] == 0
+        assert runtime.continue_calls == []
         with service.repository.connect() as db:
             acked = db.execute(
                 "SELECT last_acked_event_seq FROM subscriptions "
@@ -624,7 +634,7 @@ def test_background_service_does_not_open_runtime_without_pending_work(tmp_path)
     assert result == {"status": "idle", "write_count": 0, "inspected": []}
 
 
-def test_manual_ack_cancels_queued_parent_notification(tmp_path):
+def test_manual_ack_after_suppressed_progress_is_idempotent(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service, parent, child = await make_parent_and_child(
@@ -642,7 +652,7 @@ def test_manual_ack_cancels_queued_parent_notification(tmp_path):
         last_seq = max(event["event_seq"] for event in events)
         await service.ack(parent["agent_id"], child_id, last_seq)
         parent_status = await service.status(parent["agent_id"] )
-        assert parent_status["mailbox"]["acknowledged"] == 1
+        assert parent_status["mailbox"].get("acknowledged", 0) == 0
 
         runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
         result = await service.sync_once()
@@ -1109,16 +1119,19 @@ def test_cancelling_parent_drops_and_acks_queued_child_notifications(tmp_path):
     asyncio.run(run())
 
 
-def test_uncertain_parent_notification_reconciles_from_side_branch(tmp_path):
+def test_explicit_child_update_reconciles_from_parent_side_branch(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service, parent, child = await make_parent_and_child(
             tmp_path, runtime, notification_policy="auto_resume"
         )
         child_id = child["agent"]["agent_id"]
-        runtime.context_events["child-chat-1"] = [
-            {"cursor": "progress-1", "kind": "progress", "summary": "working"}
-        ]
+        command = await service.send(
+            child_id,
+            parent["agent_id"],
+            "working",
+            idempotency_key="explicit-child-progress",
+        )
         runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
         runtime.continue_results["parent-chat"] = {
             "sent": True,
@@ -1165,7 +1178,7 @@ def test_uncertain_parent_notification_reconciles_from_side_branch(tmp_path):
                 (parent["agent_id"], child_id),
             ).fetchone()[0]
         assert status == "delivered"
-        assert int(acked) == int(command["ack_event_seq"])
+        assert int(acked) == 0
         assert len(runtime.continue_calls) == 1
 
     asyncio.run(run())
@@ -1223,7 +1236,7 @@ def test_restart_preserves_send_evidence_and_reconciles_without_resend(tmp_path)
     asyncio.run(run())
 
 
-def test_completion_supersedes_uncertain_progress_and_drains_cursor(tmp_path):
+def test_completion_after_suppressed_progress_drains_cursor(tmp_path):
     async def run():
         runtime = FakeRuntime()
         service, parent, child = await make_parent_and_child(
@@ -1237,25 +1250,15 @@ def test_completion_supersedes_uncertain_progress_and_drains_cursor(tmp_path):
             {"cursor": "progress-1", "kind": "progress", "summary": "working"}
         ]
         runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
-        runtime.continue_results["parent-chat"] = {
-            "sent": True,
-            "observed": False,
-            "running": True,
-            "reason": "confirmation timed out",
-            "user_message_id": "uncertain-progress-message",
-            "parent_message_id": "a-parent-chat",
-        }
         await service.sync_once()
 
         with service.repository.connect() as db:
-            progress = dict(
-                db.execute(
-                    "SELECT * FROM commands WHERE from_agent_id=? AND to_agent_id=? "
-                    "AND purpose='progress'",
-                    (child_id, parent["agent_id"]),
-                ).fetchone()
-            )
-        assert progress["status"] == "delivery_uncertain"
+            progress_count = db.execute(
+                "SELECT COUNT(*) FROM commands WHERE from_agent_id=? AND to_agent_id=? "
+                "AND purpose='progress'",
+                (child_id, parent["agent_id"]),
+            ).fetchone()[0]
+        assert progress_count == 0
 
         runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
         runtime.snapshots["child-chat-1"] = terminal_snapshot(
@@ -1288,11 +1291,10 @@ def test_completion_supersedes_uncertain_progress_and_drains_cursor(tmp_path):
                     (parent["agent_id"], child_id),
                 ).fetchone()[0]
             )
-        assert [row["purpose"] for row in rows] == ["progress", "completion"]
-        assert rows[0]["status"] == "superseded"
-        assert rows[1]["status"] == "delivered"
-        assert acked == int(rows[1]["ack_event_seq"])
-        assert '"kind":"completed"' in rows[1]["message"]
+        assert [row["purpose"] for row in rows] == ["completion"]
+        assert rows[0]["status"] == "delivered"
+        assert acked == int(rows[0]["ack_event_seq"])
+        assert '"kind":"completed"' in rows[0]["message"]
 
         runtime.snapshots["parent-chat"] = terminal_snapshot("parent-chat")
         third = await service.sync_once()
@@ -1304,7 +1306,7 @@ def test_completion_supersedes_uncertain_progress_and_drains_cursor(tmp_path):
                 (child_id, parent["agent_id"]),
             ).fetchone()[0]
         assert completion_count == 1
-        assert len(runtime.continue_calls) == 2
+        assert len(runtime.continue_calls) == 1
 
     asyncio.run(run())
 

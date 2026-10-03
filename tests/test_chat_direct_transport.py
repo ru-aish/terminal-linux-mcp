@@ -94,6 +94,30 @@ def test_fresh_stored_auth_works_without_invoking_refresh_helper(tmp_path, monke
         server.server_close()
 
 
+def test_worker_response_can_exceed_asyncio_default_line_limit(tmp_path) -> None:
+    worker = tmp_path / "worker.mjs"
+    worker.write_text(
+        """
+import {createInterface} from 'node:readline';
+const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
+lines.on('line', line => {
+  const value=JSON.parse(line);
+  process.stdout.write(JSON.stringify({id:value.id,ok:true,result:{payload:'x'.repeat(128*1024)}})+'\\n');
+});
+"""
+    )
+
+    async def scenario() -> None:
+        transport = DirectChatTransport(worker_path=worker, timeout=5)
+        try:
+            result = await transport.request("get_thread", conversation_id="large-thread")
+            assert len(result["payload"]) == 128 * 1024
+        finally:
+            await transport.close()
+
+    asyncio.run(scenario())
+
+
 def test_read_recovers_after_owned_worker_dies(tmp_path) -> None:
     worker = tmp_path / "worker.mjs"
     worker.write_text(

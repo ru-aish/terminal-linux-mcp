@@ -25,6 +25,7 @@ from chat_watchdog import (
     classify_runtime_error,
     classify_thread_state,
     desktop_launch_environment,
+    model_options_from_payload,
     select_model_option,
     QueueConflictError,
     RefreshResult,
@@ -1428,6 +1429,29 @@ def test_model_policy_selects_compatible_reasoning_without_downgrade():
             thinking_effort="extended",
             require_high_reasoning=True,
         )
+
+
+def test_model_catalog_normalizes_object_and_string_thinking_efforts():
+    options = model_options_from_payload(
+        {
+            "models": [
+                {
+                    "slug": "gpt-5-6-thinking",
+                    "thinking_efforts": [
+                        {"thinking_effort": "standard"},
+                        {"thinking_effort": "extended"},
+                    ],
+                },
+                {
+                    "slug": "legacy-model",
+                    "thinking_efforts": ["standard", "high"],
+                },
+            ]
+        }
+    )
+
+    assert options[0].thinking_efforts == ("standard", "extended")
+    assert options[1].thinking_efforts == ("standard", "high")
 
 
 def test_default_adapter_is_direct_and_ui_adapters_are_rejected(tmp_path):

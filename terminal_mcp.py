@@ -31,8 +31,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from gpt_thread_store import GPTThreadStore
 from usage_dashboard import install_usage_dashboard
 from chat_watchdog import ChatWatchdog, ChatWatchdogConfig, install_chat_watchdog_lifespan, parse_chat_link
-from chat_internal_client import sanitize_runtime_error
-from chat_direct_client import DirectChatClient, DirectChatRuntimeController
+from chat_internal_client import InternalChatClient, sanitize_runtime_error
+from chat_runtime_controller import ChatRuntimeController
 from chat_agent_orchestrator import (
     DEFAULT_AGENT_COMPLETION_MARKER,
     ChatAgentCoordinator,
@@ -42,9 +42,9 @@ from chat_agent_orchestrator import (
 )
 from gateway_agent_orchestrator import GatewayChatAgentCoordinator
 from chat_gateway import ChatGateway, GatewayConfig, SQLiteLedger
-from chat_gateway.adapters.direct_chatgpt import (
+from chat_gateway.adapters.codex_renderer import (
     DEFAULT_HIGH_REASONING_MODEL,
-    DirectChatGPTBackend,
+    CodexRendererBackend,
 )
 from process_completion_bot import read_process_start_ticks
 
@@ -111,14 +111,14 @@ CHAT_AGENT_STALE_SECONDS = max(
 _CHAT_AGENT_COORDINATOR: ChatAgentCoordinator | None = None
 _CHAT_AGENT_SERVICE: ChatAgentService | None = None
 _CHAT_GATEWAY: ChatGateway | None = None
-_CHAT_RUNTIME_CONTROLLER: DirectChatRuntimeController | None = None
+_CHAT_RUNTIME_CONTROLLER: ChatRuntimeController | None = None
 _CHAT_AGENT_RUNTIME_ENSURE: Callable[[], Awaitable[Any]] | None = None
 
 
-def get_chat_runtime_controller() -> DirectChatRuntimeController:
+def get_chat_runtime_controller() -> ChatRuntimeController:
     global _CHAT_RUNTIME_CONTROLLER
     if _CHAT_RUNTIME_CONTROLLER is None:
-        _CHAT_RUNTIME_CONTROLLER = DirectChatRuntimeController()
+        _CHAT_RUNTIME_CONTROLLER = ChatRuntimeController()
     return _CHAT_RUNTIME_CONTROLLER
 
 
@@ -133,10 +133,36 @@ def set_chat_agent_runtime_ensure(
 async def _chat_agent_runtime_factory():
     if _CHAT_AGENT_RUNTIME_ENSURE is not None:
         await _CHAT_AGENT_RUNTIME_ENSURE()
-    async with DirectChatClient(
+    async with InternalChatClient(
+        endpoint=os.environ.get(
+            "MCP_CHAT_WATCHDOG_CDP", "http://127.0.0.1:9222"
+        ),
+        timeout=max(
+            1.0,
+            float(
+                os.environ.get(
+                    "MCP_CHAT_WATCHDOG_INTERNAL_TIMEOUT_SECONDS", "90"
+                )
+            ),
+        ),
+        stream_timeout_seconds=max(
+            30,
+            int(
+                os.environ.get(
+                    "MCP_CHAT_WATCHDOG_STREAM_TIMEOUT_SECONDS", "3600"
+                )
+            ),
+        ),
         preferred_model=os.environ.get("MCP_CHAT_WATCHDOG_MODEL", ""),
-        thinking_effort=os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
-        require_high_reasoning=os.environ.get("MCP_CHAT_WATCHDOG_REQUIRE_HIGH", "1").strip().lower() not in {"0", "false", "no", "off"},
+        thinking_effort=os.environ.get(
+            "MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"
+        ),
+        require_high_reasoning=os.environ.get(
+            "MCP_CHAT_WATCHDOG_REQUIRE_HIGH", "1"
+        )
+        .strip()
+        .lower()
+        not in {"0", "false", "no", "off"},
     ) as runtime:
         yield runtime
 
@@ -148,12 +174,23 @@ def get_chat_gateway() -> ChatGateway:
             database_path=str(CHAT_GATEWAY_DB_PATH),
             maximum_active_agents=max(64, CHAT_AGENT_MAX_ACTIVE_CHILDREN + 8),
         )
-        backend = DirectChatGPTBackend(
+        backend = CodexRendererBackend(
+            cdp_endpoint=os.environ.get(
+                "CHAT_GATEWAY_CDP_ENDPOINT",
+                os.environ.get(
+                    "MCP_CHAT_WATCHDOG_CDP", "http://127.0.0.1:9222"
+                ),
+            ),
             model_slug=os.environ.get(
                 "CHAT_GATEWAY_MODEL_SLUG",
                 os.environ.get("MCP_CHAT_WATCHDOG_MODEL", DEFAULT_HIGH_REASONING_MODEL),
             )
             or DEFAULT_HIGH_REASONING_MODEL,
+            stream_start_timeout=float(
+                os.environ.get("CHAT_GATEWAY_STREAM_START_TIMEOUT", "30")
+            ),
+            cdp_timeout=float(os.environ.get("CHAT_GATEWAY_CDP_TIMEOUT", "45")),
+            webview_port=int(os.environ.get("CHAT_GATEWAY_WEBVIEW_PORT", "5175")),
             thinking_effort=os.environ.get(
                 "CHAT_GATEWAY_THINKING_EFFORT",
                 os.environ.get("MCP_CHAT_WATCHDOG_THINKING_EFFORT", "extended"),
@@ -1342,6 +1379,9 @@ def _mcp_config_files(root: Path) -> list[Path]:
         root / ".mcp.json",
         root / "mcp.json",
         root / ".vscode" / "mcp.json",
+        # Terminal MCP owns this final override. Disabled entries here hide
+        # inherited Codex/Gemini servers without changing those clients.
+        _gpt_home() / "mcp.json",
     ]
     seen: set[Path] = set()
     return [item.resolve() for item in candidates if item.is_file() and not (item.resolve() in seen or seen.add(item.resolve()))]

@@ -36,6 +36,23 @@ const clientShape = (value) => {
     && typeof value.models === 'function'
     && typeof value.startCompletionStream === 'function';
 };
+const requestClientShape = (value) => {
+  if (!objectLike(value)) return false;
+  const names = methodNames(value);
+  return ['safeGet', 'safePost', 'safeDelete', 'streamPost'].every((name) => names.has(name))
+    && typeof value.safeGet === 'function'
+    && typeof value.safePost === 'function'
+    && typeof value.safeDelete === 'function'
+    && typeof value.streamPost === 'function';
+};
+const completionClientShape = (value) => objectLike(value)
+  && typeof value.startCompletionStream === 'function'
+  && typeof value.stopCompletion === 'function'
+  && typeof value.cancelStream === 'function';
+const atomShape = (value) => objectLike(value)
+  && Object.prototype.hasOwnProperty.call(value, 'cache')
+  && Object.prototype.hasOwnProperty.call(value, 'resolve')
+  && Object.prototype.hasOwnProperty.call(value, 'scope');
 const containerShape = (value) => objectLike(value)
   && typeof value.get === 'function'
   && typeof value.set === 'function'
@@ -91,6 +108,57 @@ const priority = (url) => {
   if (value.includes('app-main') || value.includes('artifact-tab')) return 2;
   return 3;
 };
+const modernClient = (requestClient, completionClient) => ({
+  get: (conversationId) => requestClient.safeGet('/conversation/{conversation_id}', {
+    parameters:{path:{conversation_id:conversationId}},
+  }),
+  delete: (conversationId) => requestClient.safeDelete('/conversation/id/{conversation_id}', {
+    parameters:{path:{conversation_id:conversationId}},
+  }),
+  list: ({offset=0, limit=20, order='updated'}={}) => requestClient.safeGet('/conversations', {
+    parameters:{query:{offset,limit,order}},
+  }),
+  models: () => requestClient.safeGet('/models', {
+    parameters:{query:{iim:false,include_icons:false}},
+  }),
+  listProjects: ({limit=20,cursor=null,ownedOnly=true,conversationsPerProject=0}={}) => requestClient.safeGet('/gizmos/snorlax/sidebar', {
+    parameters:{query:{
+      conversations_per_gizmo:conversationsPerProject,
+      limit,
+      owned_only:ownedOnly,
+      ...(cursor?{cursor}:{}),
+    }},
+  }),
+  getProject: (projectId) => requestClient.safeGet('/gizmos/{gizmo_id}', {
+    parameters:{path:{gizmo_id:projectId}},
+  }),
+  listProjectConversations: ({projectId,limit=20,cursor=null,ownedOnly=true}={}) => requestClient.safeGet('/gizmos/{gizmo_id}/conversations', {
+    parameters:{
+      path:{gizmo_id:projectId},
+      query:{limit,owned_only:ownedOnly,...(cursor?{cursor}:{})},
+    },
+  }),
+  startCompletionStream: (options) => completionClient.startCompletionStream(options),
+  stopCompletion: (options) => completionClient.stopCompletion(options),
+  cancelStream: (requestId) => completionClient.cancelStream(requestId),
+});
+const resourceUrls = () => {
+  const values = [
+    ...performance.getEntriesByType('resource').map((entry) => entry.name),
+    ...[...document.querySelectorAll('script[src]')].map((entry) => entry.src),
+    ...[...document.querySelectorAll('link[rel="modulepreload"][href]')].map((entry) => entry.href),
+  ];
+  return [...new Set(values.filter(Boolean).filter((url) => {
+    try {
+      const parsed = new URL(url, location.href);
+      return parsed.protocol === location.protocol
+        && parsed.host === location.host
+        && /\.js(?:\?|$)/.test(parsed.href);
+    } catch {
+      return false;
+    }
+  }))].sort((a, b) => priority(a) - priority(b)).slice(0, 360);
+};
 const resolveClient = async () => {
   if (clientShape(window[clientKey])) return {client:window[clientKey], diagnostics:{cached:true}};
   const graph = discoverGraph();
@@ -98,22 +166,53 @@ const resolveClient = async () => {
     Object.defineProperty(window, clientKey, {value:graph.directClient, configurable:true});
     return {client:graph.directClient, diagnostics:{direct:true, visited:graph.visited}};
   }
-  const resources = [...new Set(performance.getEntriesByType('resource').map((entry) => entry.name)
-    .filter((url) => {
-      try { const parsed = new URL(url, location.href); return parsed.origin === location.origin && /\.js(?:\?|$)/.test(parsed.href); }
-      catch { return false; }
-    }))].sort((a, b) => priority(a) - priority(b)).slice(0, 320);
+  const resources = resourceUrls();
   let imported = 0;
   let candidates = 0;
+  let requestClient = null;
+  let completionClient = null;
   for (const url of resources) {
     let module;
     try { module = await import(url); imported += 1; } catch { continue; }
-    for (const exported of Object.values(module)) {
+    const exports = Object.values(module);
+    for (const exported of exports) {
       if (clientShape(exported)) {
         Object.defineProperty(window, clientKey, {value:exported, configurable:true});
         return {client:exported, diagnostics:{directExport:true, imported, visited:graph.visited}};
       }
-      if (exported == null) continue;
+      if (!requestClient && requestClientShape(exported)) requestClient = exported;
+    }
+    if (!completionClient && graph.containers.length) {
+      const atoms = exports.filter(atomShape);
+      for (const atom of atoms) {
+        candidates += 1;
+        for (const container of graph.containers) {
+          try {
+            const value = container.get(atom);
+            if (!completionClientShape(value)) continue;
+            completionClient = value;
+            break;
+          } catch {}
+        }
+        if (completionClient) break;
+      }
+    }
+    if (requestClient && completionClient) {
+      const value = modernClient(requestClient, completionClient);
+      Object.defineProperty(window, clientKey, {value, configurable:true});
+      return {
+        client:value,
+        diagnostics:{
+          modernApp:true,
+          imported,
+          candidates,
+          containers:graph.containers.length,
+          visited:graph.visited,
+        },
+      };
+    }
+    for (const exported of exports) {
+      if (exported == null || atomShape(exported)) continue;
       candidates += 1;
       for (const container of graph.containers) {
         try {
@@ -134,7 +233,12 @@ const collectModels = (raw) => {
   const bySlug = new Map();
   const defaultSlug = String(raw && (raw.default_model_slug || raw.defaultModelSlug || raw.default_model) || '');
   const addEffort = (entry, value) => {
-    const effort = typeof value === 'string' ? value.trim() : '';
+    const candidate = typeof value === 'string'
+      ? value
+      : value && typeof value === 'object'
+        ? value.thinking_effort || value.thinkingEffort || ''
+        : '';
+    const effort = String(candidate || '').trim();
     if (effort) entry.efforts.add(effort);
   };
   while (queue.length && bySlug.size < 500) {

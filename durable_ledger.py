@@ -73,6 +73,16 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """SQLite connection whose transaction context also owns its lifetime."""
+
+    def __exit__(self, *args: Any) -> bool | None:
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 class DurableLedger:
     """Transactional repository for actors, tasks, commands and cursors."""
 
@@ -84,7 +94,11 @@ class DurableLedger:
         self._migrate()
 
     def connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.path, timeout=30)
+        db = sqlite3.connect(
+            self.path,
+            timeout=30,
+            factory=_ClosingConnection,
+        )
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA journal_mode=WAL")

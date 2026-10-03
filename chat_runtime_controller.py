@@ -76,14 +76,28 @@ class ChatRuntimeControllerConfig:
     def validate(self) -> None:
         if not _SERVICE_NAME.fullmatch(self.service_name):
             raise ValueError("invalid ChatGPT runtime systemd service name")
-        for value in (self.cdp_endpoint, self.webview_url):
-            parsed = urlsplit(value)
-            if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
-                "127.0.0.1",
-                "localhost",
-                "::1",
-            }:
-                raise ValueError("ChatGPT runtime endpoints must be loopback HTTP URLs")
+        parsed_cdp = urlsplit(self.cdp_endpoint)
+        if parsed_cdp.scheme not in {"http", "https"} or parsed_cdp.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise ValueError("ChatGPT runtime CDP endpoint must be a loopback HTTP URL")
+        parsed_webview = urlsplit(self.webview_url)
+        embedded = (
+            parsed_webview.scheme == "app"
+            and parsed_webview.netloc == "-"
+            and parsed_webview.path == "/index.html"
+        )
+        loopback = (
+            parsed_webview.scheme in {"http", "https"}
+            and parsed_webview.hostname in {"127.0.0.1", "localhost", "::1"}
+        )
+        if not (embedded or loopback):
+            raise ValueError(
+                "ChatGPT runtime webview must be the official app renderer "
+                "or a loopback HTTP URL"
+            )
 
 
 class ChatRuntimeController:
@@ -105,7 +119,11 @@ class ChatRuntimeController:
 
     async def health(self) -> dict[str, Any]:
         webview = await self._webview_health()
-        webview_port = urlsplit(self.config.webview_url).port or 80
+        parsed_webview = urlsplit(self.config.webview_url)
+        webview_port = (
+            parsed_webview.port
+            or (5175 if parsed_webview.scheme == "app" else 80)
+        )
         cdp: RuntimeProbe = await probe_runtime(
             self.config.cdp_endpoint,
             timeout=min(3.0, self.config.internal_timeout_seconds),
@@ -228,6 +246,14 @@ class ChatRuntimeController:
             return {"action": action, "health": last}
 
     async def _webview_health(self) -> dict[str, Any]:
+        parsed = urlsplit(self.config.webview_url)
+        if parsed.scheme == "app":
+            return {
+                "ready": True,
+                "status_code": None,
+                "reason": "",
+                "transport": "embedded",
+            }
         try:
             async with httpx.AsyncClient(
                 timeout=min(3.0, self.config.internal_timeout_seconds),

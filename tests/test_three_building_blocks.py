@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import os
 import sys
 from pathlib import Path
 
@@ -196,6 +198,37 @@ def test_ledger_owns_schema_and_evidence_columns(tmp_path):
         assert "gateway_operation_id" in columns
         assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "11"
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_repeated_ledger_reads_close_sqlite_connections_without_gc(tmp_path):
+    path = (tmp_path / "ledger.sqlite").resolve()
+    ledger = DurableLedger(path)
+    gc.collect()
+
+    def ledger_descriptor_count() -> int:
+        targets = {str(path), f"{path}-wal", f"{path}-shm"}
+        count = 0
+        for entry in Path("/proc/self/fd").iterdir():
+            try:
+                if os.readlink(entry) in targets:
+                    count += 1
+            except FileNotFoundError:
+                continue
+        return count
+
+    baseline = ledger_descriptor_count()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(100):
+            assert ledger.agent("missing-agent") is None
+        descriptors_after_reads = ledger_descriptor_count()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        gc.collect()
+
+    assert descriptors_after_reads <= baseline + 1
 
 
 class _GatewayClient:

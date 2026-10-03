@@ -2457,7 +2457,7 @@ class ChatAgentCoordinator:
                         ),
                     )
                 ]
-            events = [
+            observed_events = [
                 event
                 for event in self.repository.events_after(
                     subscription["child_agent_id"],
@@ -2465,7 +2465,25 @@ class ChatAgentCoordinator:
                 )
                 if event["kind"] != "started"
             ]
+            if not observed_events:
+                continue
+
+            # Canonical progress observations are retained in the durable event
+            # stream for status/wait/context consumers, but they are too noisy
+            # to wake the parent. Explicit child-to-parent messages already use
+            # the commands queue and therefore remain deliverable.
+            events = [event for event in observed_events if event["kind"] != "progress"]
             if not events:
+                with self.repository.transaction() as db:
+                    db.execute(
+                        "UPDATE subscriptions SET last_acked_event_seq=? "
+                        "WHERE parent_agent_id=? AND child_agent_id=?",
+                        (
+                            max(int(event["event_seq"]) for event in observed_events),
+                            subscription["parent_agent_id"],
+                            subscription["child_agent_id"],
+                        ),
+                    )
                 continue
 
             completion_event = next(

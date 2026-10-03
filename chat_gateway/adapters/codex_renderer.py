@@ -316,6 +316,9 @@ class CodexRendererBackend:
           const id = {json.dumps(conversation_id)};
           const handle = gatewayRuntime.handles.get(id);
           if (handle && typeof handle.cancel === 'function') await handle.cancel();
+          else if (typeof client.stopCompletion === 'function') {{
+            await client.stopCompletion({{conversationId:id}});
+          }}
           else if (typeof client.cancelStream === 'function') await client.cancelStream(id);
           else throw new Error('renderer cancellation is unavailable');
           gatewayRuntime.handles.delete(id);

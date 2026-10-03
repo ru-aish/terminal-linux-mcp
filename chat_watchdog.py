@@ -327,9 +327,14 @@ def model_options_from_payload(payload: Any) -> tuple[ModelOption, ...]:
         seen.add(slug)
         efforts = item.get("thinking_efforts") or item.get("thinkingEfforts")
         if isinstance(efforts, list):
-            thinking_efforts = tuple(
-                str(value).strip() for value in efforts if str(value).strip()
-            )
+            normalized_efforts: list[str] = []
+            for value in efforts:
+                if isinstance(value, dict):
+                    value = value.get("thinking_effort") or value.get("thinkingEffort")
+                effort = str(value or "").strip()
+                if effort:
+                    normalized_efforts.append(effort)
+            thinking_efforts = tuple(normalized_efforts)
         else:
             inferred: list[str] = []
             if item.get("supports_extended"):

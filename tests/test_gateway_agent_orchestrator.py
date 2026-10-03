@@ -23,6 +23,7 @@ from chat_gateway import (
     OperationState,
     OperationType,
     PollingConfig,
+    RateLimitError,
     RetryConfig,
     SQLiteLedger,
     ThreadSnapshot,
@@ -561,6 +562,75 @@ def test_completed_child_reopens_for_new_parent_instruction(tmp_path):
         operation.type is OperationType.CONTINUE
         for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
     )
+
+
+def test_recovery_probe_is_not_owned_by_failed_child(tmp_path):
+    coordinator, gateway, backend, _clock, _runtime = make_coordinator(tmp_path)
+    parent = run(coordinator.register_parent("parent-chat"))
+    child = run(
+        coordinator.spawn(
+            parent["agent_id"],
+            "Hit a shared conversation rate limit.",
+            idempotency_key="unowned-recovery-probe-child",
+        )
+    )
+    gateway_id = coordinator.repository.agent(child["agent"]["agent_id"])[
+        "gateway_agent_id"
+    ]
+    backend.queue("create_thread", RateLimitError("conversation rate limited"))
+
+    limited = run(coordinator.sync_once())
+
+    assert limited["outcome"] == "rate-limited"
+    probe = next(
+        operation
+        for operation in gateway.ledger.list_operations(state=OperationState.PENDING)
+        if operation.type is OperationType.RECOVERY_PROBE
+    )
+    assert probe.agent_id is None
+    with gateway.ledger.transaction(immediate=True) as connection:
+        gateway.ledger.cancel_pending_operations_for_agent(
+            connection,
+            agent_id=gateway_id,
+            now=1000.0,
+        )
+    assert gateway.ledger.get_operation(probe.id).state is OperationState.PENDING
+
+
+def test_expired_open_conversation_circuit_recreates_missing_probe(tmp_path):
+    coordinator, gateway, backend, clock, _runtime = make_coordinator(tmp_path)
+    _register_parent_in_fake_backend(backend)
+    parent = run(coordinator.register_parent("parent-chat"))
+    run(
+        coordinator.spawn(
+            parent["agent_id"],
+            "Recover after an orphaned shared probe.",
+            idempotency_key="orphaned-recovery-probe-child",
+        )
+    )
+    with gateway.ledger.transaction(immediate=True) as connection:
+        circuit = gateway.circuits.record_rate_limit(
+            connection,
+            scope="conversation",
+            now=clock.now(),
+        )
+    assert circuit.state is CircuitState.OPEN
+
+    clock.advance(1)
+    recovered = run(coordinator.sync_once())
+
+    assert recovered["operation_type"] == OperationType.RECOVERY_PROBE.value
+    assert recovered["physical_requests"] == 1
+    assert backend.calls[-1].method == "get_thread"
+    with gateway.ledger.transaction() as connection:
+        assert gateway.ledger.get_circuit(
+            connection, scope="conversation", now=clock.now()
+        ).state is CircuitState.PACED
+
+    clock.advance(1)
+    resumed = run(coordinator.sync_once())
+    assert resumed["operation_type"] == OperationType.CREATE.value
+    assert resumed["outcome"] == "success"
 
 
 def test_runtime_outage_pauses_agents_without_consuming_retry_budget(tmp_path):

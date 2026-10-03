@@ -1147,10 +1147,10 @@ class InternalChatClient:
     async def cancel(self, conversation_id: str) -> dict[str, Any]:
         payload = await self._evaluate(
             f"const resolved = await resolveClient(); const id = {json.dumps(conversation_id)};"
-            "if (!streams.has(id)) return {cancelled:false, reason:'no watchdog-owned stream'};"
             "const handle = handles.get(id);"
             "try {"
             " if (handle && typeof handle.cancel === 'function') await handle.cancel();"
+            " else if (typeof resolved.client.stopCompletion === 'function') await resolved.client.stopCompletion({conversationId:id});"
             " else if (typeof resolved.client.cancelStream === 'function') await resolved.client.cancelStream(id);"
             " else return {cancelled:false, reason:'cancel is unavailable'};"
             " streams.delete(id); handles.delete(id); return {cancelled:true, reason:''};"

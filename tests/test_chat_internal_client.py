@@ -63,6 +63,31 @@ def test_renderer_selection_rejects_avatar_only_target():
         select_main_renderer_target([avatar])
 
 
+def test_renderer_selection_accepts_official_chatgpt_app_main_renderer():
+    main = target(
+        "app://-/index.html",
+        target_id="official-main",
+        title="ChatGPT",
+    )
+    selected = select_main_renderer_target([main])
+    assert selected.target_id == "official-main"
+
+
+def test_renderer_selection_rejects_official_chatgpt_auxiliary_windows():
+    avatar = target(
+        "app://-/index.html?initialRoute=%2Favatar-overlay",
+        target_id="official-avatar",
+        title="ChatGPT",
+    )
+    detached = target(
+        "app://-/detached-window.html?initialRoute=%2Fdetached-window",
+        target_id="official-detached",
+        title="ChatGPT",
+    )
+    with pytest.raises(RuntimeNotReadyError, match="auxiliary"):
+        select_main_renderer_target([avatar, detached])
+
+
 def message(
     message_id: str,
     role: str,
@@ -824,8 +849,9 @@ def test_mutation_confirmation_uses_bounded_single_readback():
     assert "attempts = waitForCompletion" not in continue_source
 
 
-def test_owned_stream_marker_is_age_bounded_but_cancel_handle_is_retained():
+def test_owned_stream_marker_is_age_bounded_and_cancel_can_stop_app_stream():
     source = CHAT_RENDERER_BRIDGE_JS + inspect.getsource(InternalChatClient)
     assert "Date.now() - startedAt <= 120000" in source
     assert "owned_stream:ownedStreamActive" in source
-    assert "if (!streams.has(id)) return {cancelled:false" in source
+    assert "if (!streams.has(id)) return {cancelled:false" not in source
+    assert "resolved.client.stopCompletion({conversationId:id})" in source
