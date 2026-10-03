@@ -242,6 +242,46 @@ def install_usage_dashboard(
             return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
         return _security_headers(JSONResponse(await watchdog.scan_once(trigger="dashboard")))
 
+    async def watchdog_projects_available(request: Request) -> Response:
+        if watchdog is None or not _authorized(request):
+            return _security_headers(
+                JSONResponse({"error": "not found"}, status_code=404 if watchdog is None else 401)
+            )
+        try:
+            payload = await watchdog.available_projects()
+        except Exception as exc:
+            return _security_headers(JSONResponse({"error": str(exc)}, status_code=503))
+        return _security_headers(JSONResponse(payload))
+
+    async def watchdog_project_add(request: Request) -> Response:
+        if watchdog is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not watchdog_mutation_allowed(request):
+            return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
+        try:
+            payload = await request.json()
+            snapshot = await watchdog.select_project(
+                str(payload.get("project_id", "")),
+                name=str(payload.get("name", "")),
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            return _security_headers(JSONResponse({"error": str(exc)}, status_code=400))
+        except Exception as exc:
+            return _security_headers(JSONResponse({"error": str(exc)}, status_code=503))
+        return _security_headers(JSONResponse(snapshot, status_code=201))
+
+    async def watchdog_project_remove(request: Request) -> Response:
+        if watchdog is None:
+            return _security_headers(JSONResponse({"error": "not found"}, status_code=404))
+        if not watchdog_mutation_allowed(request):
+            return _security_headers(JSONResponse({"error": "unauthorized or csrf check failed"}, status_code=403))
+        removed = await asyncio.to_thread(
+            watchdog.remove_project,
+            request.path_params["project_id"],
+        )
+        snapshot = await asyncio.to_thread(watchdog.snapshot)
+        return _security_headers(JSONResponse({"removed": removed, **snapshot}))
+
     async def dashboard_events(request: Request) -> Response:
         if not _authorized(request):
             return _security_headers(JSONResponse({"error": "unauthorized"}, status_code=401))
@@ -311,6 +351,9 @@ def install_usage_dashboard(
             Route("/dashboard/watchdog/queue/add", watchdog_add, methods=["POST"]),
             Route("/dashboard/watchdog/queue/{conversation_id:str}", watchdog_remove, methods=["DELETE"]),
             Route("/dashboard/watchdog/scan", watchdog_scan, methods=["POST"]),
+            Route("/dashboard/watchdog/projects/available", watchdog_projects_available, methods=["GET"]),
+            Route("/dashboard/watchdog/projects", watchdog_project_add, methods=["POST"]),
+            Route("/dashboard/watchdog/projects/{project_id:str}", watchdog_project_remove, methods=["DELETE"]),
             Route("/dashboard/events", dashboard_events, methods=["GET"]),
             Route("/dashboard/assets/{name:str}", dashboard_asset, methods=["GET"]),
         ]

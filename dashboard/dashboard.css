@@ -126,6 +126,19 @@ h2 { margin: 0; font-family: var(--display); font-size: clamp(1.45rem, 6vw, 2.45
 .watchdog-entry span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .watchdog-entry small { color: var(--muted); }
 .watchdog-entry button { background: transparent; color: var(--ink); border: 1px solid var(--rule); padding: 5px 8px; }
+.project-watch { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--ink); }
+.project-watch-head { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 14px; }
+.project-watch-head h3 { margin: 2px 0 0; font-family: var(--display); font-size: clamp(1.35rem, 6vw, 2rem); font-weight: 500; }
+.project-watch-head > button { flex: 0 0 auto; border: 1px solid var(--ink); border-radius: 10px; background: var(--surface); color: var(--ink); padding: 9px 11px; cursor: pointer; }
+.project-watch-list, .project-watch-picker { display: grid; gap: 0; margin-top: 14px; border-bottom: 1px solid var(--rule); }
+.project-watch-picker { margin-top: 18px; border: 1px solid var(--ink); border-radius: 14px; padding: 0 12px; background: var(--surface); }
+.project-watch-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--rule); }
+.project-watch-row:first-child { border-top: 0; }
+.project-watch-row strong, .project-watch-row small { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.project-watch-row strong { font-size: .82rem; white-space: nowrap; }
+.project-watch-row small { margin-top: 4px; color: var(--muted); font: .61rem/1.45 var(--mono); }
+.project-watch-row button { border: 1px solid var(--rule); border-radius: 9px; background: var(--surface); color: var(--ink); padding: 7px 9px; cursor: pointer; font-size: .67rem; }
+.project-watch-row button:disabled { opacity: .5; cursor: default; }
 .method h2 { max-width: 700px; }
 .method-grid { margin-top: 22px; display: grid; gap: 14px; color: var(--muted); font-size: .78rem; }
 .method-grid p { margin: 0; padding-top: 12px; border-top: 1px solid var(--rule); }

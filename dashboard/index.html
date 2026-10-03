@@ -82,6 +82,15 @@
           <div class="watchdog-actions"><button type="button" id="watchdogSave">Save queue</button><input id="watchdogAdd" type="url" placeholder="https://chatgpt.com/c/…" aria-label="Add ChatGPT URL"><button type="button" id="watchdogAddButton">Add URL</button></div>
         </div>
         <div id="watchdogEntries" class="watchdog-entries" aria-live="polite"></div>
+        <div class="project-watch">
+          <div class="project-watch-head">
+            <div><p class="eyebrow">Project discovery</p><h3>Watch selected Projects for new threads</h3></div>
+            <button type="button" id="watchdogProjectLoad">Find projects</button>
+          </div>
+          <p class="hero-note" id="watchdogProjectStatus">Only selected Projects are scanned. General chats are ignored.</p>
+          <div id="watchdogSelectedProjects" class="project-watch-list" aria-live="polite"></div>
+          <div id="watchdogAvailableProjects" class="project-watch-picker" hidden aria-live="polite"></div>
+        </div>
       </section>
 
       <section class="flow-section" aria-labelledby="flowTitle">

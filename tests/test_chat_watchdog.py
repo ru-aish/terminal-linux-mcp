@@ -50,6 +50,10 @@ def link(value: str = "11111111-1111-1111-1111-111111111111") -> ChatLink:
     return parse_chat_link(f"https://chatgpt.com/c/{value}")
 
 
+def project_id(value: str = "a") -> str:
+    return "g-p-" + value * 32
+
+
 def turn(key: str, role: str, text: str) -> ConversationTurn:
     return ConversationTurn(key=key, role=role, text=text)
 
@@ -135,6 +139,8 @@ class FakeAdapter:
         restore_result: bool = True,
         preserve_empty_transcript: bool = False,
         snapshot_sequences: dict[str, list[ThreadSnapshot]] | None = None,
+        projects: list[dict] | None = None,
+        project_threads: dict[str, list[dict]] | None = None,
     ):
         self.snapshot = snapshot
         self.snapshots = snapshots or {}
@@ -156,6 +162,10 @@ class FakeAdapter:
         self.inspected_conversation_ids: list[str] = []
         self.restored: list[str] = []
         self.forced_sends: list[bool] = []
+        self.projects = list(projects or [])
+        self.project_threads = {key: list(value) for key, value in (project_threads or {}).items()}
+        self.project_list_calls = 0
+        self.project_thread_calls: list[tuple[str, str | None]] = []
 
     async def __aenter__(self):
         return self
@@ -169,6 +179,21 @@ class FakeAdapter:
     async def refresh_catalog(self):
         self.refreshes += 1
         return self.refresh_result
+
+    async def list_projects(self, *, limit=50, cursor=None):
+        self.project_list_calls += 1
+        offset = int(cursor or 0)
+        page = self.projects[offset:offset + limit]
+        next_cursor = str(offset + limit) if offset + limit < len(self.projects) else None
+        return {"items": page, "cursor": next_cursor}
+
+    async def list_project_threads(self, project_id, *, limit=50, cursor=None):
+        self.project_thread_calls.append((project_id, cursor))
+        items = self.project_threads.get(project_id, [])
+        offset = int(cursor or 0)
+        page = items[offset:offset + limit]
+        next_cursor = str(offset + limit) if offset + limit < len(items) else None
+        return {"items": page, "cursor": next_cursor}
 
     def _hydrated(self, snapshot: ThreadSnapshot) -> ThreadSnapshot:
         if snapshot.turns or self.preserve_empty_transcript or not snapshot.found:
@@ -1765,3 +1790,367 @@ def test_watchdog_skips_conversation_owned_by_active_orchestration_task(tmp_path
         ]
 
     asyncio.run(run())
+
+
+def test_selected_project_baselines_existing_threads_and_adds_only_new_threads(tmp_path):
+    async def run():
+        selected = project_id("a")
+        unselected = project_id("b")
+        old_id = "11111111-1111-1111-1111-111111111111"
+        new_id = "22222222-2222-2222-2222-222222222222"
+        ignored_id = "33333333-3333-3333-3333-333333333333"
+        new_snapshot = canonical_snapshot(
+            conversation_id=new_id,
+            assistant_status="in_progress",
+            assistant_end_turn=False,
+            running=True,
+        )
+        fake = FakeAdapter(
+            new_snapshot,
+            snapshots={new_id: new_snapshot},
+            project_threads={
+                selected: [
+                    {"conversation_id": old_id, "title": "Existing task", "project_id": selected}
+                ],
+                unselected: [
+                    {"conversation_id": ignored_id, "title": "Ignored task", "project_id": unselected}
+                ],
+            },
+        )
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "threads.txt",
+                tmp_path / "state.json",
+                tmp_path / "done.jsonl",
+                pre_send_confirmation_seconds=0,
+            ),
+            adapter_factory=lambda: fake,
+        )
+
+        selected_snapshot = await watchdog.select_project(selected, name="Selected project")
+        assert selected_snapshot["projects"]["items"][0]["seen_thread_count"] == 1
+        assert selected_snapshot["queue"]["entries"] == []
+        assert fake.project_thread_calls == [(selected, None)]
+
+        fake.project_threads[selected] = [
+            {"conversation_id": new_id, "title": "New task", "project_id": selected},
+            {"conversation_id": old_id, "title": "Existing task", "project_id": selected},
+        ]
+        result = await watchdog.scan_once(trigger="test")
+
+        assert result["runtime"]["project_scan"]["physical_list_requests"] == 1
+        assert result["runtime"]["project_scan"]["new_thread_ids"] == [new_id]
+        assert [item["conversation_id"] for item in result["queue"]["entries"]] == [new_id]
+        assert result["queue"]["entries"][0]["state"]["task_source"] == f"project-watch:{selected}"
+        assert result["queue"]["entries"][0]["state"]["auto_project_id"] == selected
+        assert result["queue"]["entries"][0]["state"]["title"] == "New task"
+        assert all(project != unselected for project, _ in fake.project_thread_calls)
+        assert ignored_id not in {item["conversation_id"] for item in result["queue"]["entries"]}
+
+    asyncio.run(run())
+
+
+def test_project_baseline_pages_all_old_threads_but_normal_scan_stops_after_seen_page(tmp_path):
+    async def run():
+        selected = project_id("c")
+        old_ids = [f"00000000-0000-0000-0000-{index:012d}" for index in range(1, 52)]
+        fake = FakeAdapter(
+            canonical_snapshot(conversation_id=old_ids[0], running=True),
+            project_threads={
+                selected: [
+                    {"conversation_id": conversation_id, "title": f"Old {index}", "project_id": selected}
+                    for index, conversation_id in enumerate(old_ids)
+                ]
+            },
+        )
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "threads.txt",
+                tmp_path / "state.json",
+                tmp_path / "done.jsonl",
+                pre_send_confirmation_seconds=0,
+            ),
+            adapter_factory=lambda: fake,
+        )
+
+        baseline = await watchdog.select_project(selected, name="Large project")
+        assert baseline["projects"]["items"][0]["seen_thread_count"] == 51
+        assert baseline["runtime"]["project_baseline"]["physical_list_requests"] == 2
+        assert fake.project_thread_calls == [(selected, None), (selected, "50")]
+
+        fake.project_thread_calls.clear()
+        result = await watchdog.scan_once(trigger="test")
+        assert fake.project_thread_calls == [(selected, None)]
+        assert result["runtime"]["project_scan"]["physical_list_requests"] == 1
+        assert result["runtime"]["project_scan"]["new_threads_added"] == 0
+        assert result["queue"]["entries"] == []
+
+    asyncio.run(run())
+
+
+def test_removing_watched_project_stops_automatic_discovery(tmp_path):
+    async def run():
+        selected = project_id("d")
+        new_id = "44444444-4444-4444-4444-444444444444"
+        fake = FakeAdapter(
+            canonical_snapshot(conversation_id=new_id, running=True),
+            project_threads={selected: []},
+        )
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "threads.txt",
+                tmp_path / "state.json",
+                tmp_path / "done.jsonl",
+            ),
+            adapter_factory=lambda: fake,
+        )
+        await watchdog.select_project(selected, name="Temporary")
+        assert watchdog.remove_project(selected) is True
+        fake.project_threads[selected] = [
+            {"conversation_id": new_id, "title": "Should stay out", "project_id": selected}
+        ]
+        calls_before = len(fake.project_thread_calls)
+        result = await watchdog.scan_once(trigger="test")
+        assert len(fake.project_thread_calls) == calls_before
+        assert result["queue"]["entries"] == []
+        assert result["projects"]["count"] == 0
+
+    asyncio.run(run())
+
+
+def test_dashboard_can_list_select_and_remove_watchdog_projects(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_DASHBOARD_TOKEN", "secret")
+    monkeypatch.setenv("TEST_PROJECT_WATCHDOG_HOME", str(tmp_path / "gpt-home"))
+    store = GPTThreadStore(
+        lambda: tmp_path / "workspace",
+        home_env="TEST_PROJECT_WATCHDOG_HOME",
+    )
+    selected = project_id("e")
+    old_id = "55555555-5555-5555-5555-555555555555"
+    fake = FakeAdapter(
+        canonical_snapshot(conversation_id=old_id, running=True),
+        projects=[
+            {
+                "id": selected,
+                "name": "Project E",
+                "description": "Watch this project",
+                "permissions": {"can_read": True, "can_write": True, "can_delete": False},
+            }
+        ],
+        project_threads={
+            selected: [
+                {"conversation_id": old_id, "title": "Already here", "project_id": selected}
+            ]
+        },
+    )
+    watchdog = ChatWatchdog(
+        ChatWatchdogConfig(
+            False,
+            tmp_path / "threads.txt",
+            tmp_path / "state.json",
+            tmp_path / "done.jsonl",
+        ),
+        adapter_factory=lambda: fake,
+    )
+    app = Starlette()
+    install_usage_dashboard(app, store, watchdog)
+    auth = {"authorization": "Bearer secret"}
+    mutate = {**auth, "x-mcp-dashboard-csrf": "chat-watchdog"}
+
+    with TestClient(app) as client:
+        available = client.get("/dashboard/watchdog/projects/available", headers=auth)
+        assert available.status_code == 200
+        assert available.json()["items"][0]["id"] == selected
+        assert available.json()["items"][0]["selected"] is False
+        assert fake.project_list_calls == 1
+
+        rejected = client.post(
+            "/dashboard/watchdog/projects",
+            json={"project_id": selected, "name": "Project E"},
+            headers=auth,
+        )
+        assert rejected.status_code == 403
+
+        added = client.post(
+            "/dashboard/watchdog/projects",
+            json={"project_id": selected, "name": "Project E"},
+            headers=mutate,
+        )
+        assert added.status_code == 201
+        assert added.json()["projects"]["items"][0]["project_id"] == selected
+        assert added.json()["projects"]["items"][0]["seen_thread_count"] == 1
+        assert added.json()["queue"]["entries"] == []
+
+        removed = client.delete(
+            f"/dashboard/watchdog/projects/{selected}",
+            headers=mutate,
+        )
+        assert removed.status_code == 200
+        assert removed.json()["removed"] is True
+        assert removed.json()["projects"]["count"] == 0
+
+
+def test_selected_project_autodiscovers_only_new_project_threads(tmp_path):
+    async def run():
+        project_id = "g-p-" + "a" * 32
+        other_project_id = "g-p-" + "b" * 32
+        old_id = "11111111-1111-1111-1111-111111111111"
+        new_id = "22222222-2222-2222-2222-222222222222"
+        other_id = "33333333-3333-3333-3333-333333333333"
+        new_snapshot = canonical_snapshot(
+            conversation_id=new_id,
+            assistant_status="in_progress",
+            assistant_end_turn=False,
+            running=True,
+        )
+        fake = FakeAdapter(
+            new_snapshot,
+            snapshots={new_id: new_snapshot},
+            projects=[
+                {"id": project_id, "name": "Watched", "permissions": {"can_read": True}},
+                {"id": other_project_id, "name": "Ignored", "permissions": {"can_read": True}},
+            ],
+            project_threads={
+                project_id: [
+                    {"conversation_id": old_id, "title": "Existing", "project_id": project_id},
+                ],
+                other_project_id: [
+                    {"conversation_id": other_id, "title": "Other", "project_id": other_project_id},
+                ],
+            },
+        )
+        watchdog = ChatWatchdog(
+            ChatWatchdogConfig(
+                True,
+                tmp_path / "threads.txt",
+                tmp_path / "state.json",
+                tmp_path / "done.jsonl",
+                projects_path=tmp_path / "projects.json",
+                pre_send_confirmation_seconds=0,
+            ),
+            adapter_factory=lambda: fake,
+            clock=lambda: 1000.0,
+        )
+
+        selected = await watchdog.select_project(project_id, name="Watched")
+        assert selected["projects"]["count"] == 1
+        assert selected["projects"]["items"][0]["seen_thread_count"] == 1
+        entries, _ = watchdog.queue.entries()
+        assert entries == []
+        assert fake.project_thread_calls == [(project_id, None)]
+
+        fake.project_threads[project_id] = [
+            {"conversation_id": new_id, "title": "New running thread", "project_id": project_id},
+            {"conversation_id": old_id, "title": "Existing", "project_id": project_id},
+        ]
+        result = await watchdog.scan_once(trigger="test")
+        queued_ids = {entry["conversation_id"] for entry in result["queue"]["entries"]}
+        assert queued_ids == {new_id}
+        assert old_id not in queued_ids
+        assert other_id not in queued_ids
+        new_state = result["queue"]["entries"][0]["state"]
+        assert new_state["task_source"] == f"project-watch:{project_id}"
+        assert new_state["auto_project_id"] == project_id
+        assert result["runtime"]["project_scan"]["selected_projects"] == 1
+        assert result["runtime"]["project_scan"]["physical_list_requests"] == 1
+        assert result["runtime"]["project_scan"]["new_threads_added"] == 1
+        assert fake.project_thread_calls[-1] == (project_id, None)
+
+        assert watchdog.remove_project(project_id) is True
+        newer_id = "44444444-4444-4444-4444-444444444444"
+        fake.project_threads[project_id].insert(
+            0,
+            {"conversation_id": newer_id, "title": "After removal", "project_id": project_id},
+        )
+        after_remove = await watchdog.scan_once(trigger="test")
+        assert newer_id not in {
+            entry["conversation_id"] for entry in after_remove["queue"]["entries"]
+        }
+
+    asyncio.run(run())
+
+
+def test_watchdog_project_dashboard_selects_and_removes_projects(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_DASHBOARD_TOKEN", "secret")
+    monkeypatch.setenv("TEST_WATCHDOG_PROJECT_HOME", str(tmp_path / "gpt-home"))
+    store = GPTThreadStore(
+        lambda: tmp_path / "workspace",
+        home_env="TEST_WATCHDOG_PROJECT_HOME",
+    )
+    project_id = "g-p-" + "c" * 32
+    existing_id = "55555555-5555-5555-5555-555555555555"
+    fake = FakeAdapter(
+        ThreadSnapshot(True, existing_id),
+        projects=[
+            {
+                "id": project_id,
+                "name": "Project C",
+                "description": "Selected from dashboard",
+                "permissions": {"can_read": True, "can_write": True},
+            }
+        ],
+        project_threads={
+            project_id: [
+                {"conversation_id": existing_id, "title": "Existing", "project_id": project_id}
+            ]
+        },
+    )
+    watchdog = ChatWatchdog(
+        ChatWatchdogConfig(
+            False,
+            tmp_path / "threads.txt",
+            tmp_path / "state.json",
+            tmp_path / "done.jsonl",
+            projects_path=tmp_path / "projects.json",
+        ),
+        adapter_factory=lambda: fake,
+    )
+    app = Starlette()
+    install_usage_dashboard(app, store, watchdog)
+    auth = {"authorization": "Bearer secret"}
+    mutation = {**auth, "x-mcp-dashboard-csrf": "chat-watchdog"}
+
+    with TestClient(app) as client:
+        available = client.get("/dashboard/watchdog/projects/available", headers=auth)
+        assert available.status_code == 200
+        assert available.json()["items"][0]["id"] == project_id
+        assert available.json()["items"][0]["selected"] is False
+
+        denied = client.post(
+            "/dashboard/watchdog/projects",
+            json={"project_id": project_id, "name": "Project C"},
+            headers=auth,
+        )
+        assert denied.status_code == 403
+
+        added = client.post(
+            "/dashboard/watchdog/projects",
+            json={"project_id": project_id, "name": "Project C"},
+            headers=mutation,
+        )
+        assert added.status_code == 201
+        assert added.json()["projects"]["items"][0]["project_id"] == project_id
+        assert added.json()["projects"]["items"][0]["seen_thread_count"] == 1
+
+        removed = client.delete(
+            f"/dashboard/watchdog/projects/{project_id}",
+            headers=mutation,
+        )
+        assert removed.status_code == 200
+        assert removed.json()["removed"] is True
+        assert removed.json()["projects"]["count"] == 0
+
+
+def test_watchdog_config_keeps_legacy_positional_adapter_argument(tmp_path):
+    config = ChatWatchdogConfig(
+        True,
+        tmp_path / "threads.txt",
+        tmp_path / "state.json",
+        tmp_path / "done.jsonl",
+        "direct",
+    )
+    assert config.adapter_mode == "direct"
+    assert config.projects_path is None

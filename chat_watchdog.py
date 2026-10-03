@@ -46,6 +46,9 @@ CONVERSATION_ID_RE = re.compile(r"^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA
 PROJECT_ID_RE = re.compile(r"^g-p-[0-9a-fA-F]{32}$")
 MAX_QUEUE_BYTES = 128 * 1024
 MAX_QUEUE_ENTRIES = 500
+MAX_WATCHED_PROJECTS = 50
+MAX_AVAILABLE_PROJECTS = 500
+MAX_PROJECT_DISCOVERY_PAGES = 100
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -520,6 +523,21 @@ class ChatAdapter(Protocol):
 
     async def refresh_catalog(self) -> RefreshResult: ...
 
+    async def list_projects(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def list_project_threads(
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]: ...
+
     async def inspect(self, link: ChatLink) -> ThreadSnapshot: ...
 
     async def send_continue(
@@ -721,6 +739,124 @@ class ChatWatchdogQueue:
             "entries": [entry.as_dict() for entry in entries],
             "invalid_lines": [item.as_dict() for item in invalid],
         }
+
+
+class WatchdogProjectStore:
+    """Persistent allowlist and per-project discovery state."""
+
+    def __init__(self, path: Path):
+        self.path = path.expanduser().resolve()
+        self._lock = threading.RLock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            self._write_unlocked({"version": 1, "projects": {}})
+
+    def _load_unlocked(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {"version": 1, "projects": {}}
+        projects = payload.get("projects") if isinstance(payload, dict) else None
+        return {
+            "version": 1,
+            "projects": dict(projects) if isinstance(projects, dict) else {},
+        }
+
+    def _write_unlocked(self, payload: dict[str, Any]) -> None:
+        _atomic_write(
+            self.path,
+            json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            payload = self._load_unlocked()
+            items: list[dict[str, Any]] = []
+            for project_id, raw in payload["projects"].items():
+                if not isinstance(raw, dict):
+                    continue
+                seen = raw.get("seen_thread_ids")
+                items.append(
+                    {
+                        "project_id": project_id,
+                        "name": str(raw.get("name") or project_id),
+                        "selected_at": str(raw.get("selected_at") or ""),
+                        "initialized": bool(raw.get("initialized")),
+                        "seen_thread_count": len(seen) if isinstance(seen, list) else 0,
+                        "last_scan_at": str(raw.get("last_scan_at") or ""),
+                        "last_error": str(raw.get("last_error") or ""),
+                        "last_new_thread_ids": list(raw.get("last_new_thread_ids") or []),
+                    }
+                )
+            items.sort(key=lambda item: (item["name"].casefold(), item["project_id"]))
+            return {"path": str(self.path), "items": items, "count": len(items)}
+
+    def records(self) -> list[dict[str, Any]]:
+        with self._lock:
+            payload = self._load_unlocked()
+            result: list[dict[str, Any]] = []
+            for project_id, raw in payload["projects"].items():
+                if not isinstance(raw, dict):
+                    continue
+                result.append({"project_id": project_id, **dict(raw)})
+            return result
+
+    def select(self, project_id: str, *, name: str, seen_thread_ids: list[str]) -> None:
+        with self._lock:
+            payload = self._load_unlocked()
+            projects = payload["projects"]
+            if project_id in projects:
+                current = dict(projects[project_id]) if isinstance(projects[project_id], dict) else {}
+                if name:
+                    current["name"] = name[:200]
+                projects[project_id] = current
+                self._write_unlocked(payload)
+                return
+            if len(projects) >= MAX_WATCHED_PROJECTS:
+                raise ValueError(f"watchdog already contains {MAX_WATCHED_PROJECTS} projects")
+            projects[project_id] = {
+                "name": (name or project_id)[:200],
+                "selected_at": _utc_now(),
+                "initialized": True,
+                "seen_thread_ids": sorted(set(seen_thread_ids)),
+                "last_scan_at": _utc_now(),
+                "last_error": "",
+                "last_new_thread_ids": [],
+            }
+            self._write_unlocked(payload)
+
+    def remove(self, project_id: str) -> bool:
+        with self._lock:
+            payload = self._load_unlocked()
+            removed = payload["projects"].pop(project_id, None) is not None
+            if removed:
+                self._write_unlocked(payload)
+            return removed
+
+    def record_scan(
+        self,
+        project_id: str,
+        *,
+        observed_thread_ids: list[str],
+        new_thread_ids: list[str],
+        error: str = "",
+    ) -> None:
+        with self._lock:
+            payload = self._load_unlocked()
+            raw = payload["projects"].get(project_id)
+            if not isinstance(raw, dict):
+                return
+            seen = {str(item) for item in raw.get("seen_thread_ids", []) if str(item)}
+            seen.update(observed_thread_ids)
+            raw.update(
+                initialized=True,
+                seen_thread_ids=sorted(seen),
+                last_scan_at=_utc_now(),
+                last_error=error,
+                last_new_thread_ids=list(new_thread_ids),
+            )
+            payload["projects"][project_id] = raw
+            self._write_unlocked(payload)
 
 
 class WatchdogStateStore:
@@ -943,6 +1079,27 @@ class CodexInternalChatAdapter:
             reason=f"Codex internal client ready ({len(options)} models; {selection.slug})",
         )
 
+    async def list_projects(
+        self,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._client.list_projects(limit=limit, cursor=cursor)
+
+    async def list_project_threads(
+        self,
+        project_id: str,
+        *,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        return await self._client.list_project_threads(
+            project_id,
+            limit=limit,
+            cursor=cursor,
+        )
+
     async def inspect(self, link: ChatLink) -> ThreadSnapshot:
         payload = await self._gateway.read(link.conversation_id)
         if not payload.get("found"):
@@ -1085,6 +1242,7 @@ class ChatWatchdogConfig:
     ledger_path: Path | None = None
     forced_continue_conversation_ids: tuple[str, ...] = ()
     forced_continue_interval_seconds: int = 1200
+    projects_path: Path | None = None
 
     @classmethod
     def from_env(cls) -> "ChatWatchdogConfig":
@@ -1099,6 +1257,7 @@ class ChatWatchdogConfig:
             queue_path=Path(os.environ.get("MCP_CHAT_WATCHDOG_QUEUE", str(root / "threads.txt"))),
             state_path=Path(os.environ.get("MCP_CHAT_WATCHDOG_STATE", str(root / "state.json"))),
             completed_path=Path(os.environ.get("MCP_CHAT_WATCHDOG_COMPLETED", str(root / "completed.jsonl"))),
+            projects_path=Path(os.environ.get("MCP_CHAT_WATCHDOG_PROJECTS", str(root / "projects.json"))),
             adapter_mode=adapter_mode,
             cdp_endpoint=os.environ.get("MCP_CHAT_WATCHDOG_CDP", DEFAULT_CODEX_CDP_ENDPOINT).strip()
             or DEFAULT_CODEX_CDP_ENDPOINT,
@@ -1173,6 +1332,9 @@ class ChatWatchdog:
     ):
         self.config = config
         self.queue = ChatWatchdogQueue(config.queue_path, config.completed_path)
+        self.projects = WatchdogProjectStore(
+            config.projects_path or config.queue_path.with_name("projects.json")
+        )
         ledger_path = config.ledger_path or config.state_path.with_suffix(".sqlite")
         self.ledger = DurableLedger(ledger_path)
         self.state = WatchdogStateStore(config.state_path, self.ledger)
@@ -1239,6 +1401,179 @@ class ChatWatchdog:
 
     def wake(self) -> None:
         self._wake.set()
+
+    async def available_projects(self) -> dict[str, Any]:
+        if self._uses_managed_runtime:
+            await self.ensure_background_runtime()
+        selected = {item["project_id"] for item in self.projects.snapshot()["items"]}
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        requests = 0
+        async with self.adapter_factory() as adapter:
+            for _ in range(MAX_PROJECT_DISCOVERY_PAGES):
+                payload = await adapter.list_projects(limit=50, cursor=cursor)
+                requests += 1
+                page = payload.get("items") if isinstance(payload, dict) else []
+                items.extend(
+                    {**item, "selected": str(item.get("id") or "") in selected}
+                    for item in page
+                    if isinstance(item, dict) and item.get("id")
+                )
+                if len(items) >= MAX_AVAILABLE_PROJECTS:
+                    items = items[:MAX_AVAILABLE_PROJECTS]
+                    cursor = None
+                    break
+                next_cursor = str(payload.get("cursor") or "") if isinstance(payload, dict) else ""
+                if not next_cursor or next_cursor in seen_cursors:
+                    cursor = None
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+        return {"items": items, "cursor": cursor, "physical_list_requests": requests}
+
+    async def _project_thread_pages(
+        self,
+        adapter: ChatAdapter,
+        project_id: str,
+        *,
+        stop_after_seen: set[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        requests = 0
+        for _ in range(MAX_PROJECT_DISCOVERY_PAGES):
+            payload = await adapter.list_project_threads(project_id, limit=50, cursor=cursor)
+            requests += 1
+            page = [item for item in payload.get("items", []) if isinstance(item, dict)] if isinstance(payload, dict) else []
+            items.extend(page)
+            if stop_after_seen is not None:
+                page_ids = {
+                    str(item.get("conversation_id") or "").lower()
+                    for item in page
+                    if CONVERSATION_ID_RE.fullmatch(str(item.get("conversation_id") or ""))
+                }
+                if page_ids & stop_after_seen:
+                    break
+            next_cursor = str(payload.get("cursor") or "") if isinstance(payload, dict) else ""
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return items, requests
+
+    async def select_project(self, project_id: str, *, name: str = "") -> dict[str, Any]:
+        normalized = project_id.strip()
+        if PROJECT_ID_RE.fullmatch(normalized) is None:
+            raise ValueError("project_id must be a valid ChatGPT Project id")
+        existing = {item["project_id"]: item for item in self.projects.snapshot()["items"]}
+        if normalized in existing:
+            self.projects.select(normalized, name=name, seen_thread_ids=[])
+            return self.snapshot()
+        if self._uses_managed_runtime:
+            await self.ensure_background_runtime()
+        async with self.adapter_factory() as adapter:
+            items, requests = await self._project_thread_pages(adapter, normalized)
+        baseline = [
+            str(item.get("conversation_id") or "").lower()
+            for item in items
+            if CONVERSATION_ID_RE.fullmatch(str(item.get("conversation_id") or ""))
+        ]
+        self.projects.select(normalized, name=name, seen_thread_ids=baseline)
+        self._runtime["project_baseline"] = {
+            "at": _utc_now(),
+            "project_id": normalized,
+            "physical_list_requests": requests,
+            "thread_count": len(set(baseline)),
+        }
+        return self.snapshot()
+
+    def remove_project(self, project_id: str) -> bool:
+        return self.projects.remove(project_id.strip())
+
+    async def _discover_selected_project_threads(self, adapter: ChatAdapter) -> list[str]:
+        records = self.projects.records()
+        added_all: list[str] = []
+        requests = 0
+        failures = 0
+        queued_entries, _ = self.queue.entries()
+        queued_ids = {item.conversation_id for item in queued_entries}
+        for project in records:
+            project_id = str(project.get("project_id") or "")
+            if PROJECT_ID_RE.fullmatch(project_id) is None:
+                continue
+            try:
+                seen = {
+                    str(item).lower()
+                    for item in project.get("seen_thread_ids", [])
+                    if str(item)
+                }
+                items, project_requests = await self._project_thread_pages(
+                    adapter,
+                    project_id,
+                    stop_after_seen=seen if project.get("initialized") else None,
+                )
+                requests += project_requests
+                current_ids: list[str] = []
+                unseen: list[tuple[str, str]] = []
+                for item in items:
+                    conversation_id = str(item.get("conversation_id") or "").lower()
+                    if CONVERSATION_ID_RE.fullmatch(conversation_id) is None:
+                        continue
+                    current_ids.append(conversation_id)
+                    if conversation_id not in seen and not item.get("archived"):
+                        unseen.append((conversation_id, str(item.get("title") or "")))
+
+                if not project.get("initialized"):
+                    self.projects.record_scan(
+                        project_id,
+                        observed_thread_ids=current_ids,
+                        new_thread_ids=[],
+                    )
+                    continue
+
+                added_here: list[str] = []
+                discovered_here: list[str] = []
+                for conversation_id, title in unseen:
+                    discovered_here.append(conversation_id)
+                    if conversation_id in queued_ids:
+                        continue
+                    link = parse_chat_link(
+                        f"https://chatgpt.com/g/{project_id}/c/{conversation_id}"
+                    )
+                    self.queue.add(link.url)
+                    self.state.start_task(link, source=f"project-watch:{project_id}")
+                    self.state.update(
+                        conversation_id,
+                        title=title,
+                        auto_project_id=project_id,
+                    )
+                    queued_ids.add(conversation_id)
+                    added_here.append(conversation_id)
+                self.projects.record_scan(
+                    project_id,
+                    observed_thread_ids=current_ids,
+                    new_thread_ids=discovered_here,
+                )
+                added_all.extend(added_here)
+            except Exception as exc:
+                failures += 1
+                self.projects.record_scan(
+                    project_id,
+                    observed_thread_ids=[],
+                    new_thread_ids=[],
+                    error=sanitize_runtime_error(f"{type(exc).__name__}: {exc}"),
+                )
+        self._runtime["project_scan"] = {
+            "at": _utc_now(),
+            "selected_projects": len(records),
+            "physical_list_requests": requests,
+            "new_threads_added": len(added_all),
+            "failed_projects": failures,
+            "new_thread_ids": added_all,
+        }
+        return added_all
 
     def _reconcile_tasks(self, entries: list[ChatLink], *, source: str) -> None:
         """Synchronize persistent task generations with the editable URL file."""
@@ -1523,7 +1858,7 @@ class ChatWatchdog:
         )
         return {
             "url": link.url,
-            "title": snapshot.title,
+            "title": snapshot.title or str(previous.get("title") or ""),
             "last_checked_at": _utc_now(),
             "last_turn_key": last_turn_key,
             "last_assistant_hash": snapshot.assistant_hash,
@@ -1569,7 +1904,7 @@ class ChatWatchdog:
             self._runtime["skipped_orchestrated_conversation_ids"] = skipped
             if invalid:
                 self._runtime["last_error"] = f"queue contains {len(invalid)} invalid line(s)"
-            if not entries:
+            if not entries and self.projects.snapshot()["count"] == 0:
                 self._finish_scan()
                 return self.snapshot()
 
@@ -1603,6 +1938,25 @@ class ChatWatchdog:
                                     last_checked_at=_utc_now(),
                                 )
                         else:
+                            await self._discover_selected_project_threads(adapter)
+                            entries, discovered_invalid = await asyncio.to_thread(self.queue.entries)
+                            self._reconcile_tasks(entries, source=f"scan:{trigger}")
+                            if discovered_invalid and not self._runtime.get("last_error"):
+                                self._runtime["last_error"] = (
+                                    f"queue contains {len(discovered_invalid)} invalid line(s)"
+                                )
+                            orchestrated = self.ledger.active_task_conversation_ids()
+                            skipped = [
+                                link.conversation_id
+                                for link in entries
+                                if link.conversation_id in orchestrated
+                            ]
+                            entries = [
+                                link
+                                for link in entries
+                                if link.conversation_id not in orchestrated
+                            ]
+                            self._runtime["skipped_orchestrated_conversation_ids"] = skipped
                             self._runtime["active_generation_conversation_id"] = ""
                             self._runtime["active_generation_conversation_ids"] = []
                             self._runtime["selected_continue_conversation_id"] = ""
@@ -1711,7 +2065,7 @@ class ChatWatchdog:
             self.queue.complete,
             link,
             {
-                "title": snapshot.title,
+                "title": snapshot.title or str(previous.get("title") or ""),
                 "assistant_hash": snapshot.assistant_hash,
                 "transcript_hash": snapshot.transcript_hash,
                 "completion_marker": self.config.completion_marker,
@@ -2417,6 +2771,7 @@ class ChatWatchdog:
             "max_continue_attempts": self.config.max_continue_attempts,
             "pre_send_confirmation_seconds": self.config.pre_send_confirmation_seconds,
             "runtime": dict(self._runtime),
+            "projects": self.projects.snapshot(),
             "queue": {**queue, "entries": entries},
         }
 

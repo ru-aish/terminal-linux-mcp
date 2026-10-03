@@ -9,6 +9,7 @@
     seenEventIds: new Set(),
     query: "",
     watchdogEditorVersion: null,
+    availableProjects: [],
   };
 
   const $ = (id) => document.getElementById(id);
@@ -306,6 +307,29 @@
       state.watchdogEditorVersion = watchdog.queue.version || null;
     }
     $("watchdogEntries").innerHTML = watchdog.queue.entries.map((entry) => { const generation = entry.state?.task_generation ? ` · generation ${entry.state.task_generation}` : ""; return `<div class="watchdog-entry"><span title="${escapeHtml(entry.url)}">${escapeHtml(entry.url)}</span><small>${escapeHtml((entry.state?.status || "queued") + generation)}</small><button type="button" data-watchdog-remove="${escapeHtml(entry.conversation_id)}">Remove task</button></div>`; }).join("") || '<div class="empty-row">No active tasks.</div>';
+    const projects = watchdog.projects?.items || [];
+    $("watchdogSelectedProjects").innerHTML = projects.map((project) => {
+      const detail = project.last_error ? project.last_error : `${project.seen_thread_count || 0} known threads · ${project.last_scan_at ? `scanned ${relativeTime(project.last_scan_at)}` : "not scanned yet"}`;
+      return `<div class="project-watch-row"><div><strong>${escapeHtml(project.name || project.project_id)}</strong><small>${escapeHtml(detail)}</small></div><button type="button" data-watchdog-project-remove="${escapeHtml(project.project_id)}">Stop watching</button></div>`;
+    }).join("") || '<div class="empty-row">No Projects selected. General chats are never auto-added.</div>';
+    const projectScan = runtime.project_scan || {};
+    $("watchdogProjectStatus").textContent = projects.length
+      ? `${projects.length} selected Project${projects.length === 1 ? "" : "s"} · last watchdog Project scan used ${projectScan.physical_list_requests ?? 0} list request${projectScan.physical_list_requests === 1 ? "" : "s"} · ${projectScan.new_threads_added ?? 0} new thread${projectScan.new_threads_added === 1 ? "" : "s"} added`
+      : "Only selected Projects are scanned. General chats are ignored.";
+  }
+
+  function renderAvailableProjects(payload) {
+    const picker = $("watchdogAvailableProjects");
+    const items = payload?.items || [];
+    state.availableProjects = items.map((item) => ({ ...item }));
+    picker.hidden = false;
+    picker.innerHTML = items.map((project) => {
+      const selected = Boolean(project.selected);
+      const permissions = project.permissions || {};
+      const disabled = selected || permissions.can_read === false;
+      const label = selected ? "Watching" : permissions.can_read === false ? "Unavailable" : "Watch Project";
+      return `<div class="project-watch-row"><div><strong>${escapeHtml(project.name || project.id)}</strong><small>${escapeHtml(project.description || project.id)}</small></div><button type="button" data-watchdog-project-add="${escapeHtml(project.id)}" data-watchdog-project-name="${escapeHtml(project.name || project.id)}" ${disabled ? "disabled" : ""}>${label}</button></div>`;
+    }).join("") || '<div class="empty-row">No readable ChatGPT Projects were returned.</div>';
   }
 
   async function fetchWatchdog() { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog")); } catch (error) { $("watchdogStatus").textContent = error.message; } }
@@ -326,6 +350,43 @@
   $("watchdogAddButton").addEventListener("click", async () => { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog/queue/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: $("watchdogAdd").value }) })); $("watchdogAdd").value = ""; } catch (error) { $("watchdogStatus").textContent = error.message; } });
   $("watchdogScan").addEventListener("click", async () => { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog/scan", { method: "POST" })); } catch (error) { $("watchdogStatus").textContent = error.message; } });
   $("watchdogEntries").addEventListener("click", async (event) => { const button = event.target.closest("[data-watchdog-remove]"); if (!button) return; try { renderWatchdog(await watchdogRequest(`/dashboard/watchdog/queue/${button.dataset.watchdogRemove}`, { method: "DELETE" })); } catch (error) { $("watchdogStatus").textContent = error.message; } });
+  $("watchdogProjectLoad").addEventListener("click", async () => {
+    try {
+      $("watchdogProjectStatus").textContent = "Loading available Projects…";
+      renderAvailableProjects(await watchdogRequest("/dashboard/watchdog/projects/available"));
+      $("watchdogProjectStatus").textContent = "Choose only the Projects whose new threads should enter the watchdog.";
+    } catch (error) {
+      $("watchdogProjectStatus").textContent = error.message;
+    }
+  });
+  $("watchdogAvailableProjects").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-watchdog-project-add]");
+    if (!button || button.disabled) return;
+    try {
+      button.disabled = true;
+      button.textContent = "Adding…";
+      renderWatchdog(await watchdogRequest("/dashboard/watchdog/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project_id: button.dataset.watchdogProjectAdd, name: button.dataset.watchdogProjectName || "" }),
+      }));
+      state.availableProjects = state.availableProjects.map((project) => project.id === button.dataset.watchdogProjectAdd ? { ...project, selected: true } : project);
+      renderAvailableProjects({ items: state.availableProjects });
+    } catch (error) {
+      $("watchdogProjectStatus").textContent = error.message;
+    }
+  });
+  $("watchdogSelectedProjects").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-watchdog-project-remove]");
+    if (!button) return;
+    try {
+      renderWatchdog(await watchdogRequest(`/dashboard/watchdog/projects/${button.dataset.watchdogProjectRemove}`, { method: "DELETE" }));
+      state.availableProjects = state.availableProjects.map((project) => project.id === button.dataset.watchdogProjectRemove ? { ...project, selected: false } : project);
+      if (!$("watchdogAvailableProjects").hidden) renderAvailableProjects({ items: state.availableProjects });
+    } catch (error) {
+      $("watchdogProjectStatus").textContent = error.message;
+    }
+  });
   fetchWatchdog();
   window.setInterval(fetchWatchdog, 5000);
 
