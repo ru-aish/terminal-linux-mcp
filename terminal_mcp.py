@@ -229,6 +229,7 @@ def get_chat_agent_coordinator() -> ChatAgentCoordinator:
             _chat_agent_runtime_factory,
             get_chat_gateway(),
             maximum_active_children=CHAT_AGENT_MAX_ACTIVE_CHILDREN,
+            thread_identity_store=GPT_STORE,
         )
     return _CHAT_AGENT_COORDINATOR
 
@@ -288,6 +289,53 @@ def _append_goal_context(result: Any, goal: dict[str, Any]) -> Any:
     return [mcp_types.TextContent(type="text", text=str(result)), reminder]
 
 
+def _request_turn_metadata(server: FastMCP) -> dict[str, Any]:
+    try:
+        request_meta = server.get_context().request_context.meta
+    except (LookupError, ValueError):
+        return {}
+    if request_meta is None:
+        return {}
+    payload = request_meta.model_dump(mode="json", by_alias=True, exclude_none=True)
+    turn = payload.get("x-codex-turn-metadata")
+    return turn if isinstance(turn, dict) else {}
+
+
+def _host_conversation_identity(server: FastMCP) -> str:
+    turn = _request_turn_metadata(server)
+    if str(turn.get("thread_source") or "") == "terminal_mcp":
+        return ""
+    for key in ("conversation_id", "chat_id", "thread_id"):
+        value = str(turn.get(key) or "").strip()
+        if value:
+            return value[:512]
+    return ""
+
+
+def _tool_identity_error(server: FastMCP, arguments: dict[str, Any]) -> str | None:
+    candidate = str(
+        arguments.get("thread_id") or arguments.get("session_id") or ""
+    ).strip()[:128]
+    if not candidate or candidate == "default":
+        return None
+    host_identity = _host_conversation_identity(server)
+    if not host_identity:
+        return None
+    binding = GPT_STORE.ensure_chat_binding(
+        host_identity,
+        source="host_metadata",
+        preferred_thread_id=candidate,
+    )
+    expected = str(binding["thread_id"])
+    if candidate == expected:
+        return None
+    return (
+        "Terminal MCP thread identity mismatch. This ChatGPT conversation is permanently "
+        f"bound to thread_id={expected!r}; the supplied value {candidate!r} is not allowed. "
+        "Reuse the permanent thread ID and never create or switch to another one."
+    )
+
+
 class AccountingFastMCP(FastMCP):
     """Record the two text legs of each MCP tool loop without affecting tools.
 
@@ -340,6 +388,12 @@ class AccountingFastMCP(FastMCP):
         }
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        identity_error = _tool_identity_error(self, arguments)
+        if identity_error:
+            return mcp_types.CallToolResult(
+                content=[mcp_types.TextContent(type="text", text=identity_error)],
+                isError=True,
+            )
         # FastMCP's own conversion/validation remains authoritative.
         result = await super().call_tool(name, arguments)
         thread_id = self._thread_id(arguments)
@@ -647,6 +701,37 @@ def _normalize_session_id(session_id: str | None) -> str:
     return (normalized or "default")[:128]
 
 
+def _resolve_request_thread_id(requested_thread_id: str | None) -> tuple[str, str | None]:
+    requested = str(requested_thread_id or "").strip()[:128]
+    host_identity = _host_conversation_identity(mcp)
+    if host_identity:
+        binding = GPT_STORE.ensure_chat_binding(
+            host_identity,
+            source="host_metadata",
+            preferred_thread_id=requested,
+        )
+        expected = str(binding["thread_id"])
+        if requested and requested != expected:
+            return "", (
+                "Error: this ChatGPT conversation already has a permanent Terminal MCP "
+                f"thread ID {expected!r}; supplied thread_id {requested!r} is not allowed."
+            )
+        return expected, None
+    if not requested or requested == "default":
+        return "", (
+            "Error: no server-assigned Terminal MCP thread identity is available for this "
+            "conversation. Wait for the gateway identity message or use a host that supplies "
+            "stable ChatGPT thread metadata; models may not invent thread IDs."
+        )
+    binding = GPT_STORE.binding_for_thread(requested)
+    if binding is None:
+        return "", (
+            f"Error: thread_id {requested!r} is not bound to any ChatGPT conversation. "
+            "Terminal MCP thread IDs are server-assigned and cannot be created by the model."
+        )
+    return requested, None
+
+
 def _gpt_home() -> Path:
     return GPT_STORE.home()
 
@@ -667,8 +752,17 @@ def _estimate_tokens(text: str) -> int:
     return GPT_STORE.estimate_tokens(text)
 
 
-def _upsert_thread_record(thread_id: str, cwd: Path, fingerprint: str = "", loaded: bool = False) -> None:
-    GPT_STORE.upsert_thread(thread_id, cwd, fingerprint, loaded=loaded)
+def _upsert_thread_record(
+    thread_id: str,
+    cwd: Path,
+    fingerprint: str = "",
+    loaded: bool = False,
+    *,
+    bootstrap: bool = False,
+) -> None:
+    GPT_STORE.upsert_thread(
+        thread_id, cwd, fingerprint, loaded=loaded, bootstrap=bootstrap
+    )
 
 
 def _record_usage_event(
@@ -1171,7 +1265,7 @@ def _context_gate_error(
     listed = "\n".join(f"- {path}" for path, _ in rows) or "- none"
     identity_note = (
         "The shared session_id='default' is intentionally rejected by this experimental server.\n"
-        "Choose a unique stable thread_id, call bootstrap_thread(thread_id=...), and reuse it as session_id.\n\n"
+        "Use this ChatGPT conversation's permanent server-assigned Terminal MCP thread ID; never invent one.\n\n"
         if session_id == "default"
         else ""
     )
@@ -2641,8 +2735,9 @@ def _build_thread_context_document(
     parts = [
         "[Terminal GPT Thread Bootstrap]",
         "MANDATORY: Follow every instruction below strictly for the lifetime of this model thread.",
+        "MANDATORY: This server-assigned thread ID is permanently bound to this ChatGPT conversation. Never replace it or bootstrap another ID.",
         "MANDATORY: Reuse this thread ID as session_id in every later Terminal GPT tool call.",
-        "MANDATORY: If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
+        "MANDATORY: If context is compacted, forgotten, changed, or uncertain, call get_thread_context with this same ID before continuing.",
         "",
         f"Thread ID: {thread_id}",
         f"Working Directory: {run_cwd}",
@@ -2696,8 +2791,8 @@ def _build_thread_context_document(
     parts.extend([
         "",
         "## Context recovery and accounting",
-        "- bootstrap_thread: initialize a genuinely new model thread.",
-        "- get_thread_context: reload the complete context after compaction or uncertainty.",
+        "- bootstrap_thread: one-time initialization for this conversation's permanent server-assigned thread ID.",
+        "- get_thread_context: reload complete context later without changing or re-bootstrapping the thread identity.",
         "- context_manifest: inspect fingerprints, files, skills, tools, and nested MCP names without loading full instruction bodies.",
         "- refresh_startup_context: rebuild MCP initialization instructions for future client initializations.",
         "- record_token_usage: store exact provider-reported input/output/cached-input usage.",
@@ -2720,8 +2815,8 @@ async def _load_thread_context(
     normalized = _normalize_session_id(thread_id)
     if normalized == "default":
         return (
-            "Error: thread_id must be a unique, stable non-default identifier. "
-            "Generate one for this model thread and reuse it as session_id on every later call."
+            "Error: no permanent server-assigned Terminal MCP thread ID is available. "
+            "Models may not generate their own thread IDs."
         )
     session = await _get_session(normalized)
     run_cwd = _resolve_cwd(cwd, session.cwd) if cwd else session.cwd.resolve()
@@ -2736,7 +2831,13 @@ async def _load_thread_context(
     session.context_fingerprints[_context_key(run_cwd)] = fingerprint
     session.bootstrapped_at = time.time()
     session.updated_at = time.time()
-    _upsert_thread_record(normalized, run_cwd, fingerprint, loaded=True)
+    _upsert_thread_record(
+        normalized,
+        run_cwd,
+        fingerprint,
+        loaded=True,
+        bootstrap=(event_type == "thread_bootstrap"),
+    )
     estimated_tokens = _estimate_tokens(full)
     _record_usage_event(
         normalized,
@@ -2758,22 +2859,40 @@ async def _load_thread_context(
 
 @mcp.tool()
 async def bootstrap_thread(
-    thread_id: str,
+    thread_id: str = "",
     cwd: str | None = None,
     max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
 ) -> str:
-    """Initialize a new model thread with .GPT instructions, all discovered skills, public tools, nested MCP names, and a persistent context fingerprint."""
-    return await _load_thread_context(thread_id, cwd, max_chars, "thread_bootstrap")
+    """Initialize this ChatGPT conversation exactly once using its permanent server-assigned Terminal MCP thread ID."""
+    resolved, error = _resolve_request_thread_id(thread_id)
+    if error:
+        return error
+    existing = GPT_STORE.get_thread(resolved)
+    if existing and int(existing.get("bootstrap_count") or 0) > 0:
+        return (
+            f"Error: thread_id {resolved!r} has already been bootstrapped for this ChatGPT conversation. "
+            "Its identity is immutable. Use get_thread_context with the same thread ID to reload context."
+        )
+    return await _load_thread_context(resolved, cwd, max_chars, "thread_bootstrap")
 
 
 @mcp.tool()
 async def get_thread_context(
-    thread_id: str,
+    thread_id: str = "",
     cwd: str | None = None,
     max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
 ) -> str:
-    """Reload the complete GPT thread context after compaction, instruction changes, or uncertainty."""
-    return await _load_thread_context(thread_id, cwd, max_chars, "thread_context_reload")
+    """Reload context for this conversation's permanent Terminal MCP thread identity."""
+    resolved, error = _resolve_request_thread_id(thread_id)
+    if error:
+        return error
+    existing = GPT_STORE.get_thread(resolved)
+    if existing is None or int(existing.get("bootstrap_count") or 0) <= 0:
+        return (
+            f"Error: thread_id {resolved!r} has not completed its initial bootstrap step. "
+            "Call bootstrap_thread once with this server-assigned thread ID first."
+        )
+    return await _load_thread_context(resolved, cwd, max_chars, "thread_context_reload")
 
 
 @mcp.tool()
@@ -2930,8 +3049,8 @@ async def project_context(
     cwd: str | None = None,
     max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
 ) -> str:
-    """Compatibility alias that loads the complete GPT thread context using session_id as the stable thread identity."""
-    return await _load_thread_context(session_id, cwd, max_chars, "project_context_reload")
+    """Compatibility alias that reloads context for the conversation's permanent Terminal MCP identity."""
+    return await get_thread_context(thread_id=session_id, cwd=cwd, max_chars=max_chars)
 
 
 @_hidden_tool()
@@ -3787,8 +3906,8 @@ def _build_startup_instructions() -> str:
     nested_servers = _configured_mcp_manifest(root)
     parts = [
         "You are connected to the isolated Terminal GPT Experimental MCP.",
-        "STRICT REQUIREMENT: At the beginning of each genuinely new model thread, call bootstrap_thread with a unique stable thread_id before substantive terminal work.",
-        "Reuse that exact thread_id as session_id on every later tool call. The shared session_id='default' is rejected for gated work.",
+        "STRICT REQUIREMENT: Never invent or replace a Terminal MCP thread ID. Each ChatGPT conversation has one permanent server-assigned identity.",
+        "Call bootstrap_thread exactly once with the assigned thread ID, then reuse that exact value as session_id on every later tool call. The shared session_id='default' is rejected for gated work.",
         "If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
         "When the user writes /goal <objective>, call thread_goal(action='set') with explicit finish conditions and continue until each condition has evidence and the goal is completed, unless a real technical error blocks further work.",
         "The following global .GPT instructions are mandatory and are separate from Codex's ~/.codex/AGENTS.md.",

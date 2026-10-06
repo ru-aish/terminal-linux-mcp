@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from math import ceil, floor
@@ -22,8 +23,8 @@ from Codex's `~/.codex/AGENTS.md`.
 ## Mandatory operating rules
 
 1. Treat every instruction in this file and every applicable project `.GPT/AGENTS.md` as mandatory.
-2. Start each new model thread by calling `bootstrap_thread` with a unique, stable `thread_id`.
-3. Reuse that same value as `session_id` for all later terminal tools in the thread.
+2. Never invent or replace a Terminal MCP thread ID. Each ChatGPT conversation has one permanent server-assigned thread ID.
+3. Call `bootstrap_thread` exactly once with the assigned thread ID, then reuse that same value as `session_id` for all later terminal tools in the conversation.
 4. If context is lost, compacted, changed, or uncertain, call `get_thread_context` before continuing.
 5. Read relevant listed skills before performing specialized work.
 6. Inspect nested MCP tool schemas before invoking them.
@@ -168,8 +169,133 @@ class GPTThreadStore:
 
                 CREATE INDEX IF NOT EXISTS idx_thread_goals_status_seen
                     ON thread_goals(status, last_seen_at);
+
+                CREATE TABLE IF NOT EXISTS chat_thread_bindings (
+                    conversation_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL UNIQUE,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+
+    @staticmethod
+    def derive_thread_id(conversation_id: str) -> str:
+        """Derive one stable Terminal MCP identity from a ChatGPT conversation ID."""
+        normalized = str(conversation_id or "").strip()
+        if not normalized:
+            raise ValueError("conversation_id is required")
+        derived = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"https://terminal-mcp.local/chatgpt/conversation/{normalized}",
+        )
+        return f"tmcp_{derived.hex}"
+
+    @staticmethod
+    def _binding_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "conversation_id": str(row["conversation_id"]),
+            "thread_id": str(row["thread_id"]),
+            "source": str(row["source"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def ensure_chat_binding(
+        self,
+        conversation_id: str,
+        *,
+        source: str = "gateway",
+        preferred_thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically create or return the immutable 1:1 chat/thread binding."""
+        conversation_id = str(conversation_id or "").strip()
+        source = str(source or "gateway").strip() or "gateway"
+        if not conversation_id:
+            raise ValueError("conversation_id is required")
+        if len(conversation_id) > 512:
+            raise ValueError("conversation_id is too long")
+        if len(source) > 64:
+            raise ValueError("binding source is too long")
+        preferred = str(preferred_thread_id or "").strip()[:128]
+        thread_id = self.derive_thread_id(conversation_id)
+        self._init_db()
+        now = self._now()
+        workspace = self._workspace_provider().resolve()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM chat_thread_bindings WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+            if existing is not None:
+                binding = self._binding_row(existing)
+                assert binding is not None
+                return binding
+            if preferred:
+                legacy = connection.execute(
+                    "SELECT bootstrap_count FROM threads WHERE thread_id=?",
+                    (preferred,),
+                ).fetchone()
+                if legacy is not None and int(legacy["bootstrap_count"] or 0) > 0:
+                    thread_id = preferred
+            collision = connection.execute(
+                "SELECT conversation_id FROM chat_thread_bindings WHERE thread_id=?",
+                (thread_id,),
+            ).fetchone()
+            if collision is not None:
+                raise RuntimeError(
+                    "derived Terminal MCP thread ID is already bound to another conversation"
+                )
+            connection.execute(
+                """
+                INSERT INTO threads (
+                    thread_id, cwd, context_fingerprint, context_loaded_at,
+                    bootstrap_count, created_at, updated_at
+                ) VALUES (?, ?, '', NULL, 0, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET updated_at=excluded.updated_at
+                """,
+                (thread_id, str(workspace), now, now),
+            )
+            connection.execute(
+                "INSERT INTO chat_thread_bindings(conversation_id,thread_id,source,created_at,updated_at) "
+                "VALUES(?,?,?,?,?)",
+                (conversation_id, thread_id, source, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM chat_thread_bindings WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        binding = self._binding_row(row)
+        assert binding is not None
+        return binding
+
+    def binding_for_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        conversation_id = str(conversation_id or "").strip()
+        if not conversation_id:
+            return None
+        self._init_db()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM chat_thread_bindings WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        return self._binding_row(row)
+
+    def binding_for_thread(self, thread_id: str) -> dict[str, Any] | None:
+        thread_id = str(thread_id or "").strip()
+        if not thread_id:
+            return None
+        self._init_db()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM chat_thread_bindings WHERE thread_id=?",
+                (thread_id,),
+            ).fetchone()
+        return self._binding_row(row)
 
     @staticmethod
     def _clean_goal_text(value: str, *, field: str, max_chars: int) -> str:
@@ -449,18 +575,26 @@ class GPTThreadStore:
         fingerprint: str = "",
         *,
         loaded: bool = False,
+        bootstrap: bool = False,
     ) -> None:
         self._init_db()
         now = self._now()
         with self._connect() as connection:
             existing = connection.execute(
-                "SELECT bootstrap_count, created_at FROM threads WHERE thread_id = ?",
+                "SELECT bootstrap_count, created_at, context_loaded_at FROM threads WHERE thread_id = ?",
                 (thread_id,),
             ).fetchone()
             bootstrap_count = int(existing["bootstrap_count"]) if existing else 0
             created_at = str(existing["created_at"]) if existing else now
-            if loaded:
+            context_loaded_at = (
+                str(existing["context_loaded_at"])
+                if existing and existing["context_loaded_at"]
+                else None
+            )
+            if bootstrap:
                 bootstrap_count += 1
+            if loaded:
+                context_loaded_at = now
             connection.execute(
                 """
                 INSERT INTO threads (
@@ -478,7 +612,7 @@ class GPTThreadStore:
                     thread_id,
                     str(cwd),
                     fingerprint,
-                    now if loaded else None,
+                    context_loaded_at,
                     bootstrap_count,
                     created_at,
                     now,

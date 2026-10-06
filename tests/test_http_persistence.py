@@ -11,8 +11,9 @@ from pathlib import Path
 from mcp import ClientSession, types as mcp_types
 from mcp.client.streamable_http import streamable_http_client
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+from gpt_thread_store import GPTThreadStore
 
 
 def _free_port() -> int:
@@ -114,6 +115,7 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
     env = dict(**__import__("os").environ)
     env["MCP_WORKSPACE"] = str(tmp_path)
     env["MCP_LOG_DIR"] = str(tmp_path / "logs")
+    env["MCP_GPT_HOME"] = str(tmp_path / "gpt-home")
     env["MCP_NODE_REPL_SERVER"] = "stateful-http"
     process = subprocess.Popen(
         [
@@ -154,11 +156,20 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
         return "\n".join(getattr(item, "text", "") for item in result.content)
 
     async def exercise() -> None:
-        session_id = "http-persistence-test"
-        await call(
-            "project_context",
-            {"session_id": session_id, "cwd": str(tmp_path), "max_chars": 50000},
+        conversation_id = "conversation-http-persistence"
+        session_id = GPTThreadStore.derive_thread_id(conversation_id)
+        bootstrap_turn = {
+            "session_id": "codex-session-a",
+            "turn_id": "bootstrap",
+            "thread_id": conversation_id,
+        }
+        bootstrapped = await call(
+            "bootstrap_thread",
+            {"cwd": str(tmp_path), "max_chars": 50000},
+            meta={"x-codex-turn-metadata": bootstrap_turn},
         )
+        assert "Context Gate: satisfied" in text(bootstrapped)
+        assert f"Thread ID: {session_id}" in text(bootstrapped)
         first = text(await call(
             "local_mcp",
             {
@@ -210,7 +221,7 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
         first_turn = {
             "session_id": "codex-session-a",
             "turn_id": "turn-1",
-            "thread_id": "thread-a",
+            "thread_id": conversation_id,
         }
         first_metadata_result = await call(
             "local_mcp",
@@ -231,7 +242,7 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
         second_turn = {
             "session_id": "codex-session-a",
             "turn_id": "turn-2",
-            "thread_id": "thread-a",
+            "thread_id": conversation_id,
         }
         second_metadata_result = await call(
             "local_mcp",
@@ -250,7 +261,7 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
         wrapper_turn = {
             "session_id": "codex-session-a",
             "turn_id": "turn-wrapper",
-            "thread_id": "thread-a",
+            "thread_id": conversation_id,
         }
         wrapper_result = await call(
             "node_repl_js",
@@ -456,6 +467,15 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
     )
 
     async def exercise() -> None:
+        conversation_id = "conversation-http-bootstrap"
+        thread_id = GPTThreadStore.derive_thread_id(conversation_id)
+        turn_meta = {
+            "x-codex-turn-metadata": {
+                "session_id": "http-client",
+                "turn_id": "bootstrap",
+                "thread_id": conversation_id,
+            }
+        }
         url = f"http://127.0.0.1:{port}/mcp"
         async with streamable_http_client(url) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
@@ -484,10 +504,10 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 bootstrapped = await session.call_tool(
                     "bootstrap_thread",
                     {
-                        "thread_id": "http-thread",
                         "cwd": str(tmp_path),
                         "max_chars": 100000,
                     },
+                    meta=turn_meta,
                 )
                 bootstrap_text = "\n".join(
                     getattr(item, "text", "") for item in bootstrapped.content
@@ -495,12 +515,36 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 assert "Context Gate: satisfied" in bootstrap_text
                 assert "http-global-rule" in bootstrap_text
                 assert "http-project-rule" in bootstrap_text
+                assert f"Thread ID: {thread_id}" in bootstrap_text
+
+                repeated = await session.call_tool(
+                    "bootstrap_thread",
+                    {"thread_id": thread_id, "cwd": str(tmp_path)},
+                )
+                repeated_text = "\n".join(getattr(item, "text", "") for item in repeated.content)
+                assert "already been bootstrapped" in repeated_text
+
+                wrong = await session.call_tool(
+                    "run_command",
+                    {"command": "printf should-not-run", "session_id": "invented-id", "cwd": str(tmp_path)},
+                    meta={
+                        "x-codex-turn-metadata": {
+                            "session_id": "http-client",
+                            "turn_id": "wrong-id",
+                            "thread_id": conversation_id,
+                        }
+                    },
+                )
+                wrong_text = "\n".join(getattr(item, "text", "") for item in wrong.content)
+                assert wrong.isError is True
+                assert "permanently bound" in wrong_text
+                assert not (tmp_path / "should-not-run").exists()
 
                 goal_set = await session.call_tool(
                     "thread_goal",
                     {
                         "action": "set",
-                        "session_id": "http-thread",
+                        "session_id": thread_id,
                         "objective": "Verify HTTP goal persistence",
                         "finish_conditions": ["Goal survives context reload"],
                         "cwd": str(tmp_path),
@@ -513,7 +557,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 reloaded = await session.call_tool(
                     "get_thread_context",
                     {
-                        "thread_id": "http-thread",
+                        "thread_id": thread_id,
                         "cwd": str(tmp_path),
                         "max_chars": 100000,
                     },
@@ -526,14 +570,14 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 with sqlite3.connect(gpt_home / "thread_usage.db") as connection:
                     connection.execute(
                         "UPDATE thread_goals SET last_seen_at = '2000-01-01T00:00:00Z' WHERE thread_id = ?",
-                        ("http-thread",),
+                        (thread_id,),
                     )
 
                 command = await session.call_tool(
                     "run_command",
                     {
                         "command": "printf ready",
-                        "session_id": "http-thread",
+                        "session_id": thread_id,
                         "cwd": str(tmp_path),
                     },
                 )
@@ -545,7 +589,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                     "watch_image",
                     {
                         "path": str(image_path),
-                        "session_id": "http-thread",
+                        "session_id": thread_id,
                         "cwd": str(tmp_path),
                     },
                 )
@@ -557,7 +601,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 await session.call_tool(
                     "record_token_usage",
                     {
-                        "thread_id": "http-thread",
+                        "thread_id": thread_id,
                         "input_tokens": 200,
                         "output_tokens": 50,
                         "cached_input_tokens": 25,
@@ -566,7 +610,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 )
                 usage = await session.call_tool(
                     "get_token_usage",
-                    {"thread_id": "http-thread", "limit": 10},
+                    {"thread_id": thread_id, "limit": 10},
                 )
                 usage_text = "\n".join(getattr(item, "text", "") for item in usage.content)
                 payload = json.loads(usage_text)

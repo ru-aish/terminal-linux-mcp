@@ -86,7 +86,7 @@ class _ClosingConnection(sqlite3.Connection):
 class DurableLedger:
     """Transactional repository for actors, tasks, commands and cursors."""
 
-    SCHEMA_VERSION = 11
+    SCHEMA_VERSION = 12
 
     def __init__(self, path: Path):
         self.path = Path(path).expanduser().resolve()
@@ -118,7 +118,7 @@ class DurableLedger:
                     agent_id TEXT PRIMARY KEY,
                     orchestration_id TEXT NOT NULL REFERENCES orchestrations(orchestration_id) ON DELETE CASCADE,
                     parent_agent_id TEXT REFERENCES agents(agent_id), root_agent_id TEXT NOT NULL,
-                    chat_id TEXT UNIQUE, project_id TEXT, working_directory TEXT,
+                    chat_id TEXT UNIQUE, terminal_thread_id TEXT UNIQUE, project_id TEXT, working_directory TEXT,
                     title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
                     notification_policy TEXT NOT NULL, context_cursor TEXT, current_node TEXT,
                     last_progress_at REAL, progress_signature TEXT, last_error TEXT NOT NULL DEFAULT '',
@@ -204,6 +204,7 @@ class DurableLedger:
                 ("commands", "purpose", "TEXT NOT NULL DEFAULT 'instruction'"),
                 ("commands", "next_attempt_at", "REAL NOT NULL DEFAULT 0"),
                 ("agents", "last_progress_at", "REAL"),
+                ("agents", "terminal_thread_id", "TEXT"),
                 ("agents", "working_directory", "TEXT"),
                 ("agents", "progress_signature", "TEXT"),
                 ("agents", "creation_request_id", "TEXT"),
@@ -217,6 +218,10 @@ class DurableLedger:
             db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS agents_gateway_agent_id "
                 "ON agents(gateway_agent_id) WHERE gateway_agent_id IS NOT NULL"
+            )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS agents_terminal_thread_id "
+                "ON agents(terminal_thread_id) WHERE terminal_thread_id IS NOT NULL"
             )
             # Rows created before schema v6 had no purpose column. Notification
             # commands are identifiable by their event cursor and must not be

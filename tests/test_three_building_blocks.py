@@ -194,9 +194,10 @@ def test_ledger_owns_schema_and_evidence_columns(tmp_path):
             "creation_user_message_id",
             "gateway_agent_id",
             "gateway_control_operation_id",
+            "terminal_thread_id",
         } <= agent_columns
         assert "gateway_operation_id" in columns
-        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "11"
+        assert db.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()[0] == "12"
         assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 

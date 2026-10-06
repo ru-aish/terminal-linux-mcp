@@ -31,6 +31,7 @@ from chat_gateway import (
     WindowLimit,
 )
 from gateway_agent_orchestrator import GatewayChatAgentCoordinator
+from gpt_thread_store import GPTThreadStore
 
 
 def parent_snapshot() -> dict:
@@ -129,7 +130,7 @@ def fast_config(path: Path) -> GatewayConfig:
     )
 
 
-def make_coordinator(tmp_path: Path):
+def make_coordinator(tmp_path: Path, thread_identity_store=None):
     clock = FakeClock(1000.0)
     backend = FakeBackend()
     gateway_db = tmp_path / "gateway.sqlite"
@@ -153,6 +154,7 @@ def make_coordinator(tmp_path: Path):
         lambda: runtime_factory(runtime),
         gateway,
         maximum_active_children=5,
+        thread_identity_store=thread_identity_store,
     )
     return coordinator, gateway, backend, clock, runtime
 
@@ -198,6 +200,107 @@ def test_spawn_is_queued_and_every_sync_uses_at_most_one_request(tmp_path):
         result["physical_requests"] in {0, 1}
         for result in (create_tick, blocked_tick, verify_tick)
     )
+
+
+
+def test_gateway_binds_one_permanent_thread_id_and_queues_one_identity_handoff(tmp_path, monkeypatch):
+    gpt_home = tmp_path / "gpt-home"
+    monkeypatch.setenv("MCP_GPT_HOME", str(gpt_home))
+    identity_store = GPTThreadStore(lambda: tmp_path)
+    coordinator, gateway, backend, clock, _runtime = make_coordinator(
+        tmp_path, identity_store
+    )
+    parent = run(
+        coordinator.register_parent("parent-chat", working_directory=str(tmp_path))
+    )
+    parent_binding = identity_store.binding_for_conversation("parent-chat")
+    assert parent_binding is not None
+    assert parent["terminal_thread_id"] == parent_binding["thread_id"]
+
+    child = run(
+        coordinator.spawn(
+            parent["agent_id"],
+            "Perform the assigned task only after identity handoff.",
+            project_policy="inherit_parent",
+            idempotency_key="identity-child",
+        )
+    )
+    child_id = child["agent"]["agent_id"]
+    pending_create = [
+        op for op in gateway.ledger.list_operations(state=OperationState.PENDING)
+        if op.type is OperationType.CREATE
+    ]
+    assert len(pending_create) == 1
+    assert "WAITING_FOR_TERMINAL_THREAD_ID" in pending_create[0].payload["prompt"]
+    assert "do not perform the assigned task" in pending_create[0].payload["prompt"]
+
+    create_tick = run(coordinator.sync_once())
+    assert create_tick["physical_requests"] == 1
+    assert create_tick["operation_type"] == "CREATE"
+    gateway_id = coordinator.repository.agent(child_id)["gateway_agent_id"]
+    conversation_id = gateway.ledger.get_agent(gateway_id).conversation_id
+    assert conversation_id
+
+    expected = GPTThreadStore.derive_thread_id(conversation_id)
+    child_row = coordinator.repository.agent(child_id)
+    assert child_row["terminal_thread_id"] == expected
+    assert identity_store.binding_for_conversation(conversation_id)["thread_id"] == expected
+    with coordinator.repository.connect() as db:
+        identity_commands = [
+            dict(row)
+            for row in db.execute(
+                "SELECT * FROM commands WHERE to_agent_id=? AND idempotency_key=?",
+                (child_id, f"thread-identity:{child_id}"),
+            )
+        ]
+    assert len(identity_commands) == 1
+    message = identity_commands[0]["message"]
+    assert expected in message
+    assert "permanently bound" in message
+    assert "Never invent, replace, or switch" in message
+
+    original = backend.threads[conversation_id]
+    backend.set_snapshot(
+        ThreadSnapshot(
+            conversation_id=conversation_id,
+            found=True,
+            running=False,
+            title=original.title,
+            current_node="identity-wait-assistant",
+            turns=(
+                *original.turns[:-1],
+                TurnSnapshot(
+                    "identity-wait-assistant",
+                    "assistant",
+                    "finished_successfully",
+                    "WAITING_FOR_TERMINAL_THREAD_ID",
+                    True,
+                ),
+            ),
+        ),
+        project_id="g-p-project",
+    )
+    clock.advance(1)
+    verify_tick = run(coordinator.sync_once())
+    assert verify_tick["physical_requests"] == 1
+    assert verify_tick["operation_type"] == "VERIFY_CREATION"
+
+    handoff_tick = run(coordinator.sync_once())
+    assert handoff_tick["physical_requests"] == 1
+    assert handoff_tick["operation_type"] == "CONTINUE"
+    assert backend.calls[-1].method == "continue_thread"
+    with coordinator.repository.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM commands WHERE to_agent_id=? AND idempotency_key=?",
+            (child_id, f"thread-identity:{child_id}"),
+        ).fetchone()[0] == 1
+
+    coordinator._ensure_thread_identity(child_id, conversation_id, queue_message=True)
+    with coordinator.repository.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM commands WHERE to_agent_id=? AND idempotency_key=?",
+            (child_id, f"thread-identity:{child_id}"),
+        ).fetchone()[0] == 1
 
 
 def test_five_child_capacity_is_transactional(tmp_path):

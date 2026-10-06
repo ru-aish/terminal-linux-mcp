@@ -125,6 +125,16 @@ class AgentRuntime(Protocol):
 RuntimeFactory = Callable[[], AsyncContextManager[AgentRuntime]]
 
 
+class ThreadIdentityStore(Protocol):
+    def ensure_chat_binding(
+        self,
+        conversation_id: str,
+        *,
+        source: str = "gateway",
+        preferred_thread_id: str | None = None,
+    ) -> dict[str, Any]: ...
+
+
 @dataclass(frozen=True)
 class CoordinatorConfig:
     database_path: Path
@@ -144,10 +154,16 @@ class CoordinatorConfig:
 AgentRepository = DurableLedger
 
 class ChatAgentCoordinator:
-    def __init__(self, config: CoordinatorConfig, runtime_factory: RuntimeFactory):
+    def __init__(
+        self,
+        config: CoordinatorConfig,
+        runtime_factory: RuntimeFactory,
+        thread_identity_store: ThreadIdentityStore | None = None,
+    ):
         self.config = config
         self.repository = AgentRepository(config.database_path)
         self.runtime_factory = runtime_factory
+        self.thread_identity_store = thread_identity_store
         self._lock = asyncio.Lock()
         self._reconcile_inflight_operations()
 
@@ -357,6 +373,93 @@ class ChatAgentCoordinator:
         return str(path)
 
     @staticmethod
+    def _thread_identity_message(thread_id: str, working_directory: str | None) -> str:
+        cwd_instruction = (
+            f" Call bootstrap_thread(thread_id={thread_id!r}, cwd={working_directory!r}) now."
+            if working_directory
+            else f" Call bootstrap_thread(thread_id={thread_id!r}) now."
+        )
+        return (
+            "[TERMINAL MCP THREAD IDENTITY]\n"
+            f"Your permanent Terminal MCP thread ID is {thread_id}. "
+            "It is server-assigned and permanently bound to this ChatGPT conversation. "
+            "Never invent, replace, or switch to another Terminal MCP thread ID."
+            + cwd_instruction
+            + f" After bootstrap succeeds, use session_id={thread_id!r} for every later Terminal MCP call. "
+            "Do not call bootstrap_thread again after the initial successful bootstrap; use "
+            f"get_thread_context(thread_id={thread_id!r}) when context needs to be reloaded. "
+            "Continue the originally assigned task now."
+        )
+
+    def _ensure_thread_identity(
+        self,
+        agent_id: str,
+        conversation_id: str,
+        *,
+        queue_message: bool,
+    ) -> str | None:
+        if self.thread_identity_store is None:
+            return None
+        binding = self.thread_identity_store.ensure_chat_binding(
+            conversation_id,
+            source="agent_gateway",
+            preferred_thread_id=agent_id,
+        )
+        thread_id = str(binding["thread_id"])
+        agent = self.repository.agent(agent_id)
+        if agent is None:
+            raise ValueError("agent was not found while binding thread identity")
+        stored = str(agent.get("terminal_thread_id") or "")
+        if stored and stored != thread_id:
+            raise RuntimeError("agent is already bound to a different Terminal MCP thread ID")
+        task = self.repository.task_for_agent(agent_id)
+        with self.repository.transaction() as db:
+            db.execute(
+                "UPDATE agents SET terminal_thread_id=?,updated_at=? WHERE agent_id=?",
+                (thread_id, _now(), agent_id),
+            )
+            if queue_message and agent.get("parent_agent_id"):
+                key = f"thread-identity:{agent_id}"
+                existing = db.execute(
+                    "SELECT command_id FROM commands WHERE to_agent_id=? AND idempotency_key=? LIMIT 1",
+                    (agent_id, key),
+                ).fetchone()
+                if existing is None:
+                    sequence = int(
+                        db.execute(
+                            "SELECT COALESCE(MAX(sequence_no),0)+1 FROM commands WHERE to_agent_id=?",
+                            (agent_id,),
+                        ).fetchone()[0]
+                    )
+                    command_id = _id("cmd")
+                    db.execute(
+                        "INSERT INTO commands(command_id,from_agent_id,to_agent_id,sequence_no,message,"
+                        "interrupt_policy,status,idempotency_key,purpose,created_at) "
+                        "VALUES(?,?,?,?,?,'queue','queued',?,'instruction',?)",
+                        (
+                            command_id,
+                            str(agent["parent_agent_id"]),
+                            agent_id,
+                            sequence,
+                            self._thread_identity_message(
+                                thread_id,
+                                str(agent.get("working_directory") or "") or None,
+                            ),
+                            key,
+                            _now(),
+                        ),
+                    )
+                    self._insert_event(
+                        db,
+                        agent_id,
+                        str(task["task_id"]) if task else None,
+                        "thread_identity_bound",
+                        {"chat_id": conversation_id, "thread_id": thread_id},
+                        source_cursor=f"thread-identity:{thread_id}",
+                    )
+        return thread_id
+
+    @staticmethod
     def _progress_signature(snapshot: dict[str, Any]) -> str:
         turns = snapshot.get("turns")
         normalized_turns = turns if isinstance(turns, list) else []
@@ -418,6 +521,10 @@ class ChatAgentCoordinator:
                         (requested_working_directory, _now(), existing["agent_id"]),
                     )
                 existing = self.repository.agent(existing["agent_id"]) or existing
+            self._ensure_thread_identity(
+                str(existing["agent_id"]), chat_id, queue_message=False
+            )
+            existing = self.repository.agent(existing["agent_id"]) or existing
             return self._public_agent(existing)
 
         async with self.runtime_factory() as runtime:
@@ -467,8 +574,13 @@ class ChatAgentCoordinator:
         except sqlite3.IntegrityError:
             concurrent = self.repository.agent_by_chat(chat_id)
             if concurrent:
+                self._ensure_thread_identity(
+                    str(concurrent["agent_id"]), chat_id, queue_message=False
+                )
+                concurrent = self.repository.agent(concurrent["agent_id"]) or concurrent
                 return self._public_agent(concurrent)
             raise
+        self._ensure_thread_identity(agent_id, chat_id, queue_message=False)
         return self._public_agent(self.repository.agent(agent_id) or {})
 
     async def list_projects(self, *, limit: int = 20, cursor: str | None = None) -> dict[str, Any]:
@@ -499,6 +611,7 @@ class ChatAgentCoordinator:
         orchestration_id: str,
         project_id: str | None,
         working_directory: str | None,
+        await_thread_identity: bool = False,
     ) -> str:
         identity = (
             "[TERMINAL MCP AGENT CONTEXT]\n"
@@ -518,11 +631,20 @@ class ChatAgentCoordinator:
             "generic continuation. The parent replies with purpose='answer'. Use the "
             "default purpose for non-blocking updates.\n"
             + (
-                "Before terminal work, call bootstrap_thread with thread_id equal to "
-                f"your agent_id and cwd={working_directory!r}. Reuse agent_id as "
-                "session_id in every later Terminal MCP call."
-                if working_directory
-                else "Before terminal work, obtain a working_directory from your parent."
+                "Do not call bootstrap_thread or any other Terminal MCP tool yet. "
+                "This conversation does not receive its permanent Terminal MCP thread ID until "
+                "the gateway observes the newly created ChatGPT conversation ID. End this initial "
+                "turn with exactly WAITING_FOR_TERMINAL_THREAD_ID, do not perform the assigned task, "
+                "and do not output the completion marker. A follow-up message will provide the one "
+                "permanent thread ID and tell you to continue."
+                if await_thread_identity
+                else (
+                    "Before terminal work, call bootstrap_thread with thread_id equal to "
+                    f"your agent_id and cwd={working_directory!r}. Reuse agent_id as "
+                    "session_id in every later Terminal MCP call."
+                    if working_directory
+                    else "Before terminal work, obtain a working_directory from your parent."
+                )
             )
         )
         completion = ""
@@ -633,6 +755,7 @@ class ChatAgentCoordinator:
                 },
                 source_cursor=f"creation-uncertain:{task_id}",
             )
+        self._ensure_thread_identity(agent_id, chat_id, queue_message=True)
 
     async def _create_reserved_agent(
         self,
@@ -686,6 +809,7 @@ class ChatAgentCoordinator:
             working_directory=(
                 str(agent.get("working_directory") or "") or None
             ),
+            await_thread_identity=self.thread_identity_store is not None,
         )
         with self.repository.transaction() as db:
             db.execute(
@@ -763,6 +887,7 @@ class ChatAgentCoordinator:
                 {"chat_id": chat_id, "project_id": project_id},
                 source_cursor=f"started:{task['task_id']}",
             )
+        self._ensure_thread_identity(agent_id, chat_id, queue_message=True)
 
     async def _recover_one_creation(
         self,
@@ -2628,6 +2753,7 @@ class ChatAgentCoordinator:
                 "parent_agent_id",
                 "root_agent_id",
                 "chat_id",
+                "terminal_thread_id",
                 "project_id",
                 "working_directory",
                 "title",

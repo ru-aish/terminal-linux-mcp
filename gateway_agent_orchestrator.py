@@ -14,6 +14,7 @@ from chat_agent_orchestrator import (
     ChatAgentCoordinator,
     CoordinatorConfig,
     RuntimeFactory,
+    ThreadIdentityStore,
     _id,
     _now,
     _safe_error,
@@ -57,8 +58,9 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
         gateway: ChatGateway,
         *,
         maximum_active_children: int = 5,
+        thread_identity_store: ThreadIdentityStore | None = None,
     ) -> None:
-        super().__init__(config, runtime_factory)
+        super().__init__(config, runtime_factory, thread_identity_store)
         self.gateway = gateway
         self.maximum_active_children = max(1, int(maximum_active_children))
         self._adopt_existing_conversations()
@@ -76,6 +78,11 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
                 )
             ]
         for row in rows:
+            self._ensure_thread_identity(
+                str(row["agent_id"]),
+                str(row["chat_id"]),
+                queue_message=bool(row.get("parent_agent_id")),
+            )
             gateway_id = str(
                 self.gateway.register_existing(
                     project_id=str(row.get("project_id") or ""),
@@ -351,6 +358,7 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
             orchestration_id=str(parent["orchestration_id"]),
             project_id=selected_project,
             working_directory=selected_working_directory,
+            await_thread_identity=self.thread_identity_store is not None,
         )
         try:
             gateway_agent_id, operation_id = self.gateway.enqueue_create(
@@ -1069,6 +1077,13 @@ class GatewayChatAgentCoordinator(ChatAgentCoordinator):
             previous_signature = str(domain.get("progress_signature") or "")
             status = self._domain_status_from_gateway(domain, gateway_agent.state)
             now = _now()
+            if gateway_agent.conversation_id:
+                self._ensure_thread_identity(
+                    str(domain["agent_id"]),
+                    gateway_agent.conversation_id,
+                    queue_message=bool(domain.get("parent_agent_id")),
+                )
+                domain = self.repository.agent(str(domain["agent_id"])) or domain
             with self.repository.transaction() as db:
                 if gateway_agent.conversation_id and not domain.get("chat_id"):
                     self._insert_event(
