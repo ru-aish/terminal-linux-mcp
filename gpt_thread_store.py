@@ -77,6 +77,18 @@ class GPTThreadStore:
         agents = self.agents_path()
         if not agents.exists():
             agents.write_text(self.default_agents, encoding="utf-8")
+        else:
+            content = agents.read_text(encoding="utf-8", errors="replace")
+            legacy = (
+                "2. Start each new model thread by calling `bootstrap_thread` with a unique, stable `thread_id`.\n"
+                "3. Reuse that same value as `session_id` for all later terminal tools in the thread."
+            )
+            replacement = (
+                "2. Never invent or replace a Terminal MCP thread ID. Each ChatGPT conversation has one permanent server-assigned thread ID.\n"
+                "3. Call `bootstrap_thread` exactly once with the assigned thread ID, then reuse that same value as `session_id` for all later terminal tools in the conversation."
+            )
+            if legacy in content:
+                agents.write_text(content.replace(legacy, replacement, 1), encoding="utf-8")
         self._init_db()
         return home
 
@@ -568,6 +580,19 @@ class GPTThreadStore:
             ).fetchone()
         return self._goal_row(updated)
 
+    def complete_initial_bootstrap(self, thread_id: str, cwd: Path, fingerprint: str) -> bool:
+        """Commit the single successful bootstrap atomically across server processes."""
+        self._init_db()
+        now = self._now()
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE threads SET cwd=?,context_fingerprint=?,context_loaded_at=?,"
+                "bootstrap_count=1,updated_at=? WHERE thread_id=? AND bootstrap_count=0 "
+                "AND EXISTS (SELECT 1 FROM chat_thread_bindings WHERE thread_id=threads.thread_id)",
+                (str(cwd), fingerprint, now, now, thread_id),
+            )
+            return result.rowcount == 1
+
     def upsert_thread(
         self,
         thread_id: str,
@@ -580,6 +605,7 @@ class GPTThreadStore:
         self._init_db()
         now = self._now()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 "SELECT bootstrap_count, created_at, context_loaded_at FROM threads WHERE thread_id = ?",
                 (thread_id,),

@@ -320,11 +320,19 @@ def _tool_identity_error(server: FastMCP, arguments: dict[str, Any]) -> str | No
         return None
     host_identity = _host_conversation_identity(server)
     if not host_identity:
-        return None
+        try:
+            server.get_context().request_context
+        except (LookupError, ValueError):
+            # Direct, server-owned calls have no external request context.
+            return None
+        return (
+            "Terminal MCP requires host-provided conversation identity metadata. "
+            "A supplied thread ID alone cannot prove which ChatGPT conversation is calling. "
+            "The gateway must attach the conversation identity before this tool can run."
+        )
     binding = GPT_STORE.ensure_chat_binding(
         host_identity,
         source="host_metadata",
-        preferred_thread_id=candidate,
     )
     expected = str(binding["thread_id"])
     if candidate == expected:
@@ -708,7 +716,6 @@ def _resolve_request_thread_id(requested_thread_id: str | None) -> tuple[str, st
         binding = GPT_STORE.ensure_chat_binding(
             host_identity,
             source="host_metadata",
-            preferred_thread_id=requested,
         )
         expected = str(binding["thread_id"])
         if requested and requested != expected:
@@ -2822,22 +2829,24 @@ async def _load_thread_context(
     run_cwd = _resolve_cwd(cwd, session.cwd) if cwd else session.cwd.resolve()
     full, root, rows, fingerprint = _build_thread_context_document(normalized, run_cwd)
     if max_chars > 0 and len(full) > max_chars:
+        retry_tool = "bootstrap_thread" if event_type == "thread_bootstrap" else "get_thread_context"
         return full[:max_chars] + (
             f"\n\n[Context truncated to {max_chars} of {len(full)} chars. Context gate remains unsatisfied. "
-            "Call get_thread_context again with a larger max_chars.]"
+            f"Call {retry_tool} again with a larger max_chars.]"
         )
 
+    if event_type == "thread_bootstrap":
+        if not GPT_STORE.complete_initial_bootstrap(normalized, run_cwd, fingerprint):
+            return (
+                f"Error: thread_id {normalized!r} has already been bootstrapped for this ChatGPT conversation. "
+                "Its identity is immutable. Use get_thread_context with the same thread ID to reload context."
+            )
+    else:
+        _upsert_thread_record(normalized, run_cwd, fingerprint, loaded=True)
     session.cwd = run_cwd
     session.context_fingerprints[_context_key(run_cwd)] = fingerprint
     session.bootstrapped_at = time.time()
     session.updated_at = time.time()
-    _upsert_thread_record(
-        normalized,
-        run_cwd,
-        fingerprint,
-        loaded=True,
-        bootstrap=(event_type == "thread_bootstrap"),
-    )
     estimated_tokens = _estimate_tokens(full)
     _record_usage_event(
         normalized,

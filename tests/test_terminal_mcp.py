@@ -48,6 +48,27 @@ def bound_thread(label: str) -> str:
     )["thread_id"]
 
 
+def test_ensure_layout_migrates_only_legacy_thread_identity_rules(tmp_path, monkeypatch):
+    home = isolated_home(tmp_path, monkeypatch)
+    gpt_home = home / ".GPT"
+    gpt_home.mkdir()
+    agents = gpt_home / "AGENTS.md"
+    agents.write_text(
+        "# Custom\n\n"
+        "2. Start each new model thread by calling `bootstrap_thread` with a unique, stable `thread_id`.\n"
+        "3. Reuse that same value as `session_id` for all later terminal tools in the thread.\n"
+        "99. preserve-this-custom-rule\n",
+        encoding="utf-8",
+    )
+
+    terminal_mcp.GPT_STORE.ensure_layout()
+    migrated = agents.read_text(encoding="utf-8")
+    assert "Never invent or replace a Terminal MCP thread ID" in migrated
+    assert "exactly once with the assigned thread ID" in migrated
+    assert "unique, stable `thread_id`" not in migrated
+    assert "99. preserve-this-custom-rule" in migrated
+
+
 def test_chat_binding_preserves_existing_bootstrapped_thread_id(tmp_path, monkeypatch):
     isolated_home(tmp_path, monkeypatch)
     legacy_thread_id = "agent_legacy_thread"
@@ -82,6 +103,45 @@ def test_chat_binding_preserves_existing_bootstrapped_thread_id(tmp_path, monkey
 def test_exact_public_tool_list():
     tools = run(terminal_mcp.mcp.list_tools())
     assert [tool.name for tool in tools] == EXPECTED_TOOLS
+
+
+def test_initial_bootstrap_commit_is_atomic_across_store_instances(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    thread_id = bound_thread("concurrent-bootstrap")
+    stores = [terminal_mcp.GPT_STORE.__class__(lambda: tmp_path) for _ in range(8)]
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        results = list(pool.map(
+            lambda store: store.complete_initial_bootstrap(thread_id, tmp_path, "fingerprint"),
+            stores,
+        ))
+    assert results.count(True) == 1
+    assert terminal_mcp.GPT_STORE.get_thread(thread_id)["bootstrap_count"] == 1
+
+
+def test_chat_binding_creation_is_idempotent_under_concurrency(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    stores = [terminal_mcp.GPT_STORE.__class__(lambda: tmp_path) for _ in range(8)]
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        bindings = list(pool.map(lambda store: store.ensure_chat_binding("same-chat"), stores))
+    expected = terminal_mcp.GPT_STORE.derive_thread_id("same-chat")
+    assert {binding["thread_id"] for binding in bindings} == {expected}
+    reopened = terminal_mcp.GPT_STORE.__class__(lambda: tmp_path)
+    assert reopened.ensure_chat_binding("same-chat")["thread_id"] == expected
+    assert reopened.ensure_chat_binding("different-chat")["thread_id"] != expected
+    with reopened._connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM chat_thread_bindings").fetchone()[0] == 2
+
+
+def test_host_metadata_cannot_claim_unowned_legacy_bootstrap(tmp_path, monkeypatch):
+    isolated_home(tmp_path, monkeypatch)
+    legacy = "bootstrapped-by-another-chat"
+    terminal_mcp.GPT_STORE.upsert_thread(legacy, tmp_path, "old", loaded=True, bootstrap=True)
+    monkeypatch.setattr(terminal_mcp, "_host_conversation_identity", lambda _server: "new-chat")
+    resolved, error = terminal_mcp._resolve_request_thread_id(legacy)
+    assert resolved == ""
+    assert "not allowed" in error
+    assert terminal_mcp.GPT_STORE.binding_for_conversation("new-chat")["thread_id"] != legacy
+    assert terminal_mcp.GPT_STORE.binding_for_thread(legacy) is None
 
 
 def test_bearer_auth_middleware():
@@ -142,6 +202,7 @@ def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
     ))
     assert "Context truncated" in truncated
     assert "Context Gate: satisfied" not in truncated
+    assert "Call bootstrap_thread again with a larger max_chars" in truncated
 
     loaded = run(terminal_mcp.bootstrap_thread(
         thread_id=thread_id, cwd=str(project), max_chars=100000

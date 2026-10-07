@@ -150,7 +150,10 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
                 elicitation_callback=elicitation_callback,
             ) as session:
                 await session.initialize()
-                return await session.call_tool(tool, arguments, meta=meta)
+                return await session.call_tool(tool, arguments, meta=(
+                    {"x-codex-turn-metadata": {"thread_id": "conversation-http-persistence"}}
+                    if meta is None else meta
+                ))
 
     def text(result) -> str:
         return "\n".join(getattr(item, "text", "") for item in result.content)
@@ -288,15 +291,10 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
                 "session_id": session_id,
                 "cwd": str(tmp_path),
             },
+            meta={},
         )
-        wrapper_fallback_metadata = json.loads(text(wrapper_fallback_result))
-        assert set(wrapper_fallback_metadata) == {"x-codex-turn-metadata"}
-        fallback_turn = wrapper_fallback_metadata["x-codex-turn-metadata"]
-        assert fallback_turn["session_id"] == session_id
-        assert fallback_turn["thread_id"] == session_id
-        assert fallback_turn["thread_source"] == "terminal_mcp"
-        assert fallback_turn["turn_id"].startswith("terminal-mcp-")
-        assert wrapper_fallback_result.meta == {"downstream-turn-metadata": fallback_turn}
+        assert wrapper_fallback_result.isError is True
+        assert "host-provided conversation identity" in text(wrapper_fallback_result)
 
         elicitation_requests = []
 
@@ -397,9 +395,10 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
         no_metadata_result = await call(
             "local_mcp",
             {**metadata_call, "server": "generic-http"},
+            meta={},
         )
-        assert json.loads(text(no_metadata_result)) == {}
-        assert no_metadata_result.meta == {"downstream-turn-metadata": None}
+        assert no_metadata_result.isError is True
+        assert "host-provided conversation identity" in text(no_metadata_result)
 
         await call(
             "local_mcp",
@@ -448,23 +447,26 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
     env["MCP_WORKSPACE"] = str(tmp_path)
     env["MCP_LOG_DIR"] = str(tmp_path / "logs")
     env["MCP_GPT_HOME"] = str(gpt_home)
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            str(REPO_ROOT / "terminal_mcp.py"),
-            "--transport",
-            "streamable-http",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    def launch_server():
+        return subprocess.Popen(
+            [
+                sys.executable,
+                str(REPO_ROOT / "terminal_mcp.py"),
+                "--transport",
+                "streamable-http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    process = launch_server()
 
     async def exercise() -> None:
         conversation_id = "conversation-http-bootstrap"
@@ -485,6 +487,11 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 assert "Project-specific .GPT instructions are loaded" in (initialized.instructions or "")
                 assert "http-skill" in (initialized.instructions or "")
                 assert "bootstrap_thread" in (initialized.instructions or "")
+
+                raw_call = session.call_tool
+                async def call_with_identity(name, arguments=None, *, meta=None, **kwargs):
+                    return await raw_call(name, arguments, meta=turn_meta if meta is None else meta, **kwargs)
+                session.call_tool = call_with_identity
 
                 tools = await session.list_tools()
                 names = [tool.name for tool in tools.tools]
@@ -526,7 +533,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
 
                 wrong = await session.call_tool(
                     "run_command",
-                    {"command": "printf should-not-run", "session_id": "invented-id", "cwd": str(tmp_path)},
+                    {"command": "touch should-not-run", "session_id": "invented-id", "cwd": str(tmp_path)},
                     meta={
                         "x-codex-turn-metadata": {
                             "session_id": "http-client",
@@ -539,6 +546,32 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 assert wrong.isError is True
                 assert "permanently bound" in wrong_text
                 assert not (tmp_path / "should-not-run").exists()
+
+                missing_identity = await session.call_tool(
+                    "run_command",
+                    {"command": "touch missing-identity-ran", "session_id": thread_id, "cwd": str(tmp_path)},
+                    meta={},
+                )
+                assert missing_identity.isError is True
+                assert "host-provided conversation identity" in "\n".join(getattr(item, "text", "") for item in missing_identity.content)
+                assert not (tmp_path / "missing-identity-ran").exists()
+
+                fallback_identity = await session.call_tool(
+                    "run_command",
+                    {"command": "touch fallback-identity-ran", "session_id": thread_id, "cwd": str(tmp_path)},
+                    meta={"x-codex-turn-metadata": {"thread_id": conversation_id, "thread_source": "terminal_mcp"}},
+                )
+                assert fallback_identity.isError is True
+                assert not (tmp_path / "fallback-identity-ran").exists()
+
+                cross_chat = await session.call_tool(
+                    "run_command",
+                    {"command": "touch cross-chat-ran", "session_id": thread_id, "cwd": str(tmp_path)},
+                    meta={"x-codex-turn-metadata": {"thread_id": "another-chat"}},
+                )
+                assert cross_chat.isError is True
+                assert "permanently bound" in "\n".join(getattr(item, "text", "") for item in cross_chat.content)
+                assert not (tmp_path / "cross-chat-ran").exists()
 
                 goal_set = await session.call_tool(
                     "thread_goal",
@@ -631,6 +664,36 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
     try:
         _wait_for_port(port, process)
         asyncio.run(exercise())
+    finally:
+        process.terminate()
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
+
+
+    async def exercise_after_restart():
+        conversation_id = "conversation-http-bootstrap"
+        thread_id = GPTThreadStore.derive_thread_id(conversation_id)
+        meta = {"x-codex-turn-metadata": {"thread_id": conversation_id, "turn_id": "after-restart"}}
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                repeated = await session.call_tool("bootstrap_thread", {"thread_id": thread_id, "cwd": str(tmp_path)}, meta=meta)
+                assert "already been bootstrapped" in "\n".join(getattr(item, "text", "") for item in repeated.content)
+                refreshed = await session.call_tool("get_thread_context", {"thread_id": thread_id, "cwd": str(tmp_path), "max_chars": 100000}, meta=meta)
+                assert "Context Gate: satisfied" in "\n".join(getattr(item, "text", "") for item in refreshed.content)
+                command = await session.call_tool("run_command", {"command": "printf restart-ok", "session_id": thread_id, "cwd": str(tmp_path)}, meta=meta)
+                assert "restart-ok" in "\n".join(getattr(item, "text", "") for item in command.content)
+        with sqlite3.connect(gpt_home / "thread_usage.db") as db:
+            assert db.execute("SELECT bootstrap_count FROM threads WHERE thread_id=?", (thread_id,)).fetchone()[0] == 1
+            assert db.execute("SELECT thread_id FROM chat_thread_bindings WHERE conversation_id=?", (conversation_id,)).fetchone()[0] == thread_id
+
+    process = launch_server()
+    try:
+        _wait_for_port(port, process)
+        asyncio.run(exercise_after_restart())
     finally:
         process.terminate()
         try:
