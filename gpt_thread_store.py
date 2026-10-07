@@ -24,7 +24,7 @@ from Codex's `~/.codex/AGENTS.md`.
 
 1. Treat every instruction in this file and every applicable project `.GPT/AGENTS.md` as mandatory.
 2. Never invent or replace a Terminal MCP thread ID. Each ChatGPT conversation has one permanent server-assigned thread ID.
-3. Call `bootstrap_thread` exactly once with the assigned thread ID, then reuse that same value as `session_id` for all later terminal tools in the conversation.
+3. If no thread ID is assigned, request `bootstrap_thread` with the exact latest user message. Once assigned, bootstrap is forbidden; call `get_thread_context` with that ID and reuse it as `session_id` for all later terminal tools.
 4. If context is lost, compacted, changed, or uncertain, call `get_thread_context` before continuing.
 5. Read relevant listed skills before performing specialized work.
 6. Inspect nested MCP tool schemas before invoking them.
@@ -85,10 +85,15 @@ class GPTThreadStore:
             )
             replacement = (
                 "2. Never invent or replace a Terminal MCP thread ID. Each ChatGPT conversation has one permanent server-assigned thread ID.\n"
+                "3. If no thread ID is assigned, request `bootstrap_thread` with the exact latest user message. Once assigned, bootstrap is forbidden; call `get_thread_context` with that ID and reuse it as `session_id` for all later terminal tools."
+            )
+            previous = (
                 "3. Call `bootstrap_thread` exactly once with the assigned thread ID, then reuse that same value as `session_id` for all later terminal tools in the conversation."
             )
-            if legacy in content:
-                agents.write_text(content.replace(legacy, replacement, 1), encoding="utf-8")
+            current = replacement.splitlines()[1]
+            migrated = content.replace(legacy, replacement, 1).replace(previous, current, 1)
+            if migrated != content:
+                agents.write_text(migrated, encoding="utf-8")
         self._init_db()
         return home
 
@@ -122,8 +127,24 @@ class GPTThreadStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            # WAL persists in the database. Changing modes on every connection
+            # can race a concurrent first-open/schema write, and this PRAGMA
+            # may return SQLITE_BUSY immediately despite the connection timeout.
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                        connection.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as error:
+                    if not any(word in str(error).lower() for word in ("locked", "busy")) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.02)
+            connection.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def _init_db(self) -> None:

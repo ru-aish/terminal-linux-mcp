@@ -1426,6 +1426,7 @@ class ChatWatchdog:
                 f"supported adapters are {DIRECT_ADAPTER_NAME!r} and {CODEX_INTERNAL_ADAPTER_NAME!r}"
             )
         self.clock = clock
+        self.identity_listing_observer = None
         self._runtime_ensure = runtime_ensure
         self._task: asyncio.Task[None] | None = None
         self._scan_lock = asyncio.Lock()
@@ -1503,6 +1504,7 @@ class ChatWatchdog:
         cursor: str | None = None
         seen_cursors: set[str] = set()
         requests = 0
+        next_cursor = ""
         for _ in range(MAX_PROJECT_DISCOVERY_PAGES):
             payload = await adapter.list_project_threads(project_id, limit=50, cursor=cursor)
             requests += 1
@@ -1521,6 +1523,11 @@ class ChatWatchdog:
                 break
             seen_cursors.add(next_cursor)
             cursor = next_cursor
+        if self.identity_listing_observer is not None:
+            # Complete listings may be reused for identity matching without
+            # another backend request. Prefix/partial scans cannot set a baseline.
+            complete = not next_cursor and stop_after_seen is None
+            self.identity_listing_observer(project_id, items, complete=complete)
         return items, requests
 
     @staticmethod

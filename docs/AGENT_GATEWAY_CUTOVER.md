@@ -35,7 +35,7 @@ CHAT_GATEWAY_MODEL_SLUG=gpt-5-6-thinking
 
 5. Start Terminal MCP once. Do not run the old and new coordinators concurrently against the same domain database.
 6. Verify the process, port, MCP endpoint, `/dashboard`, `/dashboard/agents`, and `/dashboard/agents/api`.
-7. Call `bootstrap_thread` from a new MCP client and confirm the core behavior appears before `.GPT/AGENTS.md` and the `terminal-mcp-subagents` skill is listed.
+7. Load context using `get_thread_context` with a server-assigned ID and confirm the core behavior appears before `.GPT/AGENTS.md` and the `terminal-mcp-subagents` skill is listed.
 8. Call `agent_sync` while idle and confirm `physical_requests` is `0`.
 9. Run one bounded child canary. Confirm each sync result reports `physical_requests` as `0` or `1`, create and verification occur in separate ticks, and the dashboard records the request events.
 

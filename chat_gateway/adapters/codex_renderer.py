@@ -246,8 +246,7 @@ class CodexRendererBackend:
         message: str,
         idempotency_key: str,
     ) -> MutationResult:
-        del idempotency_key
-        user_message_id = str(uuid.uuid4())
+        user_message_id = str(uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key))
         expression = f"""
         (async () => {{
           {_BRIDGE}
@@ -384,6 +383,34 @@ class CodexRendererBackend:
                 )
             )
         return tuple(snapshots)
+
+    async def list_discovery_threads(
+        self, *, project_id: str = "", cursor: str | None = None, offset: int = 0
+    ) -> Mapping[str, Any]:
+        """One desktop listing request, preserving previews and pagination."""
+        from chat_internal_client import normalize_project_threads
+
+        request = (
+            "client.listProjectConversations({projectId:" + json.dumps(project_id)
+            + ",limit:50,cursor:" + json.dumps(cursor) + ",ownedOnly:true})"
+            if project_id else
+            "client.list({offset:" + str(int(offset)) + ",limit:50,order:'updated'})"
+        )
+        payload = self._evaluate(
+            "(async()=>{" + _BRIDGE + "const {client}=await resolveClient();"
+            + "return plain(await " + request + ");})()"
+        )
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            raise MalformedBackendResponse("discovery listing items are missing")
+        normalized = normalize_project_threads(payload, project_id)
+        if not project_id and "total" not in payload:
+            raise MalformedBackendResponse("general listing total is missing; pagination is unverified")
+        normalized["next_offset"] = (
+            offset + len(payload["items"])
+            if not project_id and offset + len(payload["items"]) < int(payload.get("total") or 0)
+            else None
+        )
+        return normalized
 
     def _target(self) -> _Target:
         try:
@@ -574,7 +601,7 @@ def _normalize_conversation(raw: Any, requested_id: str) -> ThreadSnapshot:
                 )
         cursor = str(node.get("parent") or "")
     turns = tuple(reversed(reverse))
-    latest = turns[-1] if turns else None
+    latest = next((turn for turn in reversed(turns) if turn.role == "assistant"), None)
     running = bool(
         latest
         and latest.role == "assistant"

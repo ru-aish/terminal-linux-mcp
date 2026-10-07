@@ -441,7 +441,7 @@ def test_default_completion_contract_and_automatic_continuation(tmp_path):
         assert f"root_agent_id: {parent['agent_id']}" in prompt
         assert f"orchestration_id: {parent['orchestration_id']}" in prompt
         assert f"working_directory: {tmp_path}" in prompt
-        assert "call bootstrap_thread with thread_id equal to your agent_id" in prompt
+        assert "wait for your permanent server-assigned thread ID" in prompt
         assert child["agent"]["working_directory"] == str(tmp_path)
 
         runtime.snapshots["child-chat-1"] = terminal_snapshot("child-chat-1")

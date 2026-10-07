@@ -554,7 +554,8 @@ class SQLiteLedger:
         connection.execute(
             f"""
             UPDATE operations
-            SET state='PENDING', claim_token=NULL, claim_expires_at=NULL,
+            SET state=CASE WHEN type='CONTINUE' AND max_attempts=1 THEN 'FAILED' ELSE 'PENDING' END,
+                claim_token=NULL, claim_expires_at=NULL,
                 due_at=?, attempts=attempts+1, updated_at=?,
                 last_error='claim lease expired before finalization'
             WHERE id IN ({placeholders})

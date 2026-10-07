@@ -64,7 +64,7 @@ def test_ensure_layout_migrates_only_legacy_thread_identity_rules(tmp_path, monk
     terminal_mcp.GPT_STORE.ensure_layout()
     migrated = agents.read_text(encoding="utf-8")
     assert "Never invent or replace a Terminal MCP thread ID" in migrated
-    assert "exactly once with the assigned thread ID" in migrated
+    assert "Once assigned, bootstrap is forbidden" in migrated
     assert "unique, stable `thread_id`" not in migrated
     assert "99. preserve-this-custom-rule" in migrated
 
@@ -197,14 +197,14 @@ def test_project_context_gate_and_truncation(tmp_path, monkeypatch):
     ))
     assert "GPT thread context has not been loaded" in blocked_new_thread
 
-    truncated = run(terminal_mcp.bootstrap_thread(
+    truncated = run(terminal_mcp.get_thread_context(
         thread_id=thread_id, cwd=str(project), max_chars=280
     ))
     assert "Context truncated" in truncated
     assert "Context Gate: satisfied" not in truncated
-    assert "Call bootstrap_thread again with a larger max_chars" in truncated
+    assert "Call get_thread_context again with a larger max_chars" in truncated
 
-    loaded = run(terminal_mcp.bootstrap_thread(
+    loaded = run(terminal_mcp.get_thread_context(
         thread_id=thread_id, cwd=str(project), max_chars=100000
     ))
     assert "global-gpt-rule" in loaded
@@ -254,7 +254,7 @@ def test_thread_goal_lifecycle_and_bootstrap_restoration(tmp_path, monkeypatch):
     (project / ".git").mkdir()
     thread_id = bound_thread("goal-lifecycle-thread")
 
-    run(terminal_mcp.bootstrap_thread(thread_id, str(project), max_chars=100000))
+    run(terminal_mcp.get_thread_context(thread_id, str(project), max_chars=100000))
     created = json.loads(run(terminal_mcp.thread_goal(
         action="set",
         session_id=thread_id,
@@ -334,7 +334,7 @@ def test_due_goal_reminder_appends_once_to_text_image_and_error(tmp_path, monkey
     image_path.write_bytes(image_bytes)
     thread_id = bound_thread("goal-reminder-thread")
 
-    run(terminal_mcp.bootstrap_thread(thread_id, str(project), max_chars=100000))
+    run(terminal_mcp.get_thread_context(thread_id, str(project), max_chars=100000))
     run(terminal_mcp.thread_goal(
         action="set",
         session_id=thread_id,
@@ -417,7 +417,7 @@ def test_bounded_command_capture_spills_large_output(tmp_path, monkeypatch):
     (project / ".GPT" / "AGENTS.md").write_text("rule", encoding="utf-8")
     monkeypatch.setattr(terminal_mcp, "CAPTURE_MEMORY_CHARS", 128)
     thread_id = bound_thread("bounded-output")
-    run(terminal_mcp.bootstrap_thread(thread_id=thread_id, cwd=str(project), max_chars=100000))
+    run(terminal_mcp.get_thread_context(thread_id=thread_id, cwd=str(project), max_chars=100000))
     result = run(terminal_mcp.run_command(
         "python -c \"print('x' * 4096)\"",
         session_id=thread_id,
@@ -437,7 +437,7 @@ def test_run_command_preserves_original_exit_code(tmp_path, monkeypatch):
     (project / ".GPT").mkdir()
     (project / ".GPT" / "AGENTS.md").write_text("rule", encoding="utf-8")
     thread_id = bound_thread("exit-code-thread")
-    run(terminal_mcp.bootstrap_thread(thread_id=thread_id, cwd=str(project), max_chars=100000))
+    run(terminal_mcp.get_thread_context(thread_id=thread_id, cwd=str(project), max_chars=100000))
 
     result = run(terminal_mcp.run_command(
         "python -c 'raise SystemExit(7)'",
@@ -465,7 +465,7 @@ def test_local_skills_list_read_and_search(tmp_path, monkeypatch):
     skill.write_text("# Demo\nUseful terminal workflow\n", encoding="utf-8")
 
     session = bound_thread("skills-test")
-    run(terminal_mcp.bootstrap_thread(thread_id=session, cwd=str(tmp_path), max_chars=100000))
+    run(terminal_mcp.get_thread_context(thread_id=session, cwd=str(tmp_path), max_chars=100000))
 
     listing = json.loads(run(terminal_mcp.local_skills(
         cwd=str(tmp_path), session_id=session
@@ -532,7 +532,7 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
 
     async def lifecycle():
         session = bound_thread("mcp-test")
-        await terminal_mcp.bootstrap_thread(thread_id=session, cwd=str(tmp_path), max_chars=100000)
+        await terminal_mcp.get_thread_context(thread_id=session, cwd=str(tmp_path), max_chars=100000)
 
         async def request(*args, **kwargs):
             # Each proxy call runs in a fresh task, matching separate HTTP tool
@@ -563,7 +563,7 @@ def test_local_mcp_persists_reconnects_resets_and_locks_profiles(tmp_path, monke
         assert connected["servers"][0]["status"] == "connected"
 
         other_owner = bound_thread("other-owner")
-        await terminal_mcp.bootstrap_thread(thread_id=other_owner, cwd=str(tmp_path), max_chars=100000)
+        await terminal_mcp.get_thread_context(thread_id=other_owner, cwd=str(tmp_path), max_chars=100000)
         busy = await request(
             "call",
             server="stateful",
@@ -607,7 +607,7 @@ def test_filesystem_and_process_lifecycle(tmp_path, monkeypatch):
 
     async def lifecycle():
         session = bound_thread("fs-test")
-        await terminal_mcp.bootstrap_thread(thread_id=session, cwd=str(tmp_path), max_chars=100000)
+        await terminal_mcp.get_thread_context(thread_id=session, cwd=str(tmp_path), max_chars=100000)
         assert "Bytes Written: 5" in await terminal_mcp.write_file(
             "one.txt", "alpha", session_id=session, cwd=str(tmp_path)
         )
@@ -631,7 +631,7 @@ def test_filesystem_and_process_lifecycle(tmp_path, monkeypatch):
         )
 
         other_session = bound_thread("fs-test-other")
-        await terminal_mcp.bootstrap_thread(thread_id=other_session, cwd=str(tmp_path), max_chars=100000)
+        await terminal_mcp.get_thread_context(thread_id=other_session, cwd=str(tmp_path), max_chars=100000)
         denied = await terminal_mcp.poll_process(process_id, session_id=other_session)
         assert f"not owned by session {other_session}" in denied
         denied_stop = await terminal_mcp.stop_process(process_id, session_id=other_session)
@@ -682,7 +682,7 @@ def test_process_completion_bot_queues_exactly_one_continue(tmp_path, monkeypatc
     monkeypatch.setattr(terminal_mcp, "get_chat_agent_service", lambda: service)
 
     async def lifecycle():
-        await terminal_mcp.bootstrap_thread(
+        await terminal_mcp.get_thread_context(
             session_id, str(project), max_chars=100000
         )
         started = await terminal_mcp.start_process(
@@ -763,7 +763,7 @@ def test_watch_image_returns_native_image_content(tmp_path, monkeypatch):
     assert "session_id='default' is intentionally rejected" in blocked.content[0].text
 
     session = bound_thread("watch-image-test")
-    run(terminal_mcp.bootstrap_thread(session, str(tmp_path), max_chars=100000))
+    run(terminal_mcp.get_thread_context(session, str(tmp_path), max_chars=100000))
     result = run(terminal_mcp.watch_image(
         str(image), session_id=session, cwd=str(tmp_path)
     ))
@@ -841,7 +841,7 @@ def test_token_usage_database_separates_exact_and_estimated(tmp_path, monkeypatc
     project.mkdir()
     (project / ".git").mkdir()
 
-    bootstrap = run(terminal_mcp.bootstrap_thread(
+    bootstrap = run(terminal_mcp.get_thread_context(
         thread_id=(thread_id := bound_thread("usage-thread")), cwd=str(project), max_chars=100000
     ))
     assert "Context Gate: satisfied" in bootstrap
@@ -914,7 +914,7 @@ def test_chat_agent_tool_wrappers_use_injected_coordinator(tmp_path, monkeypatch
     project.mkdir()
     (project / ".git").mkdir()
     session_id = bound_thread("agent-tools-thread")
-    run(terminal_mcp.bootstrap_thread(session_id, str(project), max_chars=100000))
+    run(terminal_mcp.get_thread_context(session_id, str(project), max_chars=100000))
 
     class FakeCoordinator:
         def __init__(self):
@@ -1079,7 +1079,7 @@ def test_chat_runtime_control_pauses_recovers_and_resumes(tmp_path, monkeypatch)
     (project / ".git").mkdir()
     isolated_home(tmp_path, monkeypatch)
     session_id = bound_thread("runtime-control-thread")
-    run(terminal_mcp.bootstrap_thread(session_id, str(project), max_chars=100000))
+    run(terminal_mcp.get_thread_context(session_id, str(project), max_chars=100000))
 
     class CircuitRecord:
         scope = "runtime"

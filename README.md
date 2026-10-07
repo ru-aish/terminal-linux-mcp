@@ -45,18 +45,31 @@ On MCP initialization, the server sends a startup instruction document containin
 4. Every configured nested MCP server name and public endpoint summary.
 5. The recovery and token-accounting tools.
 
-Project-specific `.GPT/AGENTS.md` files are intentionally not injected until `bootstrap_thread` receives the target `cwd`, preventing one project’s rules from leaking into another project’s initialization. The global startup payload is rebuilt for every MCP initialization, so changes to global rules or discovered skills are visible to newly initialized clients without restarting the server.
+Project-specific `.GPT/AGENTS.md` files are intentionally not injected until `get_thread_context` receives the assigned ID and target `cwd`, preventing one project’s rules from leaking into another project’s initialization. The global startup payload is rebuilt for every MCP initialization, so changes to global rules or discovered skills are visible to newly initialized clients without restarting the server.
 
-A model thread must then call:
+An unassigned ordinary ChatGPT chat requests identity discovery with:
 
 ```json
 {
-  "thread_id": "a-unique-stable-id-for-this-model-thread",
+  "exact_user_message": "The latest user request, copied verbatim",
   "cwd": "/absolute/project/path"
 }
 ```
 
-through `bootstrap_thread`. The same value must be reused as `session_id` for later tools. The shared value `default` is rejected for gated execution or modification, preventing one chat from inheriting another chat's loaded-context fingerprint.
+through `bootstrap_thread`. It must not invent a thread ID. The server compares the
+request with cached desktop conversation previews, scans only when necessary, and
+sends one permanent identity message to a uniquely matched new chat. Older matches
+reuse their saved identity without a message; unmatched requests receive retry
+guidance. Managed children receive their ID directly from the creation gateway.
+
+Once an ID is assigned, bootstrap is forbidden. Load or reload context with
+`get_thread_context(thread_id=assigned_id, cwd=...)`, and reuse the assigned ID as
+`session_id` on later tools. Native host metadata, when available, validates caller
+ownership. Preview-based assignment without that metadata cannot authenticate a
+caller who supplies another already-issued ID. See
+[permanent identity and verification](docs/CHAT_THREAD_IDENTITY.md).
+
+The shared value `default` is rejected for gated work.
 
 If the model loses context after compaction or a long conversation, it calls `get_thread_context`. If any applicable `.GPT/AGENTS.md` changes, the fingerprint gate blocks further gated work until the thread reloads its context.
 

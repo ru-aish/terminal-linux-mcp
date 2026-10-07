@@ -113,6 +113,12 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
 
     port = _free_port()
     env = dict(**__import__("os").environ)
+    env["MCP_CHAT_AGENT_DB"] = str(tmp_path / "agents.db")
+    env["MCP_CHAT_GATEWAY_DB"] = str(tmp_path / "gateway.db")
+    env["MCP_CHAT_WATCHDOG_DIR"] = str(tmp_path / "watchdog")
+    env["MCP_CHAT_AGENT_ENABLED"] = "0"
+    env["MCP_CHAT_WATCHDOG_ENABLED"] = "0"
+    env["MCP_CHAT_IDENTITY_DISCOVERY_ENABLED"] = "0"
     env["MCP_WORKSPACE"] = str(tmp_path)
     env["MCP_LOG_DIR"] = str(tmp_path / "logs")
     env["MCP_GPT_HOME"] = str(tmp_path / "gpt-home")
@@ -167,7 +173,7 @@ def test_downstream_mcp_persists_across_distinct_http_sessions(tmp_path):
             "thread_id": conversation_id,
         }
         bootstrapped = await call(
-            "bootstrap_thread",
+            "get_thread_context",
             {"cwd": str(tmp_path), "max_chars": 50000},
             meta={"x-codex-turn-metadata": bootstrap_turn},
         )
@@ -444,6 +450,12 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
 
     port = _free_port()
     env = dict(**__import__("os").environ)
+    env["MCP_CHAT_AGENT_DB"] = str(tmp_path / "agents.db")
+    env["MCP_CHAT_GATEWAY_DB"] = str(tmp_path / "gateway.db")
+    env["MCP_CHAT_WATCHDOG_DIR"] = str(tmp_path / "watchdog")
+    env["MCP_CHAT_AGENT_ENABLED"] = "0"
+    env["MCP_CHAT_WATCHDOG_ENABLED"] = "0"
+    env["MCP_CHAT_IDENTITY_DISCOVERY_ENABLED"] = "0"
     env["MCP_WORKSPACE"] = str(tmp_path)
     env["MCP_LOG_DIR"] = str(tmp_path / "logs")
     env["MCP_GPT_HOME"] = str(gpt_home)
@@ -508,8 +520,10 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 blocked_text = "\n".join(getattr(item, "text", "") for item in blocked.content)
                 assert "session_id='default' is intentionally rejected" in blocked_text
 
+                initial_bootstrap = await session.call_tool("bootstrap_thread", {"thread_id": thread_id})
+                assert "Bootstrap is no longer permitted" in "\n".join(getattr(i, "text", "") for i in initial_bootstrap.content)
                 bootstrapped = await session.call_tool(
-                    "bootstrap_thread",
+                    "get_thread_context",
                     {
                         "cwd": str(tmp_path),
                         "max_chars": 100000,
@@ -524,12 +538,25 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
                 assert "http-project-rule" in bootstrap_text
                 assert f"Thread ID: {thread_id}" in bootstrap_text
 
+                preview_chat = "preview-http-chat"
+                preview_id = GPTThreadStore.derive_thread_id(preview_chat)
+                with sqlite3.connect(gpt_home / "thread_usage.db") as db:
+                    db.execute("INSERT INTO threads(thread_id,cwd,created_at,updated_at) VALUES(?,?,?,?)", (preview_id, str(tmp_path), "now", "now"))
+                    db.execute("INSERT INTO chat_thread_bindings VALUES(?,?,'desktop_preview','now','now')", (preview_chat, preview_id))
+                preview_context = await session.call_tool("get_thread_context", {"thread_id": preview_id, "cwd": str(tmp_path), "max_chars": 100000}, meta={})
+                assert "Context Gate: satisfied" in "\n".join(getattr(i, "text", "") for i in preview_context.content)
+                preview_command = await session.call_tool("run_command", {"session_id": preview_id, "command": "printf preview-issued-id-ok", "cwd": str(tmp_path)}, meta={})
+                assert "preview-issued-id-ok" in "\n".join(getattr(i, "text", "") for i in preview_command.content)
+                authoritative_mismatch = await session.call_tool("run_command", {"session_id": preview_id, "command": "touch preview-cross-chat-ran", "cwd": str(tmp_path)})
+                assert authoritative_mismatch.isError
+                assert not (tmp_path / "preview-cross-chat-ran").exists()
+
                 repeated = await session.call_tool(
                     "bootstrap_thread",
                     {"thread_id": thread_id, "cwd": str(tmp_path)},
                 )
                 repeated_text = "\n".join(getattr(item, "text", "") for item in repeated.content)
-                assert "already been bootstrapped" in repeated_text
+                assert "already permanently assigned" in repeated_text
 
                 wrong = await session.call_tool(
                     "run_command",
@@ -681,7 +708,7 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
             async with ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
                 repeated = await session.call_tool("bootstrap_thread", {"thread_id": thread_id, "cwd": str(tmp_path)}, meta=meta)
-                assert "already been bootstrapped" in "\n".join(getattr(item, "text", "") for item in repeated.content)
+                assert "already permanently assigned" in "\n".join(getattr(item, "text", "") for item in repeated.content)
                 refreshed = await session.call_tool("get_thread_context", {"thread_id": thread_id, "cwd": str(tmp_path), "max_chars": 100000}, meta=meta)
                 assert "Context Gate: satisfied" in "\n".join(getattr(item, "text", "") for item in refreshed.content)
                 command = await session.call_tool("run_command", {"command": "printf restart-ok", "session_id": thread_id, "cwd": str(tmp_path)}, meta=meta)
@@ -694,6 +721,92 @@ def test_http_initialize_bootstrap_and_usage_accounting(tmp_path):
     try:
         _wait_for_port(port, process)
         asyncio.run(exercise_after_restart())
+    finally:
+        process.terminate()
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
+
+
+def test_http_unassigned_bootstrap_discovers_hands_off_and_loads_issued_identity(tmp_path):
+    runner = tmp_path / "discovery_server.py"
+    runner.write_text('''import asyncio, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["TEST_REPO"])
+sys.path.insert(0, os.environ["TEST_REPO"]+"/tests")
+import terminal_mcp as server
+from chat_identity_discovery import ChatIdentityDiscovery
+from chat_gateway import ChatGateway, SQLiteLedger
+from test_gateway_agent_orchestrator import fast_config
+from test_chat_identity_discovery import ListingBackend, item, install_chat
+root=Path(os.environ["MCP_WORKSPACE"])
+backend=ListingBackend()
+install_chat(backend)
+gateway=ChatGateway(SQLiteLedger(root/"discovery-gateway.db"),backend,fast_config(root/"discovery-gateway.db"))
+discovery=ChatIdentityDiscovery(server.GPT_STORE,gateway,scopes=["project"],managed=lambda:(set(),False))
+discovery.seed_known("project", ["old-chat"])
+discovery.observe("project", [item()])
+async def fast_worker():
+    while True:
+        await discovery.run_once()
+        await asyncio.sleep(.05)
+discovery._run=fast_worker
+server._CHAT_GATEWAY=gateway
+server._CHAT_IDENTITY_DISCOVERY=discovery
+server.main()
+''', encoding="utf-8")
+    port = _free_port()
+    env = dict(__import__("os").environ)
+    env.update(MCP_WORKSPACE=str(tmp_path), MCP_GPT_HOME=str(tmp_path / "gpt-home"),
+               MCP_LOG_DIR=str(tmp_path / "logs"), MCP_CHAT_AGENT_DB=str(tmp_path / "agents.db"),
+               MCP_CHAT_GATEWAY_DB=str(tmp_path / "unused-gateway.db"), MCP_CHAT_WATCHDOG_DIR=str(tmp_path / "watchdog"),
+               MCP_CHAT_AGENT_ENABLED="0", MCP_CHAT_WATCHDOG_ENABLED="0", MCP_CHAT_IDENTITY_DISCOVERY_ENABLED="1",
+               TEST_REPO=str(REPO_ROOT))
+    process = subprocess.Popen([sys.executable, str(runner), "--transport", "streamable-http", "--port", str(port)],
+                               env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    async def exercise():
+        message = "Please find the trained PrivacyAI model location and compare the recorded benchmark results with the base model."
+        thread_id = GPTThreadStore.derive_thread_id("new-chat")
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as streams:
+            async with ClientSession(streams[0], streams[1]) as session:
+                await session.initialize()
+                def text(result):
+                    return "\n".join(getattr(c, "text", "") for c in result.content)
+                response = text(await session.call_tool("bootstrap_thread", {"exact_user_message": message, "project_id": "project", "cwd": str(tmp_path)}))
+                assert "Discovery Event ID:" in response
+                assert "State: stop_pending" in response or "State: stopping" in response
+                token = response.splitlines()[0].split(": ", 1)[1]
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    with sqlite3.connect(tmp_path / "gpt-home" / "thread_usage.db") as db:
+                        state = db.execute("SELECT state FROM identity_events WHERE event_id=?", (token,)).fetchone()[0]
+                    if state == "confirmed":
+                        break
+                    await asyncio.sleep(.05)
+                assert state == "confirmed"
+                rejected = text(await session.call_tool("bootstrap_thread", {"thread_id": thread_id}))
+                assert "Bootstrap is no longer permitted" in rejected
+                context = text(await session.call_tool("get_thread_context", {"thread_id": thread_id, "cwd": str(tmp_path), "max_chars": 100000}))
+                assert "Context Gate: satisfied" in context
+                usable = await session.call_tool("write_file", {"session_id": thread_id, "cwd": str(tmp_path), "path": "issued-id.txt", "content": "verified"})
+                assert not usable.isError
+                assert (tmp_path / "issued-id.txt").read_text() == "verified"
+                wrong = await session.call_tool("write_file", {"session_id": "invented", "cwd": str(tmp_path), "path": "wrong-id.txt", "content": "blocked"})
+                assert wrong.isError and not (tmp_path / "wrong-id.txt").exists()
+                old = text(await session.call_tool("bootstrap_thread", {"exact_user_message": message, "project_id": "project", "cwd": str(tmp_path)}))
+                assert "State: old" in old and thread_id in old
+        with sqlite3.connect(tmp_path / "discovery-gateway.db") as db:
+            assert db.execute("SELECT COUNT(*) FROM operations WHERE type='CONTINUE'").fetchone()[0] == 1
+            assert db.execute("SELECT COUNT(*) FROM operations WHERE type='DISCOVERY_LIST'").fetchone()[0] == 0
+        with sqlite3.connect(tmp_path / "gpt-home" / "thread_usage.db") as db:
+            assert db.execute("SELECT bootstrap_count FROM threads WHERE thread_id=?", (thread_id,)).fetchone()[0] == 1
+
+    try:
+        _wait_for_port(port, process)
+        asyncio.run(exercise())
     finally:
         process.terminate()
         try:

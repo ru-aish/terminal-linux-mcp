@@ -39,6 +39,10 @@ class BackendAdapter(Protocol):
         self, *, project_id: str
     ) -> Sequence[ThreadSnapshot]: ...
 
+    async def list_discovery_threads(
+        self, *, project_id: str = "", cursor: str | None = None, offset: int = 0
+    ) -> Mapping[str, Any]: ...
+
 
 AsyncOrSyncCallable = Callable[..., Any]
 T = TypeVar("T")

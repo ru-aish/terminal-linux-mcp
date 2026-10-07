@@ -373,8 +373,10 @@ def normalize_project_threads(raw: Any, project_id: str) -> dict[str, Any]:
                 "title": str(item.get("title") or ""),
                 "project_id": str(item.get("gizmo_id") or project_id),
                 "current_node": str(item.get("current_node") or ""),
+                "snippet": str(item.get("snippet") or ""),
+                "create_time": item.get("create_time"),
                 "update_time": item.get("update_time")
-                if isinstance(item.get("update_time"), (int, float))
+                if isinstance(item.get("update_time"), (int, float, str))
                 else None,
                 "archived": bool(item.get("is_archived")),
             }

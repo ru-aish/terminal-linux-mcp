@@ -375,9 +375,9 @@ class ChatAgentCoordinator:
     @staticmethod
     def _thread_identity_message(thread_id: str, working_directory: str | None) -> str:
         cwd_instruction = (
-            f" Call bootstrap_thread(thread_id={thread_id!r}, cwd={working_directory!r}) now."
+            f" Call get_thread_context(thread_id={thread_id!r}, cwd={working_directory!r}) now."
             if working_directory
-            else f" Call bootstrap_thread(thread_id={thread_id!r}) now."
+            else f" Call get_thread_context(thread_id={thread_id!r}) now."
         )
         return (
             "[TERMINAL MCP THREAD IDENTITY]\n"
@@ -385,8 +385,8 @@ class ChatAgentCoordinator:
             "It is server-assigned and permanently bound to this ChatGPT conversation. "
             "Never invent, replace, or switch to another Terminal MCP thread ID."
             + cwd_instruction
-            + f" After bootstrap succeeds, use session_id={thread_id!r} for every later Terminal MCP call. "
-            "Do not call bootstrap_thread again after the initial successful bootstrap; use "
+            + f" After context loads, use session_id={thread_id!r} for every later Terminal MCP call. "
+            "Bootstrap is forbidden now that your ID is assigned; use "
             f"get_thread_context(thread_id={thread_id!r}) when context needs to be reloaded. "
             "Continue the originally assigned task now."
         )
@@ -639,9 +639,9 @@ class ChatAgentCoordinator:
                 "permanent thread ID and tell you to continue."
                 if await_thread_identity
                 else (
-                    "Before terminal work, call bootstrap_thread with thread_id equal to "
-                    f"your agent_id and cwd={working_directory!r}. Reuse agent_id as "
-                    "session_id in every later Terminal MCP call."
+                    "Before terminal work, wait for your permanent server-assigned thread ID, then call "
+                    f"get_thread_context with that ID and cwd={working_directory!r}. "
+                    "Reuse that assigned ID as session_id in every later Terminal MCP call."
                     if working_directory
                     else "Before terminal work, obtain a working_directory from your parent."
                 )

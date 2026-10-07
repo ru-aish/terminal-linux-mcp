@@ -186,6 +186,8 @@ class ChatGateway:
         message: str,
         idempotency_key: Optional[str] = None,
         due_at: Optional[float] = None,
+        maximum_attempts: Optional[int] = None,
+        one_shot: bool = False,
     ) -> str:
         agent = self._require_agent(agent_id)
         message = message.strip()
@@ -203,9 +205,9 @@ class ChatGateway:
             lane=Lane.HEAVY,
             priority=int(Priority.CONTINUE),
             idempotency_key=key,
-            payload={"conversation_id": agent.conversation_id, "message": message},
+            payload={"conversation_id": agent.conversation_id, "message": message, "one_shot": one_shot},
             due_at=now if due_at is None else due_at,
-            max_attempts=self.config.retry.maximum_attempts,
+            max_attempts=maximum_attempts or self.config.retry.maximum_attempts,
             agent_id=agent_id,
         )
 
@@ -573,6 +575,13 @@ class ChatGateway:
         payload: Mapping[str, Any],
         idempotency_key: str,
     ) -> Any:
+        if operation_type is OperationType.DISCOVERY_LIST:
+            return await self.backend.list_discovery_threads(
+                project_id=str(payload.get("project_id") or ""),
+                cursor=payload.get("cursor"), offset=int(payload.get("offset") or 0),
+            )
+        if operation_type is OperationType.DISCOVERY_READ:
+            return await self.backend.get_thread(conversation_id=str(payload["conversation_id"]))
         if operation_type is OperationType.CREATE:
             return await self.backend.create_thread(
                 project_id=str(payload["project_id"]),
@@ -691,6 +700,17 @@ class ChatGateway:
         value: Any,
         now: float,
     ) -> None:
+        if effective_type in {OperationType.DISCOVERY_LIST, OperationType.DISCOVERY_READ}:
+            if effective_type is OperationType.DISCOVERY_READ:
+                if not isinstance(value, ThreadSnapshot):
+                    raise MalformedBackendResponse("discovery read returned a non-ThreadSnapshot")
+                result = _serialize_snapshot(value)
+            else:
+                if not isinstance(value, Mapping) or not isinstance(value.get("items"), list):
+                    raise MalformedBackendResponse("discovery listing returned an invalid page")
+                result = dict(value)
+            self.ledger.succeed_operation(connection, operation_id=operation.id, now=now, result=result)
+            return
         if effective_type is OperationType.CREATE:
             result = _require_mutation(value, "create")
             if not result.accepted or not result.conversation_id:
@@ -762,6 +782,7 @@ class ChatGateway:
                     "conversation_id": payload["conversation_id"],
                     "expected_message_id": result.message_id,
                     "verification_attempt": 1,
+                    "one_shot": bool(payload.get("one_shot")),
                 },
                 due_at=now + self.config.polling.continue_verification,
                 max_attempts=self.config.retry.maximum_attempts,
@@ -976,6 +997,13 @@ class ChatGateway:
             },
         )
 
+        if payload.get("one_shot"):
+            # Identity delivery does not take over ongoing task monitoring.
+            self.ledger.update_agent(connection, agent_id=agent.id, now=now,
+                                     state=reduction.state, snapshot_hash=reduction.snapshot_hash,
+                                     last_inspected_at=now, next_inspection_at=None)
+            return
+
         if reduction.terminal:
             self.ledger.update_agent(
                 connection,
@@ -1086,7 +1114,12 @@ class ChatGateway:
                 details={"message": str(backend_error)[:500]},
             )
 
-            if infrastructure_outage:
+            if operation.type is OperationType.CONTINUE and operation.max_attempts == 1:
+                # Identity handoffs are at-most-once submissions. A timeout or
+                # outage may occur after acceptance, so never dispatch it again.
+                self.ledger.fail_operation(connection, operation_id=operation.id,
+                                           now=finished_at, error=str(backend_error))
+            elif infrastructure_outage:
                 result_scope = RUNTIME_CIRCUIT_SCOPE
                 if _is_runtime_probe(operation):
                     circuit = self.circuits.record_probe_error(

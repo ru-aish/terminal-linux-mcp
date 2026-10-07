@@ -29,6 +29,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from gpt_thread_store import GPTThreadStore
+from chat_identity_discovery import ChatIdentityDiscovery, NO_MATCH, install_identity_discovery_lifespan
 from usage_dashboard import install_usage_dashboard
 from chat_watchdog import ChatWatchdog, ChatWatchdogConfig, install_chat_watchdog_lifespan, parse_chat_link
 from chat_internal_client import InternalChatClient, sanitize_runtime_error
@@ -245,6 +246,36 @@ def get_chat_agent_service() -> ChatAgentService:
     return _CHAT_AGENT_SERVICE
 
 
+_CHAT_IDENTITY_DISCOVERY: ChatIdentityDiscovery | None = None
+
+
+def get_chat_identity_discovery() -> ChatIdentityDiscovery:
+    global _CHAT_IDENTITY_DISCOVERY
+    if _CHAT_IDENTITY_DISCOVERY is None:
+        config = ChatWatchdogConfig.from_env()
+        project_file = config.projects_path or config.queue_path.with_name("projects.json")
+        try:
+            projects = json.loads(project_file.read_text(encoding="utf-8")).get("projects", {})
+        except (OSError, ValueError):
+            projects = {}
+        configured = os.environ.get("MCP_IDENTITY_PROJECT_IDS", "")
+        scopes = [item.strip() for item in configured.split(",") if item.strip()] or list(projects)
+        scopes.append("")  # Ordinary conversations outside selected projects.
+
+        def managed():
+            repository = get_chat_agent_coordinator().repository
+            with repository.connect() as db:
+                rows = list(db.execute("SELECT chat_id,status FROM agents"))
+            return ({str(row["chat_id"]) for row in rows if row["chat_id"]},
+                    any(not row["chat_id"] and row["status"] not in {"completed", "failed", "cancelled"} for row in rows))
+
+        _CHAT_IDENTITY_DISCOVERY = ChatIdentityDiscovery(GPT_STORE, get_chat_gateway(), scopes=scopes, managed=managed)
+        for scope, record in projects.items():
+            if isinstance(record, dict) and record.get("initialized"):
+                _CHAT_IDENTITY_DISCOVERY.seed_known(scope, record.get("seen_thread_ids") or [])
+    return _CHAT_IDENTITY_DISCOVERY
+
+
 def _format_goal_context(goal: dict[str, Any], *, reminder: bool = False) -> str:
     heading = "Periodic active-goal reminder" if reminder else "Thread goal context"
     conditions = "\n".join(
@@ -324,6 +355,11 @@ def _tool_identity_error(server: FastMCP, arguments: dict[str, Any]) -> str | No
             server.get_context().request_context
         except (LookupError, ValueError):
             # Direct, server-owned calls have no external request context.
+            return None
+        binding = GPT_STORE.binding_for_thread(candidate)
+        if binding and binding["source"] in {"desktop_preview", "agent_gateway"}:
+            # Preview correlation supplies an issued ID, not authentication.
+            # Enforce native metadata whenever present; document this fallback.
             return None
         return (
             "Terminal MCP requires host-provided conversation identity metadata. "
@@ -1280,7 +1316,7 @@ def _context_gate_error(
         "GPT thread context has not been loaded, or an applicable .GPT/AGENTS.md changed.\n"
         "No action was executed.\n\n"
         + identity_note
-        + "Call bootstrap_thread or get_thread_context with this cwd, follow every returned instruction, then retry.\n\n"
+        + "Call get_thread_context with your assigned ID and this cwd, follow every returned instruction, then retry.\n\n"
         + f"Thread/Session ID: {session_id}\nProject Root: {root}\nWorking Directory: {cwd}\nApplicable Files:\n{listed}"
     )
 
@@ -2798,8 +2834,8 @@ def _build_thread_context_document(
     parts.extend([
         "",
         "## Context recovery and accounting",
-        "- bootstrap_thread: one-time initialization for this conversation's permanent server-assigned thread ID.",
-        "- get_thread_context: reload complete context later without changing or re-bootstrapping the thread identity.",
+        "- bootstrap_thread: request identity discovery for an unassigned conversation using the exact latest user message.",
+        "- get_thread_context: load initial context or reload it later with the same permanent assigned ID.",
         "- context_manifest: inspect fingerprints, files, skills, tools, and nested MCP names without loading full instruction bodies.",
         "- refresh_startup_context: rebuild MCP initialization instructions for future client initializations.",
         "- record_token_usage: store exact provider-reported input/output/cached-input usage.",
@@ -2829,7 +2865,7 @@ async def _load_thread_context(
     run_cwd = _resolve_cwd(cwd, session.cwd) if cwd else session.cwd.resolve()
     full, root, rows, fingerprint = _build_thread_context_document(normalized, run_cwd)
     if max_chars > 0 and len(full) > max_chars:
-        retry_tool = "bootstrap_thread" if event_type == "thread_bootstrap" else "get_thread_context"
+        retry_tool = "get_thread_context"
         return full[:max_chars] + (
             f"\n\n[Context truncated to {max_chars} of {len(full)} chars. Context gate remains unsatisfied. "
             f"Call {retry_tool} again with a larger max_chars.]"
@@ -2871,18 +2907,37 @@ async def bootstrap_thread(
     thread_id: str = "",
     cwd: str | None = None,
     max_chars: int = DEFAULT_BOOTSTRAP_MAX_CHARS,
+    exact_user_message: str = "",
+    discovery_event_id: str = "",
+    project_id: str | None = None,
 ) -> str:
-    """Initialize this ChatGPT conversation exactly once using its permanent server-assigned Terminal MCP thread ID."""
+    """Discover an unassigned chat using its exact latest user message. Once assigned, bootstrap is forbidden; load context with get_thread_context."""
+    if not thread_id and not _host_conversation_identity(mcp):
+        if os.environ.get("MCP_CHAT_IDENTITY_DISCOVERY_ENABLED", "1").lower() in {"0", "false", "no", "off"}:
+            return "Error: identity discovery is disabled on this server. Use an already assigned ID with get_thread_context."
+        if not exact_user_message.strip() or len(exact_user_message) > 24000:
+            return "Error: provide exact_user_message (1–24000 characters). " + NO_MATCH
+        discovery = get_chat_identity_discovery()
+        response = discovery.submit(exact_user_message, event_id=discovery_event_id, scope=project_id, cwd=cwd)
+        if response.startswith("Error:"):
+            return response
+        await discovery.start()
+        if response.startswith("Discovery Event ID:"):
+            eid = response.splitlines()[0].split(": ", 1)[1]
+            # Return actionable no-match/old-chat feedback in the tool result.
+            # Delivery waits until the allocation result can reach the model.
+            deadline = time.monotonic() + 45
+            while discovery.event(eid)["state"] == "pending" and time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+            response = discovery.response(eid)
+        return response
     resolved, error = _resolve_request_thread_id(thread_id)
     if error:
         return error
-    existing = GPT_STORE.get_thread(resolved)
-    if existing and int(existing.get("bootstrap_count") or 0) > 0:
-        return (
-            f"Error: thread_id {resolved!r} has already been bootstrapped for this ChatGPT conversation. "
-            "Its identity is immutable. Use get_thread_context with the same thread ID to reload context."
-        )
-    return await _load_thread_context(resolved, cwd, max_chars, "thread_bootstrap")
+    return (
+        f"Error: thread_id {resolved!r} is already permanently assigned to this conversation. "
+        "Bootstrap is no longer permitted. Use get_thread_context with this same ID to load or reload context."
+    )
 
 
 @mcp.tool()
@@ -2897,10 +2952,7 @@ async def get_thread_context(
         return error
     existing = GPT_STORE.get_thread(resolved)
     if existing is None or int(existing.get("bootstrap_count") or 0) <= 0:
-        return (
-            f"Error: thread_id {resolved!r} has not completed its initial bootstrap step. "
-            "Call bootstrap_thread once with this server-assigned thread ID first."
-        )
+        return await _load_thread_context(resolved, cwd, max_chars, "thread_bootstrap")
     return await _load_thread_context(resolved, cwd, max_chars, "thread_context_reload")
 
 
@@ -3916,11 +3968,11 @@ def _build_startup_instructions() -> str:
     parts = [
         "You are connected to the isolated Terminal GPT Experimental MCP.",
         "STRICT REQUIREMENT: Never invent or replace a Terminal MCP thread ID. Each ChatGPT conversation has one permanent server-assigned identity.",
-        "Call bootstrap_thread exactly once with the assigned thread ID, then reuse that exact value as session_id on every later tool call. The shared session_id='default' is rejected for gated work.",
+        "If you have no assigned ID, call bootstrap_thread with exact_user_message copied verbatim from the latest user request. Once assigned, bootstrap is forbidden; load context with get_thread_context and reuse the assigned ID as session_id on every later tool call. The shared session_id='default' is rejected for gated work.",
         "If context is compacted, forgotten, changed, or uncertain, call get_thread_context before continuing.",
         "When the user writes /goal <objective>, call thread_goal(action='set') with explicit finish conditions and continue until each condition has evidence and the goal is completed, unless a real technical error blocks further work.",
         "The following global .GPT instructions are mandatory and are separate from Codex's ~/.codex/AGENTS.md.",
-        "Project-specific .GPT instructions are loaded after bootstrap_thread receives the target cwd.",
+        "Project-specific .GPT instructions are loaded by get_thread_context with the target cwd.",
         "",
         f"Startup Context Fingerprint: {fingerprint}",
         f"GPT Home: {_gpt_home()}",
@@ -4675,6 +4727,10 @@ def main() -> None:
         )
         install_chat_watchdog_lifespan(app, chat_watchdog)
         install_chat_agent_lifespan(app, agent_service)
+        if os.environ.get("MCP_CHAT_IDENTITY_DISCOVERY_ENABLED", "1").lower() not in {"0", "false", "no", "off"}:
+            discovery = get_chat_identity_discovery()
+            chat_watchdog.identity_listing_observer = discovery.observe
+            install_identity_discovery_lifespan(app, discovery)
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "")
         if bearer_token:
             app.add_middleware(BearerAuthMiddleware, token=bearer_token)
