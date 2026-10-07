@@ -398,6 +398,7 @@ class ContinuationCandidate:
     task_start_index: int
     fairness_epoch: float
     forced: bool = False
+    running_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -544,6 +545,8 @@ class ChatAdapter(Protocol):
     ) -> dict[str, Any]: ...
 
     async def inspect(self, link: ChatLink) -> ThreadSnapshot: ...
+
+    async def stop_generation(self, link: ChatLink) -> dict[str, Any]: ...
 
     async def send_continue(
         self,
@@ -1209,6 +1212,9 @@ class CodexInternalChatAdapter:
             active_stream=bool(payload.get("active_stream")),
         )
 
+    async def stop_generation(self, link: ChatLink) -> dict[str, Any]:
+        return await self._gateway.cancel(link.conversation_id)
+
     async def send_continue(
         self,
         link: ChatLink,
@@ -1221,7 +1227,9 @@ class CodexInternalChatAdapter:
             link.conversation_id,
             message,
             expected_current_node=expected_current_node,
-            wait_for_completion=not force,
+            # Let the next watchdog scans enforce the running-generation limit;
+            # waiting for the entire stream here can hold the scan lock for an hour.
+            wait_for_completion=False,
             force=force,
         )
         clicked = delivery.state in {
@@ -1303,6 +1311,8 @@ class ChatWatchdogConfig:
     forced_continue_conversation_ids: tuple[str, ...] = ()
     forced_continue_interval_seconds: int = 1200
     projects_path: Path | None = None
+    running_restart_seconds: int = 1200
+    running_restart_scans: int = 2
 
     @classmethod
     def from_env(cls) -> "ChatWatchdogConfig":
@@ -1377,6 +1387,12 @@ class ChatWatchdogConfig:
                         "MCP_CHAT_WATCHDOG_FORCED_CONTINUE_INTERVAL_SECONDS", "1200"
                     )
                 ),
+            ),
+            running_restart_seconds=max(
+                30, int(os.environ.get("MCP_CHAT_WATCHDOG_RUNNING_RESTART_SECONDS", "1200"))
+            ),
+            running_restart_scans=max(
+                2, int(os.environ.get("MCP_CHAT_WATCHDOG_RUNNING_RESTART_SCANS", "2"))
             ),
         )
 
@@ -2028,6 +2044,58 @@ class ChatWatchdog:
         if not self._runtime.get("active_generation_conversation_id"):
             self._runtime["active_generation_conversation_id"] = conversation_id
 
+    @staticmethod
+    def _is_working(snapshot: ThreadSnapshot) -> bool:
+        if not snapshot.found or not snapshot.turns:
+            return False
+        if snapshot.canonical and not snapshot.state_verified:
+            return False
+        latest = snapshot.latest_turn
+        return bool(
+            snapshot.running
+            or snapshot.active_stream
+            or latest is not None
+            and latest.role == "assistant"
+            and (latest.status.casefold() in RUNNING_MESSAGE_STATUSES or latest.end_turn is False)
+        )
+
+    @staticmethod
+    def _running_generation(snapshot: ThreadSnapshot) -> tuple[str, float | None]:
+        latest_user_index = next(
+            (index for index in range(len(snapshot.turns) - 1, -1, -1)
+             if snapshot.turns[index].role == "user"),
+            None,
+        )
+        if latest_user_index is None:
+            return "", None
+        user = snapshot.turns[latest_user_index]
+        # A regenerated answer can belong to an old user turn. Prefer the
+        # current branch's first assistant timestamp over that old prompt time.
+        started = next(
+            (turn.create_time for turn in snapshot.turns[latest_user_index + 1:]
+             if turn.role == "assistant" and turn.create_time is not None),
+            user.create_time,
+        )
+        return user.key, started
+
+    def _observe_working(
+        self, snapshot: ThreadSnapshot, previous: dict[str, Any], *, now: float,
+    ) -> tuple[dict[str, Any], bool]:
+        if not self._is_working(snapshot):
+            return {"running_scan_count": 0, "running_since_epoch": 0,
+                    "running_generation_key": ""}, False
+        key, started = self._running_generation(snapshot)
+        same_generation = key and previous.get("running_generation_key") == key
+        count = int(previous.get("running_scan_count", 0) or 0) + 1 if same_generation else 1
+        since = previous.get("running_since_epoch") if same_generation else None
+        if since is None or not since:
+            since = min(now, started) if started is not None else now
+        state = {"running_scan_count": count, "running_since_epoch": since,
+                 "running_generation_key": key}
+        due = (count >= self.config.running_restart_scans
+               or now - float(since) >= self.config.running_restart_seconds)
+        return state, due
+
     def _snapshot_state(
         self,
         link: ChatLink,
@@ -2177,7 +2245,13 @@ class ChatWatchdog:
                                         )
                                     )
 
+                            # An overdue owned stream must be eligible for recovery
+                            # instead of indefinitely blocking the scheduler itself.
                             if owned_stream_active:
+                                candidates = [
+                                    item for item in candidates if item[2].running_recovery
+                                ]
+                            if owned_stream_active and not candidates:
                                 self._runtime["write_deferred_reason"] = (
                                     "a watchdog-owned completion stream is already active"
                                 )
@@ -2309,6 +2383,8 @@ class ChatWatchdog:
                 return LinkObservation()
 
         common = self._snapshot_state(link, snapshot, previous, now=now)
+        working_state, recovery_due = self._observe_working(snapshot, previous, now=now)
+        common.update(working_state)
         if not snapshot.found:
             if snapshot.reason.startswith("conversation transcript"):
                 status = "waiting_transcript"
@@ -2411,6 +2487,7 @@ class ChatWatchdog:
             latest_turn is not None
             and latest_turn.role == "user"
             and latest_turn.text.strip() == self.config.continue_message.strip()
+            and not self._is_working(snapshot)
         ):
             self.state.update(
                 link.conversation_id,
@@ -2441,6 +2518,26 @@ class ChatWatchdog:
                 common,
             )
             return LinkObservation()
+        if self._is_working(snapshot) and recovery_due:
+            self._record_active_generation(link.conversation_id)
+            if snapshot.composer_text.strip():
+                self.state.update(link.conversation_id, **common, status="draft_present")
+                return LinkObservation()
+            if previous.get("status") in {"continue_unconfirmed", "waiting_unconfirmed_submission"} and previous.get("last_transcript_hash") == snapshot.transcript_hash:
+                self.state.update(link.conversation_id, **common, status="waiting_unconfirmed_submission")
+                return LinkObservation()
+            if self.config.dry_run:
+                self.state.update(link.conversation_id, **common, status="would_restart_running")
+                return LinkObservation()
+            candidate = ContinuationCandidate(
+                link=link, snapshot=snapshot, previous=previous, common=common,
+                task_start_key=task_start_key, task_start_index=task_start_index,
+                fairness_epoch=max(float(previous.get("last_continue_epoch", 0) or 0),
+                                   float(previous.get("last_scheduler_selected_epoch", 0) or 0)),
+                running_recovery=True,
+            )
+            self.state.update(link.conversation_id, **common, status="ready_running_restart")
+            return LinkObservation(candidate=candidate)
         if decision.state in {
             ThreadDecisionState.RUNNING_OWNED_STREAM,
             ThreadDecisionState.RUNNING_CANONICAL,
@@ -2621,6 +2718,10 @@ class ChatWatchdog:
             )
             return
         confirmation_common["task_start_user_turn_key"] = confirmation_start_key
+
+        if candidate.running_recovery and self._is_working(confirmation):
+            await self._restart_running(adapter, candidate, confirmation, confirmation_common, now)
+            return
 
         confirmation_latest = confirmation.latest_turn
         if (
@@ -2842,6 +2943,70 @@ class ChatWatchdog:
             },
         )
 
+    async def _restart_running(
+        self, adapter: ChatAdapter, candidate: ContinuationCandidate,
+        confirmation: ThreadSnapshot, common: dict[str, Any], now: float,
+    ) -> None:
+        link = candidate.link
+        key, _ = self._running_generation(confirmation)
+        if key != candidate.common.get("running_generation_key"):
+            self.state.update(link.conversation_id, **{**common, "running_scan_count": 0,
+                              "running_since_epoch": 0, "running_generation_key": "",
+                              "status": "waiting_generation_change"})
+            return
+        if confirmation.composer_text.strip():
+            self.state.update(link.conversation_id, **common, status="draft_present")
+            return
+        entries, _ = await asyncio.to_thread(self.queue.entries)
+        if not any(item.conversation_id == link.conversation_id for item in entries):
+            self.state.mark_not_queued(link.conversation_id)
+            return
+        try:
+            stopped = await adapter.stop_generation(link)
+            if not stopped.get("cancelled"):
+                self.state.update(link.conversation_id, **{**common, "status": "running_stop_failed",
+                                  "last_error": stopped.get("reason") or "generation stop was not confirmed"})
+                return
+            after = await adapter.inspect(link)
+        except Exception as exc:
+            failure = classify_runtime_error(exc)
+            self.state.update(link.conversation_id, **{**common, "status": failure.state.value,
+                              "last_error": f"running recovery failed: {failure.reason}"})
+            return
+        after_common = self._snapshot_state(link, after, {**candidate.previous, **common}, now=now)
+        after_common.update({name: common[name] for name in (
+            "running_scan_count", "running_since_epoch", "running_generation_key"
+        ) if name in common})
+        after_key, _ = self._running_generation(after)
+        if not after.found or not after.turns or after.canonical and not after.state_verified:
+            self.state.update(link.conversation_id, **{**after_common, "status": "waiting_transcript",
+                              "last_error": "post-stop conversation could not be verified"})
+            return
+        if after_key != key:
+            self.state.update(link.conversation_id, **after_common, status="waiting_generation_change")
+            return
+        start_key, start_index, reason = self._resolve_task_start(after, candidate.previous)
+        if start_key is None or start_index is None:
+            self.state.update(link.conversation_id, **{**after_common, "status": "awaiting_new_task",
+                              "last_error": reason})
+            return
+        decision = classify_thread_state(
+            after, task_start_index=start_index, completion_marker=self.config.completion_marker,
+            continuation_message=self.config.continue_message,
+        )
+        if decision.state is ThreadDecisionState.COMPLETE and decision.completion_turn is not None:
+            await self._record_completion(link, after, candidate.previous, start_key,
+                                          decision.completion_turn, after_common)
+            return
+        if self._is_working(after):
+            self.state.update(link.conversation_id, **{**after_common, "status": "waiting_generation_stop",
+                              "last_error": "generation is still working after stop; continuation deferred"})
+            return
+        if after.composer_text.strip():
+            self.state.update(link.conversation_id, **after_common, status="draft_present")
+            return
+        await self._send_forced_continue(adapter, candidate, after, after_common, now)
+
     async def _send_forced_continue(
         self,
         adapter: ChatAdapter,
@@ -2883,9 +3048,14 @@ class ChatWatchdog:
         if result.clicked and not result.observed and not result.running:
             status = "continue_unconfirmed"
         elif result.clicked:
-            status = "forced_continue_sent"
+            status = "running_restart_sent" if candidate.running_recovery else "forced_continue_sent"
         else:
             status = "forced_continue_blocked"
+        if candidate.running_recovery and result.clicked:
+            confirmation_common.update(
+                running_scan_count=0, running_since_epoch=now,
+                running_generation_key=self._running_generation(confirmation)[0],
+            )
         self.state.update(
             link.conversation_id,
             **{
@@ -2971,6 +3141,8 @@ class ChatWatchdog:
             "thinking_effort": self.config.thinking_effort,
             "stream_timeout_seconds": self.config.stream_timeout_seconds,
             "stale_generation_seconds": self.config.stale_generation_seconds,
+            "running_restart_seconds": self.config.running_restart_seconds,
+            "running_restart_scans": self.config.running_restart_scans,
             "max_continue_attempts": self.config.max_continue_attempts,
             "pre_send_confirmation_seconds": self.config.pre_send_confirmation_seconds,
             "runtime": dict(self._runtime),
