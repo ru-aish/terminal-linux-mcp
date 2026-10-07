@@ -1171,3 +1171,41 @@ def test_chat_runtime_control_pauses_recovers_and_resumes(tmp_path, monkeypatch)
         )
     )
     assert paused["runtime"]["state"] == "OPEN"
+
+
+def test_registered_unlinked_parent_does_not_block_ordinary_identity_assignment(tmp_path, monkeypatch):
+    import sqlite3
+    from types import SimpleNamespace
+    from chat_gateway import ChatGateway, SQLiteLedger, FakeBackend
+
+    isolated_home(tmp_path, monkeypatch)
+    path = tmp_path / "managed.db"
+
+    def connect():
+        db = sqlite3.connect(path)
+        db.row_factory = sqlite3.Row
+        return db
+
+    with connect() as db:
+        db.execute("CREATE TABLE agents(chat_id TEXT,status TEXT,parent_agent_id TEXT)")
+        db.execute("INSERT INTO agents VALUES(NULL,'registered',NULL)")
+        db.execute("INSERT INTO agents VALUES('known-child','completed','root')")
+    repository = SimpleNamespace(connect=connect)
+    gateway = ChatGateway(SQLiteLedger(tmp_path / "gateway.db"), FakeBackend())
+    monkeypatch.setenv("MCP_IDENTITY_PROJECT_IDS", "project")
+    monkeypatch.setattr(terminal_mcp, "_CHAT_IDENTITY_DISCOVERY", None)
+    monkeypatch.setattr(terminal_mcp, "get_chat_gateway", lambda: gateway)
+    monkeypatch.setattr(terminal_mcp, "get_chat_agent_coordinator", lambda: SimpleNamespace(repository=repository))
+    d = terminal_mcp.get_chat_identity_discovery()
+    # The production factory's managed callback must distinguish registration
+    # from an in-flight child creation; the latter still defers assignment.
+    assert d.managed() == ({"known-child"}, False)
+    d.seed_known("project", ["old"])
+    message = "Please inspect the installed Terminal MCP version and explain the tool flow."
+    d.observe("project", [{"conversation_id": "ordinary", "title": "Tool flow", "snippet": message}])
+    event_id = d.submit(message, scope="project").splitlines()[0].split(": ", 1)[1]
+    run(d.run_once())
+    assert d.event(event_id)["state"] == "stop_pending"
+    with connect() as db:
+        db.execute("INSERT INTO agents VALUES(NULL,'creating','root')")
+    assert d.managed() == ({"known-child"}, True)

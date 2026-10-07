@@ -775,7 +775,12 @@ server.main()
                 await session.initialize()
                 def text(result):
                     return "\n".join(getattr(c, "text", "") for c in result.content)
-                response = text(await session.call_tool("bootstrap_thread", {"exact_user_message": message, "project_id": "project", "cwd": str(tmp_path)}))
+                retry = text(await session.call_tool("bootstrap_thread", {"thread_id": "model-invented"}))
+                assert "provide exact_user_message" in retry
+                assert "copied verbatim" in retry
+                gated = await session.call_tool("get_thread_context", {"thread_id": "model-invented"})
+                assert gated.isError
+                response = text(await session.call_tool("bootstrap_thread", {"thread_id": "model-invented", "exact_user_message": message, "project_id": "project", "cwd": str(tmp_path)}))
                 assert "Discovery Event ID:" in response
                 assert "State: stop_pending" in response or "State: stopping" in response
                 token = response.splitlines()[0].split(": ", 1)[1]
@@ -803,6 +808,7 @@ server.main()
             assert db.execute("SELECT COUNT(*) FROM operations WHERE type='DISCOVERY_LIST'").fetchone()[0] == 0
         with sqlite3.connect(tmp_path / "gpt-home" / "thread_usage.db") as db:
             assert db.execute("SELECT bootstrap_count FROM threads WHERE thread_id=?", (thread_id,)).fetchone()[0] == 1
+            assert db.execute("SELECT COUNT(*) FROM threads WHERE thread_id='model-invented'").fetchone()[0] == 0
 
     try:
         _wait_for_port(port, process)

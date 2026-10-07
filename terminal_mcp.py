@@ -265,9 +265,10 @@ def get_chat_identity_discovery() -> ChatIdentityDiscovery:
         def managed():
             repository = get_chat_agent_coordinator().repository
             with repository.connect() as db:
-                rows = list(db.execute("SELECT chat_id,status FROM agents"))
+                rows = list(db.execute("SELECT chat_id,status,parent_agent_id FROM agents"))
             return ({str(row["chat_id"]) for row in rows if row["chat_id"]},
-                    any(not row["chat_id"] and row["status"] not in {"completed", "failed", "cancelled"} for row in rows))
+                    any(row["parent_agent_id"] and not row["chat_id"] and
+                        row["status"] not in {"completed", "failed", "cancelled"} for row in rows))
 
         _CHAT_IDENTITY_DISCOVERY = ChatIdentityDiscovery(GPT_STORE, get_chat_gateway(), scopes=scopes, managed=managed)
         for scope, record in projects.items():
@@ -432,7 +433,16 @@ class AccountingFastMCP(FastMCP):
         }
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        identity_error = _tool_identity_error(self, arguments)
+        # An unassigned chat may still send an obsolete model-chosen ID. Let
+        # bootstrap return discovery/retry guidance, without granting that ID
+        # authority. Trusted host identity and every other tool stay gated.
+        candidate = self._thread_id(arguments)
+        unassigned_bootstrap = (
+            name == "bootstrap_thread"
+            and not _host_conversation_identity(self)
+            and (not candidate or GPT_STORE.binding_for_thread(candidate) is None)
+        )
+        identity_error = None if unassigned_bootstrap else _tool_identity_error(self, arguments)
         if identity_error:
             return mcp_types.CallToolResult(
                 content=[mcp_types.TextContent(type="text", text=identity_error)],
@@ -440,6 +450,10 @@ class AccountingFastMCP(FastMCP):
             )
         # FastMCP's own conversion/validation remains authoritative.
         result = await super().call_tool(name, arguments)
+        if unassigned_bootstrap:
+            # Discovery has an event token, not a trusted thread identity yet.
+            # Usage attribution must not persist the discarded supplied ID.
+            return result
         thread_id = self._thread_id(arguments)
         if not thread_id or thread_id == "default":
             return result
@@ -2912,7 +2926,9 @@ async def bootstrap_thread(
     project_id: str | None = None,
 ) -> str:
     """Discover an unassigned chat using its exact latest user message. Once assigned, bootstrap is forbidden; load context with get_thread_context."""
-    if not thread_id and not _host_conversation_identity(mcp):
+    if not _host_conversation_identity(mcp) and (
+        not thread_id or GPT_STORE.binding_for_thread(thread_id) is None
+    ):
         if os.environ.get("MCP_CHAT_IDENTITY_DISCOVERY_ENABLED", "1").lower() in {"0", "false", "no", "off"}:
             return "Error: identity discovery is disabled on this server. Use an already assigned ID with get_thread_context."
         if not exact_user_message.strip() or len(exact_user_message) > 24000:
