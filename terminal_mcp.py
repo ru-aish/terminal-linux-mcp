@@ -2932,7 +2932,12 @@ async def bootstrap_thread(
         if os.environ.get("MCP_CHAT_IDENTITY_DISCOVERY_ENABLED", "1").lower() in {"0", "false", "no", "off"}:
             return "Error: identity discovery is disabled on this server. Use an already assigned ID with get_thread_context."
         if not exact_user_message.strip() or len(exact_user_message) > 24000:
-            return "Error: provide exact_user_message (1–24000 characters). " + NO_MATCH
+            return (
+                "Error: provide exact_user_message (1–24000 characters). "
+                "If the cached connector requires thread_id, send thread_id='' "
+                "to indicate an unassigned chat, together with exact_user_message. "
+                + NO_MATCH
+            )
         discovery = get_chat_identity_discovery()
         response = discovery.submit(exact_user_message, event_id=discovery_event_id, scope=project_id, cwd=cwd)
         if response.startswith("Error:"):

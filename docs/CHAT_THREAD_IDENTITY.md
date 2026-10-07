@@ -12,6 +12,12 @@ latest user request verbatim. `thread_id` is omitted. An optional `project_id` m
 be in the configured discovery scopes. The response includes a server-issued
 `discovery_event_id`; retries reuse this token. Tokens cannot change project or cwd.
 
+A cached connector definition may still require the `thread_id` property. In that
+case, pass `thread_id=""` with `exact_user_message`; the empty string means
+unassigned. An unbound supplied ID is discarded and cannot gain access or become
+a persisted identity. Missing message text returns explicit retry guidance.
+Registered parents without a chat ID do not represent pending child creation.
+
 1. Look for an exact or sufficiently long prefix match in the durable preview cache.
 2. On a cache miss, request desktop listings through the existing paced gateway.
    Listings preserve conversation ID, title, snippet, timestamps, and pagination.
@@ -54,6 +60,9 @@ a replacement ID. Uncertain delivery retains the binding for reconciliation.
 chats are also listed. `MCP_CHAT_IDENTITY_DISCOVERY_ENABLED=0` disables discovery.
 The background lifecycle is installed for HTTP/SSE; a valid stdio bootstrap starts
 its worker lazily. The process must stay alive for a pending handoff to finish.
+An explicitly paused gateway remains paused across deployments. Inspect its runtime
+circuit and pending operations before resuming; stale identity messages to older
+chats should not be replayed merely to recover a new chat.
 
 ## Context loading and identity checks
 

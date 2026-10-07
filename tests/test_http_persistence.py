@@ -778,6 +778,7 @@ server.main()
                 retry = text(await session.call_tool("bootstrap_thread", {"thread_id": "model-invented"}))
                 assert "provide exact_user_message" in retry
                 assert "copied verbatim" in retry
+                assert "thread_id=''" in retry
                 gated = await session.call_tool("get_thread_context", {"thread_id": "model-invented"})
                 assert gated.isError
                 response = text(await session.call_tool("bootstrap_thread", {"thread_id": "model-invented", "exact_user_message": message, "project_id": "project", "cwd": str(tmp_path)}))
