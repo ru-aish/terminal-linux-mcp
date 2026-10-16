@@ -1,0 +1,21 @@
+[project]
+name = "terminal-gpt-experimental-mcp"
+version = "0.2.0"
+description = "An isolated Terminal GPT MCP with per-thread context bootstrap, .GPT instructions, skills/tools manifests, and token usage accounting."
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.27.1,<2",
+  "uvicorn[standard]>=0.48,<1",
+  "starlette>=1.2,<2",
+  "httpx>=0.28,<1",
+  "websockets>=13,<17",
+  "websocket-client>=1.8,<2",
+  "tiktoken>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

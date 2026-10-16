@@ -1,0 +1,443 @@
+(() => {
+  "use strict";
+
+  const state = {
+    hours: 24,
+    snapshot: null,
+    source: null,
+    fallbackTimer: null,
+    seenEventIds: new Set(),
+    query: "",
+    watchdogEditorVersion: null,
+    availableProjects: [],
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const number = new Intl.NumberFormat("en-US");
+  const compact = new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    compactDisplay: "short",
+    maximumFractionDigits: 1,
+  });
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function formatCount(value) {
+    const n = Number(value || 0);
+    return n >= 10000 ? compact.format(n) : number.format(n);
+  }
+
+  function formatBytes(value) {
+    let n = Number(value || 0);
+    const units = ["B", "KB", "MB", "GB"];
+    let index = 0;
+    while (n >= 1024 && index < units.length - 1) {
+      n /= 1024;
+      index += 1;
+    }
+    return `${n.toFixed(index ? 1 : 0)} ${units[index]}`;
+  }
+
+  function relativeTime(value) {
+    if (!value) return "never";
+    const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
+    if (seconds < 5) return "now";
+    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)}d ago`;
+  }
+
+  function localTime(value, options = {}) {
+    if (!value) return "—";
+    return new Intl.DateTimeFormat(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      ...options,
+    }).format(new Date(value));
+  }
+
+  function setConnection(mode, label) {
+    const node = $("connection");
+    node.dataset.state = mode;
+    $("connectionLabel").textContent = label;
+  }
+
+  function linePath(points) {
+    if (!points.length) return "";
+    return points.map((point, index) => `${index ? "L" : "M"}${point[0].toFixed(1)},${point[1].toFixed(1)}`).join(" ");
+  }
+
+  function renderChart(series) {
+    const wrap = $("chartWrap");
+    if (!series?.length || !series.some((item) => item.events)) {
+      wrap.innerHTML = '<div class="chart-empty">No accounting events in this window.</div>';
+      return;
+    }
+
+    const width = 1000;
+    const height = 310;
+    const pad = { left: 36, right: 24, top: 28, bottom: 48 };
+    const plotWidth = width - pad.left - pad.right;
+    const plotHeight = height - pad.top - pad.bottom;
+    const maxTokens = Math.max(1, ...series.flatMap((item) => [item.exact_tokens, item.estimated_tokens]));
+    const maxCalls = Math.max(1, ...series.map((item) => item.tool_calls));
+    const x = (index) => pad.left + (series.length === 1 ? plotWidth / 2 : index * plotWidth / (series.length - 1));
+    const y = (value) => pad.top + plotHeight - (value / maxTokens) * plotHeight;
+    const exact = series.map((item, index) => [x(index), y(item.exact_tokens)]);
+    const estimated = series.map((item, index) => [x(index), y(item.estimated_tokens)]);
+    const barWidth = Math.max(3, Math.min(18, plotWidth / series.length - 3));
+    const grid = [0, .25, .5, .75, 1].map((portion) => {
+      const gy = pad.top + plotHeight * portion;
+      const label = formatCount(Math.round(maxTokens * (1 - portion)));
+      return `<line x1="${pad.left}" y1="${gy}" x2="${width - pad.right}" y2="${gy}" stroke="var(--rule)" stroke-width="1" opacity=".55"/><text x="${pad.left}" y="${gy - 6}" fill="var(--muted)" font-size="17" font-family="var(--mono)">${label}</text>`;
+    }).join("");
+    const bars = series.map((item, index) => {
+      const barHeight = item.tool_calls ? Math.max(3, item.tool_calls / maxCalls * 34) : 0;
+      return `<rect x="${x(index) - barWidth / 2}" y="${height - pad.bottom + 7 - barHeight}" width="${barWidth}" height="${barHeight}" rx="2" fill="var(--calls)" opacity=".65"><title>${item.tool_calls} tool calls</title></rect>`;
+    }).join("");
+    const labelIndexes = [...new Set([0, Math.floor((series.length - 1) / 2), series.length - 1])];
+    const labels = labelIndexes.map((index) => `<text x="${x(index)}" y="${height - 12}" text-anchor="${index === 0 ? "start" : index === series.length - 1 ? "end" : "middle"}" fill="var(--muted)" font-size="18" font-family="var(--mono)">${escapeHtml(localTime(series[index].at))}</text>`).join("");
+
+    wrap.innerHTML = `
+      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Exact and estimated token usage over time">
+        ${grid}
+        ${bars}
+        <path d="${linePath(estimated)}" fill="none" stroke="var(--estimated)" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+        <path d="${linePath(exact)}" fill="none" stroke="var(--exact)" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+        ${estimated.map((point, index) => `<circle cx="${point[0]}" cy="${point[1]}" r="${series[index].estimated_tokens ? 4 : 0}" fill="var(--surface)" stroke="var(--estimated)" stroke-width="3"><title>${formatCount(series[index].estimated_tokens)} estimated tokens</title></circle>`).join("")}
+        ${exact.map((point, index) => `<circle cx="${point[0]}" cy="${point[1]}" r="${series[index].exact_tokens ? 4 : 0}" fill="var(--surface)" stroke="var(--exact)" stroke-width="3"><title>${formatCount(series[index].exact_tokens)} exact tokens</title></circle>`).join("")}
+        ${labels}
+      </svg>`;
+  }
+
+  function createToolRow(tool) {
+    const row = document.createElement("div");
+    row.className = "tool-row";
+    row.dataset.toolName = tool.name;
+    row.innerHTML = `
+      <span class="tool-name"></span>
+      <strong class="tool-count"></strong>
+      <div class="tool-track" aria-hidden="true"><div class="tool-fill"></div></div>
+      <span class="tool-meta"></span>`;
+    return row;
+  }
+
+  function updateToolRow(row, tool, max) {
+    const name = row.querySelector(".tool-name");
+    const count = row.querySelector(".tool-count");
+    const fill = row.querySelector(".tool-fill");
+    const meta = row.querySelector(".tool-meta");
+
+    name.textContent = tool.name;
+    name.title = tool.name;
+    count.textContent = formatCount(tool.calls);
+    count.title = number.format(tool.calls || 0);
+    fill.style.width = `${Math.max(3, tool.calls / max * 100).toFixed(1)}%`;
+    meta.textContent = `${formatCount(tool.input_tokens)} result tokens · ${formatCount(tool.output_tokens)} call tokens · ${relativeTime(tool.last_seen)}`;
+  }
+
+  function renderTools(tools) {
+    const list = $("toolList");
+    if (!tools?.length) {
+      list.replaceChildren(Object.assign(document.createElement("div"), {
+        className: "empty-row",
+        textContent: "No tool calls in this window.",
+      }));
+      return;
+    }
+
+    const max = Math.max(...tools.map((tool) => tool.calls), 1);
+    const existing = new Map(
+      [...list.querySelectorAll(".tool-row")].map((row) => [row.dataset.toolName, row]),
+    );
+    const activeNames = new Set(tools.map((tool) => tool.name));
+
+    list.querySelectorAll(".empty-row").forEach((row) => row.remove());
+    existing.forEach((row, name) => {
+      if (!activeNames.has(name)) row.remove();
+    });
+
+    tools.forEach((tool) => {
+      const row = existing.get(tool.name) || createToolRow(tool);
+      updateToolRow(row, tool, max);
+      list.appendChild(row);
+    });
+  }
+
+  function renderEvents(events) {
+    const rail = $("eventRail");
+    if (!events?.length) {
+      rail.innerHTML = '<li class="empty-row">Waiting for the first event.</li>';
+      return;
+    }
+    const newest = events.slice(0, 14);
+    rail.innerHTML = newest.map((event) => {
+      const isNew = !state.seenEventIds.has(event.id);
+      const name = event.tool_name || event.model || event.event_type;
+      const tokens = Number(event.input_tokens || 0) + Number(event.output_tokens || 0);
+      return `<li class="event-item ${event.is_exact ? "exact" : "estimated"} ${isNew ? "new" : ""}">
+        <div class="event-head">
+          <span class="event-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+          <time class="event-time" datetime="${escapeHtml(event.created_at)}">${relativeTime(event.created_at)}</time>
+        </div>
+        <div class="event-detail">
+          <span class="event-badge">${event.is_exact ? "exact" : "estimate"}</span>
+          <span>${formatCount(tokens)} tokens</span>
+          <span title="${escapeHtml(event.thread_id)}">${escapeHtml(event.thread_id)}</span>
+        </div>
+      </li>`;
+    }).join("");
+    newest.forEach((event) => state.seenEventIds.add(event.id));
+  }
+
+  function renderThreads() {
+    const rows = state.snapshot?.threads || [];
+    const query = state.query.trim().toLowerCase();
+    const filtered = query ? rows.filter((row) => `${row.thread_id} ${row.cwd}`.toLowerCase().includes(query)) : rows;
+    const target = $("threadRows");
+    if (!filtered.length) {
+      target.innerHTML = `<div class="empty-row">${query ? "No thread matches this filter." : "No threads recorded."}</div>`;
+      return;
+    }
+    target.innerHTML = filtered.map((row) => `
+      <div class="thread-row" role="row">
+        <div class="thread-main" role="cell">
+          <span class="thread-id" title="${escapeHtml(row.thread_id)}">${escapeHtml(row.thread_id)}</span>
+          <span class="thread-path" title="${escapeHtml(row.cwd)}">${escapeHtml(row.cwd)}</span>
+        </div>
+        <strong class="thread-calls" role="cell">${formatCount(row.tool_calls)}</strong>
+        <div class="thread-metrics">
+          <span role="cell"><b>${formatCount(row.exact_tokens)}</b> exact</span>
+          <span role="cell"><b>${formatCount(row.estimated_tokens)}</b> estimated</span>
+          <span role="cell">${relativeTime(row.last_event_at || row.updated_at)}</span>
+        </div>
+      </div>`).join("");
+  }
+
+  function render(snapshot) {
+    state.snapshot = snapshot;
+    const totals = snapshot.totals;
+    $("exactTokens").textContent = formatCount(totals.exact_tokens);
+    $("exactTokens").title = number.format(totals.exact_tokens || 0);
+    $("exactInput").textContent = formatCount(totals.exact_input_tokens);
+    $("exactOutput").textContent = formatCount(totals.exact_output_tokens);
+    $("estimatedTokens").textContent = formatCount(totals.estimated_tokens);
+    $("estimatedTokens").title = number.format(totals.estimated_tokens || 0);
+    $("toolCalls").textContent = formatCount(totals.tool_calls);
+    $("callRate").textContent = Number(snapshot.window.calls_per_minute_5m || 0).toFixed(1);
+    $("activeThreads").textContent = formatCount(totals.active_threads);
+    $("threadTotal").textContent = formatCount(totals.threads);
+    $("windowSummary").textContent = `${formatCount(snapshot.window.tool_calls)} calls · ${formatCount(snapshot.window.estimated_tokens)} estimated · ${formatCount(snapshot.window.exact_tokens)} exact`;
+    $("lastUpdated").textContent = `Updated ${relativeTime(snapshot.generated_at)}`;
+    $("databaseSize").textContent = `DB ${formatBytes(snapshot.database_bytes)}`;
+    $("eventCount").textContent = `${formatCount(snapshot.window.events)} events`;
+    $("databasePath").textContent = snapshot.database;
+    $("databasePath").title = snapshot.database;
+    $("accountingNote").textContent = snapshot.accounting_note;
+    renderChart(snapshot.series);
+    renderTools(snapshot.tools);
+    renderEvents(snapshot.recent_events);
+    renderThreads();
+  }
+
+  async function fetchSnapshot() {
+    const response = await fetch(`/dashboard/api?hours=${state.hours}&limit=40`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Dashboard API returned ${response.status}`);
+    render(await response.json());
+  }
+
+  function clearFallback() {
+    if (state.fallbackTimer) window.clearInterval(state.fallbackTimer);
+    state.fallbackTimer = null;
+  }
+
+  function beginFallback() {
+    if (state.fallbackTimer) return;
+    fetchSnapshot().catch(() => {});
+    state.fallbackTimer = window.setInterval(() => fetchSnapshot().catch(() => {}), 5000);
+  }
+
+  function connect() {
+    clearFallback();
+    if (state.source) state.source.close();
+    setConnection("connecting", "Connecting");
+    const source = new EventSource(`/dashboard/events?hours=${state.hours}&limit=40`);
+    state.source = source;
+    source.addEventListener("open", () => {
+      clearFallback();
+      setConnection("live", "Live");
+    });
+    source.addEventListener("snapshot", (event) => {
+      try {
+        render(JSON.parse(event.data));
+        setConnection("live", "Live");
+      } catch (error) {
+        console.error("Could not parse dashboard snapshot", error);
+      }
+    });
+    source.addEventListener("error", () => {
+      setConnection("error", "Reconnecting");
+      beginFallback();
+    });
+  }
+
+  async function watchdogRequest(path, options = {}) {
+    const response = await fetch(path, { ...options, headers: { "x-mcp-dashboard-csrf": "chat-watchdog", ...(options.headers || {}) } });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `Watchdog request failed (${response.status})`);
+    return payload;
+  }
+
+  function renderWatchdog(snapshot) {
+    const watchdog = snapshot;
+    if (!watchdog || !watchdog.queue) return;
+    const runtime = watchdog.runtime || {};
+    $("watchdogStatus").textContent = `${watchdog.enabled ? "Enabled" : "Disabled"}${watchdog.dry_run ? " · dry run" : ""} · ${watchdog.queue.entries.length} active task${watchdog.queue.entries.length === 1 ? "" : "s"} · ${runtime.scanning ? "scanning" : `last scan ${relativeTime(runtime.last_scan_finished_at)}`}`;
+    const raw = $("watchdogRaw");
+    if (document.activeElement !== raw) {
+      raw.value = watchdog.queue.text || "";
+      state.watchdogEditorVersion = watchdog.queue.version || null;
+    }
+    $("watchdogEntries").innerHTML = watchdog.queue.entries.map((entry) => { const generation = entry.state?.task_generation ? ` · generation ${entry.state.task_generation}` : ""; return `<div class="watchdog-entry"><span title="${escapeHtml(entry.url)}">${escapeHtml(entry.url)}</span><small>${escapeHtml((entry.state?.status || "queued") + generation)}</small><button type="button" data-watchdog-remove="${escapeHtml(entry.conversation_id)}">Remove task</button></div>`; }).join("") || '<div class="empty-row">No active tasks.</div>';
+    const projects = watchdog.projects?.items || [];
+    $("watchdogSelectedProjects").innerHTML = projects.map((project) => {
+      const mode = project.watch_mode === "existing_working" ? "existing_working" : "new_threads_only";
+      const modeLabel = mode === "existing_working" ? "all working threads" : "new threads only";
+      const scanDetail = project.last_scan_at ? `scanned ${relativeTime(project.last_scan_at)}` : "not scanned yet";
+      const detail = project.last_error ? `${project.last_error} · ${modeLabel}` : `${project.seen_thread_count || 0} known threads · ${scanDetail} · ${modeLabel}`;
+      const projectName = project.name || project.project_id;
+      return `<div class="project-watch-row project-watch-selected"><div><strong>${escapeHtml(projectName)}</strong><small>${escapeHtml(detail)}</small></div><div class="project-watch-controls"><div class="project-watch-mode" role="group" aria-label="Ledger mode for ${escapeHtml(projectName)}"><button type="button" data-watchdog-project-mode="${escapeHtml(project.project_id)}" data-watchdog-mode="new_threads_only" aria-pressed="${String(mode === "new_threads_only")}">New threads</button><button type="button" data-watchdog-project-mode="${escapeHtml(project.project_id)}" data-watchdog-mode="existing_working" aria-pressed="${String(mode === "existing_working")}">All working</button></div><button type="button" class="project-watch-stop" data-watchdog-project-remove="${escapeHtml(project.project_id)}">Stop watching</button></div></div>`;
+    }).join("") || '<div class="empty-row">No Projects selected. General chats are never auto-added.</div>';
+    const projectScan = runtime.project_scan || {};
+    $("watchdogProjectStatus").textContent = projects.length
+      ? `${projects.length} selected Project${projects.length === 1 ? "" : "s"} · last scan: ${projectScan.physical_list_requests ?? 0} list request${projectScan.physical_list_requests === 1 ? "" : "s"}, ${projectScan.physical_existing_inspect_requests ?? 0} existing-thread check${projectScan.physical_existing_inspect_requests === 1 ? "" : "s"} · ${projectScan.existing_working_threads_added ?? 0} resumed, ${projectScan.new_threads_added ?? 0} new`
+      : "Each selected Project can watch only new threads or also resume existing working threads. General chats are ignored.";
+  }
+
+  function renderAvailableProjects(payload) {
+    const picker = $("watchdogAvailableProjects");
+    const items = payload?.items || [];
+    state.availableProjects = items.map((item) => ({ ...item }));
+    picker.hidden = false;
+    picker.innerHTML = items.map((project) => {
+      const selected = Boolean(project.selected);
+      const permissions = project.permissions || {};
+      const disabled = selected || permissions.can_read === false;
+      const label = selected ? "Watching" : permissions.can_read === false ? "Unavailable" : "Watch Project";
+      return `<div class="project-watch-row"><div><strong>${escapeHtml(project.name || project.id)}</strong><small>${escapeHtml(project.description || project.id)}</small></div><button type="button" data-watchdog-project-add="${escapeHtml(project.id)}" data-watchdog-project-name="${escapeHtml(project.name || project.id)}" ${disabled ? "disabled" : ""}>${label}</button></div>`;
+    }).join("") || '<div class="empty-row">No readable ChatGPT Projects were returned.</div>';
+  }
+
+  async function fetchWatchdog() { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog")); } catch (error) { $("watchdogStatus").textContent = error.message; } }
+  $("watchdogSave").addEventListener("click", async () => {
+    try {
+      renderWatchdog(await watchdogRequest("/dashboard/watchdog/queue", {
+        method: "PUT",
+        headers: {
+          "content-type": "text/plain",
+          ...(state.watchdogEditorVersion ? { "x-watchdog-queue-version": state.watchdogEditorVersion } : {}),
+        },
+        body: $("watchdogRaw").value,
+      }));
+    } catch (error) {
+      $("watchdogStatus").textContent = error.message;
+    }
+  });
+  $("watchdogAddButton").addEventListener("click", async () => { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog/queue/add", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: $("watchdogAdd").value }) })); $("watchdogAdd").value = ""; } catch (error) { $("watchdogStatus").textContent = error.message; } });
+  $("watchdogScan").addEventListener("click", async () => { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog/scan", { method: "POST" })); } catch (error) { $("watchdogStatus").textContent = error.message; } });
+  $("watchdogEntries").addEventListener("click", async (event) => { const button = event.target.closest("[data-watchdog-remove]"); if (!button) return; try { renderWatchdog(await watchdogRequest(`/dashboard/watchdog/queue/${button.dataset.watchdogRemove}`, { method: "DELETE" })); } catch (error) { $("watchdogStatus").textContent = error.message; } });
+  $("watchdogProjectLoad").addEventListener("click", async () => {
+    try {
+      $("watchdogProjectStatus").textContent = "Loading available Projects…";
+      renderAvailableProjects(await watchdogRequest("/dashboard/watchdog/projects/available"));
+      $("watchdogProjectStatus").textContent = "Add a Project, then choose whether only new threads or all currently working threads should enter the ledger.";
+    } catch (error) {
+      $("watchdogProjectStatus").textContent = error.message;
+    }
+  });
+  $("watchdogAvailableProjects").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-watchdog-project-add]");
+    if (!button || button.disabled) return;
+    try {
+      button.disabled = true;
+      button.textContent = "Adding…";
+      renderWatchdog(await watchdogRequest("/dashboard/watchdog/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ project_id: button.dataset.watchdogProjectAdd, name: button.dataset.watchdogProjectName || "" }),
+      }));
+      state.availableProjects = state.availableProjects.map((project) => project.id === button.dataset.watchdogProjectAdd ? { ...project, selected: true } : project);
+      renderAvailableProjects({ items: state.availableProjects });
+    } catch (error) {
+      $("watchdogProjectStatus").textContent = error.message;
+    }
+  });
+  $("watchdogSelectedProjects").addEventListener("click", async (event) => {
+    const modeButton = event.target.closest("[data-watchdog-project-mode]");
+    if (modeButton) {
+      if (modeButton.getAttribute("aria-pressed") === "true") return;
+      const projectId = modeButton.dataset.watchdogProjectMode;
+      const watchMode = modeButton.dataset.watchdogMode;
+      const group = modeButton.closest(".project-watch-mode");
+      const buttons = group ? [...group.querySelectorAll("button")] : [modeButton];
+      buttons.forEach((button) => { button.disabled = true; });
+      try {
+        renderWatchdog(await watchdogRequest(`/dashboard/watchdog/projects/${projectId}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ watch_mode: watchMode }),
+        }));
+      } catch (error) {
+        $("watchdogProjectStatus").textContent = error.message;
+        buttons.forEach((button) => { button.disabled = false; });
+      }
+      return;
+    }
+
+    const button = event.target.closest("[data-watchdog-project-remove]");
+    if (!button) return;
+    try {
+      renderWatchdog(await watchdogRequest(`/dashboard/watchdog/projects/${button.dataset.watchdogProjectRemove}`, { method: "DELETE" }));
+      state.availableProjects = state.availableProjects.map((project) => project.id === button.dataset.watchdogProjectRemove ? { ...project, selected: false } : project);
+      if (!$("watchdogAvailableProjects").hidden) renderAvailableProjects({ items: state.availableProjects });
+    } catch (error) {
+      $("watchdogProjectStatus").textContent = error.message;
+    }
+  });
+  fetchWatchdog();
+  window.setInterval(fetchWatchdog, 5000);
+
+  document.querySelectorAll("[data-hours]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const hours = Number(button.dataset.hours);
+      if (!hours || hours === state.hours) return;
+      state.hours = hours;
+      document.querySelectorAll("[data-hours]").forEach((candidate) => candidate.setAttribute("aria-pressed", String(candidate === button)));
+      connect();
+    });
+  });
+
+  $("threadSearch").addEventListener("input", (event) => {
+    state.query = event.currentTarget.value;
+    renderThreads();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && (!state.source || state.source.readyState === EventSource.CLOSED)) connect();
+  });
+
+  window.addEventListener("beforeunload", () => {
+    if (state.source) state.source.close();
+    clearFallback();
+  });
+
+  connect();
+})();

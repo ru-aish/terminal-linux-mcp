@@ -1,0 +1,54 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Check bootstrap interfaces
+        run: |
+          bash -n start.sh setup.sh store.sh install.sh
+          ./start.sh --help
+          ./setup.sh --help
+          ./store.sh --help
+          ./install.sh --help
+
+      - name: Install through project setup
+        env:
+          PYTHON_BIN: python
+        run: |
+          ./setup.sh --dev
+          .venv/bin/pytest --version
+          ./store.sh --check
+          ./start.sh --check --local-only
+
+      - name: Compile Python files
+        run: |
+          .venv/bin/python -m py_compile \
+            terminal_mcp.py \
+            scripts/smoke_test.py \
+            tests/test_terminal_mcp.py \
+            tests/test_http_persistence.py
+
+      - name: Run tests
+        run: .venv/bin/pytest -q

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#d7d2c6">
+  <title>Terminal MCP · Orchestration control</title>
+  <link rel="stylesheet" href="/dashboard/assets/agents.css">
+  <script src="/dashboard/assets/agents.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to orchestration status</a>
+  <div class="shell">
+    <header class="masthead">
+      <a class="identity" href="/dashboard/agents" aria-label="Terminal MCP orchestration control">
+        <span class="signal" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>Terminal MCP</strong><small>Orchestration control</small></span>
+      </a>
+      <nav aria-label="Dashboard sections">
+        <a href="/dashboard">Usage</a>
+        <a href="/dashboard/agents" aria-current="page">Agents</a>
+      </nav>
+      <div id="connection" class="connection" data-state="loading" aria-live="polite">
+        <i></i><span>Loading</span>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="dispatch-head">
+        <div>
+          <p class="eyebrow">Durable actors · one shared request rail</p>
+          <h1>See who is working, sleeping, and next in line.</h1>
+          <p class="intro">The control tower joins agent ancestry, synchronization, timers, completion gates, backend pressure, and physical ChatGPT calls without collapsing them into one ambiguous status.</p>
+        </div>
+        <div class="next-slot" aria-labelledby="nextSlotLabel">
+          <span id="nextSlotLabel">Next provider request</span>
+          <strong id="nextSlot">—</strong>
+          <small id="generatedAt">Not updated</small>
+        </div>
+      </section>
+
+      <section class="sync-strip" aria-label="Synchronization and reasoning status">
+        <article>
+          <span>Synchronizer</span>
+          <strong id="syncState">—</strong>
+          <small id="lastSync">not started</small>
+        </article>
+        <article>
+          <span>Next wake timer</span>
+          <strong id="nextWake">—</strong>
+          <small>local trigger, then shared rail</small>
+        </article>
+        <article>
+          <span>Reasoning contract</span>
+          <strong id="reasoningMode">—</strong>
+          <small id="reasoningModel">model not reported</small>
+        </article>
+      </section>
+
+      <section class="capacity" aria-label="Agent, queue, and automation totals">
+        <article><span>Active children</span><strong id="activeChildren">—</strong><small id="capacityLimit">of 5 slots</small></article>
+        <article><span>Provider queue</span><strong id="queuedOperations">—</strong><small>durable physical work</small></article>
+        <article><span>Wake timers</span><strong id="scheduledWakeups">—</strong><small>scheduled or queued</small></article>
+        <article><span>Completion gates</span><strong id="completionTriggers">—</strong><small>waiting for exact marker</small></article>
+        <article><span>Terminal agents</span><strong id="terminalAgents">—</strong><small>completed, failed, cancelled</small></article>
+        <article><span>Requests · 24h</span><strong id="requestCount">—</strong><small id="rateLimitedCount">— rate limited</small></article>
+      </section>
+
+      <section class="automation-section" aria-labelledby="automationTitle">
+        <div class="section-head">
+          <div><p class="eyebrow">Local automation layer</p><h2 id="automationTitle">Timers and marker gates</h2></div>
+          <span class="section-note">No provider call until activation</span>
+        </div>
+        <ol id="automationRail" class="automation-rail" aria-live="polite">
+          <li class="empty">No durable automations.</li>
+        </ol>
+      </section>
+
+      <section class="rail-section" aria-labelledby="railTitle">
+        <div class="section-head">
+          <div><p class="eyebrow">Provider dispatch rail</p><h2 id="railTitle">What can spend a request next</h2></div>
+          <span class="legend"><i class="read"></i>read <i class="heavy"></i>heavy <i class="cleanup"></i>cleanup</span>
+        </div>
+        <ol id="operationRail" class="operation-rail" aria-live="polite">
+          <li class="empty">No queued provider operations.</li>
+        </ol>
+      </section>
+
+      <div class="split">
+        <section class="circuit-section" aria-labelledby="circuitTitle">
+          <div class="section-head compact"><div><p class="eyebrow">Circuit board</p><h2 id="circuitTitle">Backend pressure</h2></div></div>
+          <div id="circuits" class="circuits"><p class="empty">No circuit records yet.</p></div>
+        </section>
+
+        <section class="request-section" aria-labelledby="requestTitle">
+          <div class="section-head compact"><div><p class="eyebrow">Physical calls</p><h2 id="requestTitle">Latest request events</h2></div></div>
+          <ol id="requestRail" class="request-rail"><li class="empty">No requests recorded.</li></ol>
+        </section>
+      </div>
+
+      <section class="agent-section" aria-labelledby="agentTitle">
+        <div class="section-head agent-heading">
+          <div><p class="eyebrow">Orchestration spine</p><h2 id="agentTitle">Parents, children, and work state</h2></div>
+          <label><span class="sr-only">Filter agents</span><input id="agentFilter" type="search" placeholder="Filter title, state, ID, or path" autocomplete="off"></label>
+        </div>
+        <div id="agentList" class="agent-list" aria-live="polite"><p class="empty">No agents registered.</p></div>
+      </section>
+
+      <section class="principle" aria-labelledby="principleTitle">
+        <p class="eyebrow">Operational contract</p>
+        <h2 id="principleTitle">A local trigger is not a provider request.</h2>
+        <div>
+          <p><strong>Timers are durable.</strong> A restart does not erase a scheduled wake-up; the backend materializes it when due.</p>
+          <p><strong>Completion is explicit.</strong> A gate opens only when the latest canonical assistant turn contains the exact configured marker.</p>
+          <p><strong>Reasoning is enforced.</strong> Create, continue, wake-up, and completion-triggered prompts carry the configured high reasoning effort.</p>
+          <p><strong>Synchronization is staged.</strong> Every tick performs zero or one physical call, and mutations are verified in later ticks.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Auto-refresh every 5 seconds</span>
+      <form method="post" action="/dashboard/logout"><button type="submit">Lock dashboard</button></form>
+    </footer>
+  </div>
+</body>
+</html>
