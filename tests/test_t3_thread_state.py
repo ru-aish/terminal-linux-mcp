@@ -11,6 +11,34 @@ def register(state, cwd, thread='thread-one'):
     return state.register(thread_id=thread, environment_id='test-env', provider_id='chatgpt', cwd=str(cwd), model='test-model')
 
 
+def test_sqlite_connections_are_closed_on_success_and_failure(tmp_path, monkeypatch):
+    import sqlite3
+
+    original_connect = sqlite3.connect
+    connections = []
+
+    def track_connect(*args, **kwargs):
+        db = original_connect(*args, **kwargs)
+        connections.append(db)
+        return db
+
+    monkeypatch.setattr(sqlite3, 'connect', track_connect)
+    state = ThreadState(tmp_path / 'state.db')
+    register(state, tmp_path)
+    for _ in range(32):
+        state.get('thread-one')
+        state.require_terminal('thread-one')
+    with pytest.raises(RuntimeError, match='probe'):
+        with state.connect() as db:
+            db.execute('SELECT 1')
+            raise RuntimeError('probe')
+    assert len(connections) > 60
+    for db in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            db.execute('SELECT 1')
+    state.close()
+
+
 def test_immutable_bindings_and_allowlist(tmp_path):
     state = ThreadState(tmp_path/'state.db')
     register(state, tmp_path)

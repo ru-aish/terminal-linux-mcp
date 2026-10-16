@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import json
 import re
 import sqlite3
@@ -48,11 +49,18 @@ class ThreadState:
             if 'inactivity_seconds' not in {r[1] for r in db.execute('PRAGMA table_info(bindings)')}:
                 db.execute('ALTER TABLE bindings ADD COLUMN inactivity_seconds REAL')
 
+    @contextmanager
     def connect(self):
+        # sqlite3.Connection.__exit__ commits or rolls back, but it does NOT
+        # close the connection. Explicitly close every per-operation handle.
         db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA journal_mode=WAL')
-        return db
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute('PRAGMA journal_mode=WAL')
+            with db:
+                yield db
+        finally:
+            db.close()
 
     @staticmethod
     def identifier(value: Any) -> str:
