@@ -164,6 +164,8 @@ def build(core, state: ThreadState, control_token: str):
             if action == 'register':
                 result = state.register(thread_id=body['threadId'], terminal_id=body.get('terminalThreadId'),
                     environment_id=body['environmentId'], provider_id=body['providerId'], cwd=body['cwd'], model=body['model'], inactivity_seconds=body.get('inactivitySeconds'))
+                if body.get('inactivitySeconds') is not None:
+                    state.arm(body['threadId'])
             elif action in ('claim', 'ack'):
                 fn = state.claim if action == 'claim' else state.acknowledge
                 result = fn(body['eventId'], body['environmentId'], body['providerId'])
