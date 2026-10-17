@@ -192,12 +192,23 @@ def build(core, state: ThreadState, control_token: str):
     return mcp, private
 
 
+def build_public_app(core, mcp):
+    """Build the public T3 app with the legacy usage ledger dashboard only.
+
+    The T3 flavor deliberately has no watchdog/project scanner or agent
+    orchestration surface, so those optional dashboard capabilities stay off.
+    """
+    app = mcp.streamable_http_app()
+    core.install_usage_dashboard(app, core.GPT_STORE)
+    return app
+
+
 async def serve(public_port: int, control_port: int):
     import terminal_mcp as core
     state = ThreadState(Path(os.environ['T3_TERMINAL_DB']), float(os.environ.get('T3_TERMINAL_IDLE_SECONDS', '300')))
     token = Path(os.environ['T3_TERMINAL_CONTROL_TOKEN_FILE']).read_text().strip()
     mcp, private = build(core, state, token)
-    public_server = uvicorn.Server(uvicorn.Config(mcp.streamable_http_app(), host='127.0.0.1', port=public_port, log_level='info'))
+    public_server = uvicorn.Server(uvicorn.Config(build_public_app(core, mcp), host='127.0.0.1', port=public_port, log_level='info'))
     private_server = uvicorn.Server(uvicorn.Config(private, host='127.0.0.1', port=control_port, log_level='info'))
     await asyncio.gather(public_server.serve(), private_server.serve())
 

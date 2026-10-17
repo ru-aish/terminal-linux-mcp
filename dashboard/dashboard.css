@@ -204,3 +204,9 @@ footer form { margin: 0; }
 
 @keyframes pulse { 50% { box-shadow: 0 0 0 8px rgba(49,94,89,0); } }
 @keyframes eventIn { from { opacity: 0; transform: translateY(-8px); } }
+
+
+body[data-watchdog-enabled="false"] [data-dashboard-feature="watchdog"],
+body[data-agents-enabled="false"] [data-dashboard-feature="agents"] {
+  display: none !important;
+}

@@ -4,6 +4,8 @@ This deployment is an isolated copy of the running Terminal MCP, extended by `t3
 
 - Public connector: https://t3-terminal.r7code.space/mcp (no connector authentication).
 - Public readiness: https://t3-terminal.r7code.space/healthz.
+- Usage dashboard: https://t3-terminal.r7code.space/dashboard. It uses the legacy usage-ledger UI and live accounting stream, but omits watchdog/project scanning and agent controls that are not part of the T3 flavor.
+- Dashboard authentication: set `MCP_DASHBOARD_TOKEN` (the deployed service reuses `~/.config/terminal-mcp/dashboard.env`) so the public tunnel does not expose thread paths or usage data.
 - Private T3 control: http://127.0.0.1:8022/v1; bearer token in `~/.config/terminal-mcp-t3/control-token`.
 - State: `~/.local/share/terminal-mcp-t3/state.sqlite`; separate context/usage state in its `gpt` directory.
 - Services: `terminal-mcp-t3.service`, `terminal-cloudflared-t3.service` (user units, enabled at login).

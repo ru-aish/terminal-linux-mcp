@@ -172,3 +172,21 @@ def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypa
         assert state.get('thread-one')['state']=='done'
         state.close()
     asyncio.run(run())
+
+
+def test_t3_public_app_mounts_usage_dashboard_without_legacy_features(tmp_path, monkeypatch):
+    monkeypatch.setenv('MCP_GPT_HOME', str(tmp_path/'gpt-home'))
+    import terminal_mcp as core
+    from t3_terminal_server import build, build_public_app
+
+    core.WORKSPACE_DIR = tmp_path
+    state = ThreadState(tmp_path/'state.db')
+    mcp, _private = build(core, state, 'test-control-token')
+    app = build_public_app(core, mcp)
+    paths = {getattr(route, 'path', '') for route in app.routes}
+
+    assert '/dashboard' in paths
+    assert '/dashboard/api' in paths
+    assert '/dashboard/events' in paths
+    assert '/dashboard/assets/{name:str}' in paths
+    state.close()

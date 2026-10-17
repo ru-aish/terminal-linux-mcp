@@ -13,6 +13,13 @@
   };
 
   const $ = (id) => document.getElementById(id);
+  const features = {
+    watchdog: document.body.dataset.watchdogEnabled === "true",
+    agents: document.body.dataset.agentsEnabled === "true",
+  };
+  document.querySelectorAll("[data-dashboard-feature]").forEach((node) => {
+    if (!features[node.dataset.dashboardFeature]) node.remove();
+  });
   const number = new Intl.NumberFormat("en-US");
   const compact = new Intl.NumberFormat("en-US", {
     notation: "compact",
@@ -336,6 +343,7 @@
     }).join("") || '<div class="empty-row">No readable ChatGPT Projects were returned.</div>';
   }
 
+  if (features.watchdog) {
   async function fetchWatchdog() { try { renderWatchdog(await watchdogRequest("/dashboard/watchdog")); } catch (error) { $("watchdogStatus").textContent = error.message; } }
   $("watchdogSave").addEventListener("click", async () => {
     try {
@@ -414,6 +422,7 @@
   });
   fetchWatchdog();
   window.setInterval(fetchWatchdog, 5000);
+  }
 
   document.querySelectorAll("[data-hours]").forEach((button) => {
     button.addEventListener("click", () => {
