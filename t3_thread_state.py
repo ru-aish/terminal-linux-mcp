@@ -87,7 +87,7 @@ class ThreadState:
 
     @staticmethod
     def identifier(value: Any) -> str:
-        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}', value) or value == 'default':
+        if not isinstance(value, str) or not value or value != value.strip() or value == 'default':
             raise ValueError('A non-default registered thread identifier is required')
         return value
 

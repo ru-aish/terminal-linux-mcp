@@ -61,6 +61,18 @@ def test_immutable_bindings_and_allowlist(tmp_path):
         state.bind('thread-two', cid)
 
 
+def test_t3_delegated_thread_ids_are_valid_registration_ids(tmp_path):
+    state = ThreadState(tmp_path/'state.db')
+    child = (
+        'thread:delegated-task:command%3Amcp%3A72181fd6-2c86-49b4-b74a-'
+        '5a11dd60f7dd%3Adelegate-task%3Ab5b20555-system-specs-chatgpt-56-sol-v1'
+    )
+    binding = register(state, tmp_path, child)
+    assert binding['thread_id'] == child
+    assert state.require_terminal(child)['thread_id'] == child
+    state.close()
+
+
 def test_final_process_exit_starts_one_deadline(tmp_path):
     async def run():
         state = ThreadState(tmp_path/'state.db', .035)
