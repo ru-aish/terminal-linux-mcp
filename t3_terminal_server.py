@@ -10,6 +10,7 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -84,7 +85,7 @@ def build(core, state: ThreadState, control_token: str):
             await asyncio.gather(*watchers, return_exceptions=True)
             await core._close_all_mcp_connections()
 
-    instructions = '''This is the T3-specific Terminal MCP. Bootstrap using exactly the permanent Terminal MCP ID injected by T3; use it as session_id on every tool call. Unregistered IDs are rejected. Never invent IDs. T3 owns ChatGPT prompts and streaming; Terminal MCP owns task working/done and inactivity recovery. Use schedule_continue with exactly one of after_seconds or wake_at (Unix seconds or timezone-aware ISO-8601), or continue_after_process with a managed process_id, to resume this task when no tools/processes are active. These durable continuations belong to the current task epoch; pause, completion, or a new activation invalidates them. Reuse an idempotency_key to retry scheduling safely. When all requested work is verified, call thread_task(action="complete", evidence=[...]). End of model output does not finish the task. For a pending question, call thread_task(action="wait", reason="..."). There are no project scanning, watchdog, scheduled-send, or ChatGPT runtime-control tools here.'''
+    instructions = '''This is the T3-specific Terminal MCP. Bootstrap using exactly the permanent Terminal MCP ID injected by T3; use it as session_id on every tool call. Unregistered IDs are rejected. Never invent IDs. T3 owns ChatGPT prompts and streaming; Terminal MCP owns task working/done and inactivity recovery. T3 owns app subagents: use agents_available to inspect providers/models and spawn_agent to delegate asynchronously. Spawn returns immediately and T3 automatically wakes this parent when the child finishes; do not poll, wait, or start watcher processes. The returned agent_id is the delegated task ID and child_thread_id is the backing T3 thread. Use agent_status for explicit inspection, send_input to steer the backing child, close_agent to cancel, and list_agents to inspect this thread's orchestration activity. Use schedule_continue with exactly one of after_seconds or wake_at (Unix seconds or timezone-aware ISO-8601), or continue_after_process with a managed process_id, to resume this task when no tools/processes are active. These durable continuations belong to the current task epoch; pause, completion, or a new activation invalidates them. Reuse an idempotency_key to retry scheduling safely. When all requested work is verified, call thread_task(action="complete", evidence=[...]). End of model output does not finish the task. For a pending question, call thread_task(action="wait", reason="..."). There are no project scanning, watchdog, scheduled-send, or ChatGPT runtime-control tools here.'''
     mcp = T3FastMCP('T3 Terminal MCP', instructions=instructions, lifespan=lifespan,
                     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
     excluded = {'thread_goal', 'refresh_startup_context'}
@@ -95,6 +96,189 @@ def build(core, state: ThreadState, control_token: str):
     core._set_startup_instructions = lambda: instructions
     # The context loader builds its manifest from core.mcp, which now contains only this flavor.
     core._core_behavior_prompt = lambda: instructions
+
+    def t3_mcp_payload(result: Any) -> dict:
+        if getattr(result, 'isError', False):
+            message = '\n'.join(
+                str(getattr(item, 'text', ''))
+                for item in getattr(result, 'content', []) or []
+                if getattr(item, 'text', None)
+            ).strip()
+            raise ValueError(message or 'T3 app MCP call failed')
+        structured = getattr(result, 'structuredContent', None)
+        if structured is None:
+            structured = getattr(result, 'structured_content', None)
+        if isinstance(structured, dict):
+            return structured
+        for item in getattr(result, 'content', []) or []:
+            text = getattr(item, 'text', None)
+            if not isinstance(text, str):
+                continue
+            try:
+                decoded = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, dict):
+                return decoded
+        raise RuntimeError('T3 app MCP returned no structured JSON result')
+
+    async def call_t3_mcp(binding: dict, tool: str, arguments: dict) -> dict:
+        credentials = state.t3_mcp_credentials(binding['thread_id'])
+        if credentials is None:
+            raise ValueError('T3 orchestration tools are unavailable for this thread')
+        config = {
+            'transport': 'streamable-http',
+            'url': credentials['endpoint'],
+            'headers': {'Authorization': credentials['authorization']},
+            'config_dir': binding['cwd'],
+            'source': 't3-thread',
+        }
+        result = await asyncio.wait_for(
+            core._with_mcp_session(
+                binding['terminal_id'],
+                '__t3_app__',
+                config,
+                'call',
+                tool,
+                arguments,
+            ),
+            timeout=30,
+        )
+        return t3_mcp_payload(result)
+
+    @mcp.tool()
+    async def agents_available(session_id: str = '') -> str:
+        """List T3 providers, models, and app-owned subagent capabilities available to this parent."""
+        binding = state.require_terminal(session_id)
+        try:
+            return json.dumps(await call_t3_mcp(binding, 'orchestrator_capabilities', {}))
+        except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            return f'Error: {exc}'
+
+    @mcp.tool()
+    async def spawn_agent(
+        task: str,
+        session_id: str = '',
+        provider_instance_id: str | None = None,
+        model: str | None = None,
+        options: list[dict] | None = None,
+        role: str | None = None,
+        isolation: str | None = None,
+        title: str | None = None,
+        client_request_id: str | None = None,
+    ) -> str:
+        """Delegate one T3-owned child task asynchronously. Returns immediately; T3 wakes this parent on completion."""
+        binding = state.require_terminal(session_id)
+        if not isinstance(task, str) or not task.strip():
+            return 'Error: task is required'
+        arguments: dict[str, Any] = {'task': task.strip(), 'mode': 'async'}
+        if title is not None:
+            arguments['title'] = title
+        if role is not None:
+            arguments['role'] = role
+        if isolation is not None:
+            arguments['isolation'] = isolation
+        if client_request_id is not None:
+            arguments['clientRequestId'] = client_request_id
+        target: dict[str, Any] = {}
+        if provider_instance_id is not None:
+            target['providerInstanceId'] = provider_instance_id
+        if model is not None:
+            target['model'] = model
+        if options is not None:
+            target['options'] = options
+        if target:
+            arguments['target'] = target
+        try:
+            result = await call_t3_mcp(binding, 'delegate_task', arguments)
+            task_id = result.get('taskId')
+            child_thread_id = result.get('childThreadId')
+            if not isinstance(task_id, str) or not task_id:
+                raise RuntimeError('T3 did not return the delegated task identity')
+            if not isinstance(child_thread_id, str) or not child_thread_id:
+                raise RuntimeError('T3 did not return the child thread identity')
+            return json.dumps({
+                'agent_id': task_id,
+                'task_id': task_id,
+                'child_thread_id': child_thread_id,
+                'status': result.get('status'),
+                'provider_instance_id': result.get('providerInstanceId'),
+                'model': result.get('model'),
+            })
+        except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            return f'Error: {exc}'
+
+    @mcp.tool()
+    async def agent_status(agent_id: str, session_id: str = '') -> str:
+        """Read one T3-owned delegated task by its canonical task/agent ID."""
+        binding = state.require_terminal(session_id)
+        try:
+            return json.dumps(await call_t3_mcp(binding, 'task_status', {'taskId': agent_id}))
+        except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            return f'Error: {exc}'
+
+    @mcp.tool()
+    async def send_input(
+        agent_id: str,
+        message: str,
+        session_id: str = '',
+        mode: str = 'auto',
+        client_request_id: str | None = None,
+    ) -> str:
+        """Send a follow-up to the child thread backing a T3 delegated task, without waiting for completion."""
+        binding = state.require_terminal(session_id)
+        if not isinstance(message, str) or not message.strip():
+            return 'Error: message is required'
+        try:
+            status = await call_t3_mcp(binding, 'task_status', {'taskId': agent_id})
+            child_thread_id = status.get('childThreadId')
+            if not isinstance(child_thread_id, str) or not child_thread_id:
+                raise RuntimeError('T3 did not return the child thread identity')
+            arguments: dict[str, Any] = {
+                'threadId': child_thread_id,
+                'message': message.strip(),
+                'mode': mode,
+            }
+            if client_request_id is not None:
+                arguments['clientRequestId'] = client_request_id
+            result = await call_t3_mcp(binding, 't3_thread_send', arguments)
+            return json.dumps({
+                'agent_id': result.get('taskId') or agent_id,
+                'task_id': result.get('taskId'),
+                'child_thread_id': child_thread_id,
+                'status': result.get('status'),
+                'delivery': result.get('delivery'),
+            })
+        except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            return f'Error: {exc}'
+
+    @mcp.tool()
+    async def close_agent(agent_id: str, session_id: str = '') -> str:
+        """Cancel a T3-owned delegated task by its canonical task/agent ID."""
+        binding = state.require_terminal(session_id)
+        try:
+            result = await call_t3_mcp(binding, 'task_cancel', {'taskId': agent_id})
+            return json.dumps({
+                'agent_id': agent_id,
+                'task_id': agent_id,
+                'status': result.get('status', 'cancel_requested'),
+            })
+        except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            return f'Error: {exc}'
+
+    @mcp.tool()
+    async def list_agents(session_id: str = '', limit: int = 50) -> str:
+        """Read this parent thread's orchestration activity, including its T3-owned child agents."""
+        binding = state.require_terminal(session_id)
+        try:
+            result = await call_t3_mcp(binding, 't3_thread_read', {
+                'threadId': binding['thread_id'],
+                'view': 'activity',
+                'limit': max(1, min(int(limit), 100)),
+            })
+            return json.dumps(result)
+        except (ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+            return f'Error: {exc}'
 
     @mcp.tool()
     async def thread_task(action: str = 'get', session_id: str = '', evidence: list[str] | None = None, reason: str = '') -> str:
@@ -175,7 +359,8 @@ def build(core, state: ThreadState, control_token: str):
             body = await request.json()
             if action == 'register':
                 result = state.register(thread_id=body['threadId'], terminal_id=body.get('terminalThreadId'),
-                    environment_id=body['environmentId'], provider_id=body['providerId'], cwd=body['cwd'], model=body['model'], inactivity_seconds=body.get('inactivitySeconds'))
+                    environment_id=body['environmentId'], provider_id=body['providerId'], cwd=body['cwd'], model=body['model'], inactivity_seconds=body.get('inactivitySeconds'),
+                    t3_mcp_endpoint=body.get('t3McpEndpoint'), t3_mcp_authorization=body.get('t3McpAuthorization'))
                 if body.get('inactivitySeconds') is not None:
                     state.arm(body['threadId'])
             elif action in ('claim', 'ack'):
@@ -198,6 +383,9 @@ def build(core, state: ThreadState, control_token: str):
             return JSONResponse(result or {'ok': True})
         except (KeyError, ValueError, TypeError, sqlite3.IntegrityError) as exc:
             return JSONResponse({'error': str(exc)}, status_code=409)
+
+    # Bootstrap manifests must reflect this T3 flavor's actual public tool surface.
+    core.PUBLIC_TOOL_ORDER = tuple(mcp._tool_manager._tools.keys())
 
     import sqlite3
     private = Starlette(routes=[Route('/v1/{action}', control, methods=['GET', 'POST'])])
