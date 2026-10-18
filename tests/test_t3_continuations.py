@@ -96,8 +96,9 @@ def test_claimed_explicit_event_is_idempotent(state, kind, ack_after_finish):
         if ack_after_finish:
             assert automations(state) == [delivered]
             assert continues(state) == [claimed]
-            # A claimed delivery remains non-retryable even after becoming idle.
-            assert not state.claim(event_id, 'test-env', 'chatgpt')['valid']
+            # Replays keep the stable event ID used by adapter dispatch dedupe.
+            assert state.claim(event_id, 'test-env', 'chatgpt')['valid']
+            assert continues(state)[0]['event_id'] == event_id
             state.acknowledge(event_id, 'test-env', 'chatgpt')
         assert not state.claim(event_id, 'test-env', 'chatgpt')['valid']
         state.acknowledge(event_id, 'test-env', 'chatgpt')
@@ -105,6 +106,41 @@ def test_claimed_explicit_event_is_idempotent(state, kind, ack_after_finish):
             state.arm('thread-one')
         assert automations(state) == [delivered]
         assert continues(state) == [{**claimed, 'acknowledged': 1}]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('kind', ['timer', 'process'])
+def test_claimed_explicit_event_reclaims_same_id_after_restart(tmp_path, kind):
+    async def run():
+        path = tmp_path / 'state.db'
+        state = ThreadState(path, inactivity_seconds=3600)
+        state.register(thread_id='thread-one', terminal_id='terminal-one', environment_id='test-env',
+                       provider_id='chatgpt', cwd=str(tmp_path), model='test-model')
+        state.activate('thread-one', 'activate')
+        if kind == 'process':
+            state.begin('thread-one', 'process', 'process', process_id='proc-one')
+            state.continue_after_process('thread-one', 'proc-one')
+            state.finish('process', 'exit_code=0')
+        else:
+            state.schedule_continue('thread-one', wake_at=0)
+        event, = continues(state)
+        event_id = event['event_id']
+        assert state.claim(event_id, 'test-env', 'chatgpt')['valid']
+        state.close()
+
+        recovered = ThreadState(path, inactivity_seconds=3600)
+        try:
+            replay, = continues(recovered)
+            assert replay['event_id'] == event_id
+            assert replay['claimed'] == 1
+            assert replay['acknowledged'] == 0
+            assert recovered.claim(event_id, 'test-env', 'chatgpt')['valid']
+            assert continues(recovered)[0]['event_id'] == event_id
+            recovered.acknowledge(event_id, 'test-env', 'chatgpt')
+            assert not recovered.claim(event_id, 'test-env', 'chatgpt')['valid']
+            assert len(continues(recovered)) == 1
+        finally:
+            recovered.close()
     asyncio.run(run())
 
 

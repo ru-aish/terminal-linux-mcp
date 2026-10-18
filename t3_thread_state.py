@@ -362,7 +362,7 @@ class ThreadState:
             if row['kind'] == 'continue':
                 valid = valid and row['state'] == 'working' and not row['paused'] and row['epoch'] == row['current_epoch']
                 if row['automation_id']:
-                    valid = valid and row['automation_status'] == 'delivered' and not row['claimed']
+                    valid = valid and row['automation_status'] == 'delivered'
                 else:
                     valid = valid and row['revision'] == row['current_revision']
                 if valid and db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL', (row['thread_id'],)).fetchone():
