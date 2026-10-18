@@ -84,7 +84,7 @@ def build(core, state: ThreadState, control_token: str):
             await asyncio.gather(*watchers, return_exceptions=True)
             await core._close_all_mcp_connections()
 
-    instructions = '''This is the T3-specific Terminal MCP. Bootstrap using exactly the permanent Terminal MCP ID injected by T3; use it as session_id on every tool call. Unregistered IDs are rejected. Never invent IDs. T3 owns ChatGPT prompts and streaming; Terminal MCP owns task working/done and inactivity recovery. When all requested work is verified, call thread_task(action="complete", evidence=[...]). End of model output does not finish the task. For a pending question, call thread_task(action="wait", reason="..."). There are no project scanning, watchdog, scheduled-send, or ChatGPT runtime-control tools here.'''
+    instructions = '''This is the T3-specific Terminal MCP. Bootstrap using exactly the permanent Terminal MCP ID injected by T3; use it as session_id on every tool call. Unregistered IDs are rejected. Never invent IDs. T3 owns ChatGPT prompts and streaming; Terminal MCP owns task working/done and inactivity recovery. Use schedule_continue with exactly one of after_seconds or wake_at (Unix seconds or timezone-aware ISO-8601), or continue_after_process with a managed process_id, to resume this task when no tools/processes are active. These durable continuations belong to the current task epoch; pause, completion, or a new activation invalidates them. Reuse an idempotency_key to retry scheduling safely. When all requested work is verified, call thread_task(action="complete", evidence=[...]). End of model output does not finish the task. For a pending question, call thread_task(action="wait", reason="..."). There are no project scanning, watchdog, scheduled-send, or ChatGPT runtime-control tools here.'''
     mcp = T3FastMCP('T3 Terminal MCP', instructions=instructions, lifespan=lifespan,
                     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
     excluded = {'thread_goal', 'refresh_startup_context'}
@@ -122,12 +122,24 @@ def build(core, state: ThreadState, control_token: str):
         binding = state.require_terminal(session_id)
         return json.dumps({'eventId': state.link_pr(binding['thread_id'], url)})
 
+    @mcp.tool()
+    async def schedule_continue(session_id: str, after_seconds: float | None = None, wake_at: float | str | None = None, idempotency_key: str | None = None) -> str:
+        """Schedule this task's continuation after a positive delay or at an absolute time, once tools/processes are idle."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(state.schedule_continue(binding['thread_id'], after_seconds, wake_at, idempotency_key))
+
+    @mcp.tool()
+    async def continue_after_process(process_id: str, session_id: str, idempotency_key: str | None = None) -> str:
+        """Continue this task after its managed process exits (any exit code), once tools/processes are idle."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(state.continue_after_process(binding['thread_id'], process_id, idempotency_key))
+
     original_spawn = core._spawn_workload
     async def spawn(*args, **kwargs):
         process, unit_name = await original_spawn(*args, **kwargs)
         binding = state.require_terminal(kwargs['session'].session_id)
         operation_id = 'process-' + uuid.uuid4().hex
-        state.begin(binding['thread_id'], operation_id, 'process', process.pid, core.read_process_start_ticks(process.pid))
+        state.begin(binding['thread_id'], operation_id, 'process', process.pid, core.read_process_start_ticks(process.pid), process_id=kwargs['request_id'])
         async def finished():
             result = await process.wait()
             state.finish(operation_id, f'exit_code={result}')

@@ -148,7 +148,9 @@ def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypa
         monkeypatch.setenv('MCP_GPT_HOME',str(tmp_path/'gpt-home'))
         import terminal_mcp as core
         from t3_terminal_server import build
-        core.WORKSPACE_DIR=tmp_path
+        for name in ('mcp', '_spawn_workload', '_set_startup_instructions', '_core_behavior_prompt'):
+            monkeypatch.setattr(core, name, getattr(core, name))
+        monkeypatch.setattr(core, 'WORKSPACE_DIR', tmp_path)
         state=ThreadState(tmp_path/'state.db', .03)
         mcp,private=build(core,state,'test-control-token')
         names={t.name for t in await mcp.list_tools()}
@@ -179,7 +181,9 @@ def test_t3_public_app_mounts_usage_dashboard_without_legacy_features(tmp_path, 
     import terminal_mcp as core
     from t3_terminal_server import build, build_public_app
 
-    core.WORKSPACE_DIR = tmp_path
+    for name in ('mcp', '_spawn_workload', '_set_startup_instructions', '_core_behavior_prompt'):
+        monkeypatch.setattr(core, name, getattr(core, name))
+    monkeypatch.setattr(core, 'WORKSPACE_DIR', tmp_path)
     state = ThreadState(tmp_path/'state.db')
     mcp, _private = build(core, state, 'test-control-token')
     app = build_public_app(core, mcp)
