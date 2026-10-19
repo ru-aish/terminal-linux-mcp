@@ -38,7 +38,8 @@ class ThreadState:
               CREATE TABLE IF NOT EXISTS operations (
                 operation_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
                 kind TEXT NOT NULL, pid INTEGER, start_ticks INTEGER,
-                started REAL NOT NULL, finished REAL, result TEXT
+                started REAL NOT NULL, finished REAL, result TEXT,
+                blocks_thread INTEGER NOT NULL DEFAULT 1
               );
               CREATE TABLE IF NOT EXISTS events (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL,
@@ -64,6 +65,8 @@ class ThreadState:
                 db.execute('ALTER TABLE bindings ADD COLUMN inactivity_seconds REAL')
             if 'process_id' not in {r[1] for r in db.execute('PRAGMA table_info(operations)')}:
                 db.execute('ALTER TABLE operations ADD COLUMN process_id TEXT')
+            if 'blocks_thread' not in {r[1] for r in db.execute('PRAGMA table_info(operations)')}:
+                db.execute('ALTER TABLE operations ADD COLUMN blocks_thread INTEGER NOT NULL DEFAULT 1')
             db.execute('CREATE UNIQUE INDEX IF NOT EXISTS operations_process ON operations(thread_id, process_id)')
 
     @contextmanager
@@ -189,18 +192,24 @@ class ThreadState:
     def finish(self, operation_id: str, result: str):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT thread_id,finished FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
+            row = db.execute('SELECT thread_id,finished,blocks_thread FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
             if row is None or row['finished'] is not None:
                 return
             thread_id = row['thread_id']
-            db.execute('UPDATE operations SET finished=?,result=? WHERE operation_id=?', (time.time(), result[:1000], operation_id))
-            db.execute("UPDATE automations SET status='due',updated=? WHERE operation_id=? AND status='pending'", (time.time(), operation_id))
-            db.execute('UPDATE bindings SET revision=revision+1,last_activity=? WHERE thread_id=?', (time.time(), thread_id))
+            now = time.time()
+            db.execute('UPDATE operations SET finished=?,result=? WHERE operation_id=?', (now, result[:1000], operation_id))
+            db.execute("UPDATE automations SET status='due',updated=? WHERE operation_id=? AND status='pending'", (now, operation_id))
+            if row['blocks_thread']:
+                db.execute('UPDATE bindings SET revision=revision+1,last_activity=? WHERE thread_id=?', (now, thread_id))
         self.arm(thread_id)
 
     def active(self, thread_id: str, excluding: str | None = None) -> list[dict]:
         with self.connect() as db:
             return [dict(r) for r in db.execute('SELECT * FROM operations WHERE thread_id=? AND finished IS NULL AND operation_id!=?', (thread_id, excluding or ''))]
+
+    def blocking_active(self, thread_id: str, excluding: str | None = None) -> list[dict]:
+        with self.connect() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM operations WHERE thread_id=? AND finished IS NULL AND blocks_thread=1 AND operation_id!=?', (thread_id, excluding or ''))]
 
     def complete(self, thread_id: str, evidence: list[str], excluding: str | None = None):
         if not isinstance(evidence, list) or not evidence or any(not isinstance(e, str) or not e.strip() for e in evidence):
@@ -210,8 +219,11 @@ class ThreadState:
             row = db.execute('SELECT * FROM bindings WHERE thread_id=?', (thread_id,)).fetchone()
             if row is None or row['state'] != 'working':
                 raise ValueError('Thread has no active task')
-            if db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL AND operation_id!=?', (thread_id, excluding or '')).fetchone():
-                raise ValueError('Tools or processes are still active')
+            if db.execute("SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL AND blocks_thread=1 AND kind!='process' AND operation_id!=?", (thread_id, excluding or '')).fetchone():
+                raise ValueError('Tools are still active')
+            # Explicit completion is authoritative for the task. Long-lived
+            # processes remain controllable, but no longer pin thread idleness.
+            db.execute("UPDATE operations SET blocks_thread=0 WHERE thread_id=? AND finished IS NULL AND kind='process'", (thread_id,))
             db.execute("UPDATE bindings SET state='done',revision=revision+1,deadline=NULL WHERE thread_id=?", (thread_id,))
             self._stale_automations(db, thread_id)
             self._event(db, thread_id, 'state', {'state': 'done', 'evidence': evidence})
@@ -289,7 +301,7 @@ class ThreadState:
             now = time.time()
             db.execute("UPDATE automations SET status='stale',updated=? WHERE thread_id=? AND epoch!=? AND status!='stale'", (now, thread_id, row['epoch']))
             db.execute("UPDATE automations SET status='due',updated=? WHERE thread_id=? AND status='pending' AND kind='timer' AND due_at<=?", (now, thread_id, now))
-            if not db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL', (thread_id,)).fetchone():
+            if not db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL AND blocks_thread=1', (thread_id,)).fetchone():
                 for automation in db.execute("SELECT * FROM automations WHERE thread_id=? AND status='due'", (thread_id,)).fetchall():
                     event_id = self._event(db, thread_id, 'continue', {'prompt': 'continue', 'reason': 'scheduled_' + automation['kind'], 'stopFirst': True, 'automationId': automation['automation_id']})
                     db.execute("UPDATE automations SET status='delivered',event_id=?,updated=? WHERE automation_id=?", (event_id, now, automation['automation_id']))
@@ -323,7 +335,7 @@ class ThreadState:
         row = self.get(thread_id)
         with self.connect() as db:
             pending = self._pending_continue(db, thread_id, row['epoch'], row['revision'])
-        if row['state'] != 'working' or row['paused'] or self.active(thread_id) or pending:
+        if row['state'] != 'working' or row['paused'] or self.blocking_active(thread_id) or pending:
             return
         deadline = row['last_activity'] + (row['inactivity_seconds'] or self.inactivity_seconds)
         with self.connect() as db:
@@ -337,7 +349,7 @@ class ThreadState:
             row = db.execute('SELECT * FROM bindings WHERE thread_id=?', (thread_id,)).fetchone()
             if row is None or row['state'] != 'working' or row['paused'] or (row['epoch'], row['revision']) != (epoch, revision):
                 return
-            if db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL', (thread_id,)).fetchone():
+            if db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL AND blocks_thread=1', (thread_id,)).fetchone():
                 return
             if self._pending_continue(db, thread_id, epoch, revision):
                 return
@@ -365,7 +377,7 @@ class ThreadState:
                     valid = valid and row['automation_status'] == 'delivered'
                 else:
                     valid = valid and row['revision'] == row['current_revision']
-                if valid and db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL', (row['thread_id'],)).fetchone():
+                if valid and db.execute('SELECT 1 FROM operations WHERE thread_id=? AND finished IS NULL AND blocks_thread=1', (row['thread_id'],)).fetchone():
                     if row['automation_id'] and row['claimed'] == 0:
                         # The adapter acknowledges even rejected claims. Retry
                         # only unclaimed wakes; claimed replays must retain the

@@ -84,7 +84,7 @@ def build(core, state: ThreadState, control_token: str):
             await asyncio.gather(*watchers, return_exceptions=True)
             await core._close_all_mcp_connections()
 
-    instructions = '''This is the T3-specific Terminal MCP. Bootstrap using exactly the permanent Terminal MCP ID injected by T3; use it as session_id on every tool call. Unregistered IDs are rejected. Never invent IDs. T3 owns ChatGPT prompts and streaming; Terminal MCP owns task working/done and inactivity recovery. Use schedule_continue with exactly one of after_seconds or wake_at (Unix seconds or timezone-aware ISO-8601), or continue_after_process with a managed process_id, to resume this task when no tools/processes are active. These durable continuations belong to the current task epoch; pause, completion, or a new activation invalidates them. Reuse an idempotency_key to retry scheduling safely. When all requested work is verified, call thread_task(action="complete", evidence=[...]). End of model output does not finish the task. For a pending question, call thread_task(action="wait", reason="..."). There are no project scanning, watchdog, scheduled-send, or ChatGPT runtime-control tools here.'''
+    instructions = '''This is the T3-specific Terminal MCP. Bootstrap using exactly the permanent Terminal MCP ID injected by T3; use it as session_id on every tool call. Unregistered IDs are rejected. Never invent IDs. T3 owns ChatGPT prompts and streaming; Terminal MCP owns task working/done and inactivity recovery. Use schedule_continue with exactly one of after_seconds or wake_at (Unix seconds or timezone-aware ISO-8601), or continue_after_process with a managed process_id, to resume this task when no blocking tools/processes are active. These durable continuations belong to the current task epoch; pause, completion, or a new activation invalidates them. Reuse an idempotency_key to retry scheduling safely. When all requested work is verified, call thread_task(action="complete", evidence=[...]). Intentionally long-lived background processes such as development servers may remain running after explicit completion; completion detaches them from thread-idleness accounting while leaving them controllable. If completion is not called, active processes keep the task working exactly as before. End of model output does not finish the task. For a pending question, call thread_task(action="wait", reason="..."). There are no project scanning, watchdog, scheduled-send, or ChatGPT runtime-control tools here.'''
     mcp = T3FastMCP('T3 Terminal MCP', instructions=instructions, lifespan=lifespan,
                     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
     excluded = {'thread_goal', 'refresh_startup_context'}
@@ -130,7 +130,7 @@ def build(core, state: ThreadState, control_token: str):
 
     @mcp.tool()
     async def continue_after_process(process_id: str, session_id: str, idempotency_key: str | None = None) -> str:
-        """Continue this task after its managed process exits (any exit code), once tools/processes are idle."""
+        """Continue this task after its managed process exits (any exit code), once blocking tools/processes are idle."""
         binding = state.require_terminal(session_id)
         return json.dumps(state.continue_after_process(binding['thread_id'], process_id, idempotency_key))
 

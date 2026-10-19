@@ -95,7 +95,7 @@ def test_new_activity_invalidates_queued_continue(tmp_path):
     asyncio.run(run())
 
 
-def test_stop_and_done_disable_recovery_and_done_requires_no_work(tmp_path):
+def test_stop_and_done_disable_recovery_and_done_detaches_background_processes(tmp_path):
     async def run():
         state = ThreadState(tmp_path/'state.db', .015)
         register(state, tmp_path)
@@ -104,17 +104,50 @@ def test_stop_and_done_disable_recovery_and_done_requires_no_work(tmp_path):
         await asyncio.sleep(.03)
         assert state.get('thread-one')['state']=='working'
         assert not [e for e in state.events('test-env','chatgpt') if e['kind']=='continue']
+
         state.activate('thread-one', 'request-two')
         state.begin('thread-one', 'running', 'process')
-        with pytest.raises(ValueError, match='still active'):
-            state.complete('thread-one',['tested'])
-        state.finish('running','exit=0')
         with pytest.raises(ValueError, match='evidence'):
             state.complete('thread-one',[])
         state.complete('thread-one',['tested'])
-        await asyncio.sleep(.03)
         assert state.get('thread-one')['state']=='done'
+        assert state.active('thread-one')
+        assert not state.blocking_active('thread-one')
+        await asyncio.sleep(.03)
         assert not [e for e in state.events('test-env','chatgpt') if e['kind']=='continue']
+
+        # The old long-lived process must neither pin nor perturb later
+        # task epochs when it eventually exits.
+        state.activate('thread-one', 'request-three')
+        revision = state.get('thread-one')['revision']
+        state.finish('running','exit=0')
+        assert state.get('thread-one')['revision'] == revision
+        await asyncio.sleep(.03)
+        events = [e for e in state.events('test-env','chatgpt') if e['kind']=='continue']
+        assert len(events) == 1
+        state.acknowledge(events[0]['event_id'],'test-env','chatgpt')
+
+        # A process started by a task that never explicitly completes keeps the
+        # existing working behavior until that process exits.
+        state.begin('thread-one', 'new-running', 'process')
+        state.arm('thread-one')
+        await asyncio.sleep(.03)
+        assert len([e for e in state.events('test-env','chatgpt') if e['kind']=='continue']) == 1
+        state.finish('new-running','exit=0')
+        state.close()
+    asyncio.run(run())
+
+
+def test_done_still_rejects_other_active_tools(tmp_path):
+    async def run():
+        state = ThreadState(tmp_path/'state.db')
+        register(state, tmp_path)
+        state.activate('thread-one', 'request-one')
+        state.begin('thread-one', 'other-tool', 'tool:run_command')
+        with pytest.raises(ValueError, match='Tools are still active'):
+            state.complete('thread-one',['tested'])
+        state.finish('other-tool','returned')
+        state.complete('thread-one',['tested'])
         state.close()
     asyncio.run(run())
 
@@ -165,13 +198,16 @@ def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypa
         result=await mcp.call_tool('start_process',{'session_id':'thread-one','command':'sleep 0.07','cwd':str(tmp_path)})
         assert 'Process ID' in str(result)
         assert state.active('thread-one')
+        done=await mcp.call_tool('thread_task',{'session_id':'thread-one','action':'complete','evidence':['background process intentionally left running']})
+        assert 'done' in str(done)
+        assert state.get('thread-one')['state']=='done'
+        assert state.active('thread-one')
+        assert not state.blocking_active('thread-one')
         process = next(p.process for p in core.processes.values() if p.session_id == 'thread-one')
         await asyncio.wait_for(process.wait(), 10)
         await asyncio.sleep(.07)
         assert not state.active('thread-one')
-        assert any(e['kind']=='continue' for e in state.events('test-env','chatgpt'))
-        await mcp.call_tool('thread_task',{'session_id':'thread-one','action':'complete','evidence':['process exited']})
-        assert state.get('thread-one')['state']=='done'
+        assert not any(e['kind']=='continue' for e in state.events('test-env','chatgpt'))
         state.close()
     asyncio.run(run())
 
