@@ -271,3 +271,48 @@ def test_held_workspace_fence_prevents_new_job_reservation(tmp_path):
         assert list((root / "jobs").iterdir()) == []
     finally:
         (root / "workspace-mutation.lock").rmdir()
+
+
+def test_timeout_containes_setsided_orphan(tmp_path):
+    manager = DurableProcessSupervisor(tmp_path / "durable")
+    ready = tmp_path / "escaped_ready"
+    escaped = tmp_path / "escaped_wrote"
+    code = (
+        "import os,signal,time;"
+        "os.setsid();"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        f"open({str(ready)!r},'w').write('ready');"
+        "time.sleep(2.5);"
+        f"open({str(escaped)!r},'w').write('bad')"
+    )
+    job = manager.start(f"{sys.executable} -c {code!r} & wait", owner="owner",
+                        cwd=tmp_path, hard_timeout=.7, idempotency_key="escape")
+    result = terminal(manager, job["job_id"])
+    assert ready.exists()
+    assert result["result"]["status"] == "timed_out"
+    assert result["result"]["group_verified"]
+    assert not escaped.exists()
+
+
+def test_stop_containes_setsided_orphan(tmp_path):
+    manager = DurableProcessSupervisor(tmp_path / "durable")
+    ready = tmp_path / "stop_escaped_ready"
+    escaped = tmp_path / "stop_escaped_wrote"
+    code = (
+        "import os,signal,time;"
+        "os.setsid();signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        f"open({str(ready)!r},'w').write('ready');"
+        "time.sleep(2.5);"
+        f"open({str(escaped)!r},'w').write('bad')"
+    )
+    job = manager.start(f"{sys.executable} -c {code!r} & wait", owner="owner",
+                        cwd=tmp_path, idempotency_key="stop-escape")
+    until = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < until:
+        time.sleep(.02)
+    assert ready.exists()
+    manager.stop(job["job_id"], owner="owner")
+    result = terminal(manager, job["job_id"])
+    assert result["result"]["status"] in ("cancelled", "descendants_stopped")
+    assert result["result"]["group_verified"]
+    assert not escaped.exists()

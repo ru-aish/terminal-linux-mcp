@@ -7,6 +7,7 @@ once written. A missing receipt is never mistaken for a successful command.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from contextlib import contextmanager
 import hashlib
 import json
@@ -183,6 +184,49 @@ def _running_group_members(pgid: int) -> list[int]:
     return members
 
 
+def _enable_subreaper() -> None:
+    # Orphaned grandchildren (including setsid descendants) must reparent to
+    # this supervisor rather than init, so termination receipts are trustworthy.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "Cannot enable Linux child subreaper")
+
+
+def _adopted_children() -> list[int]:
+    path = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+    try:
+        pids = [int(value) for value in path.read_text().split()]
+    except FileNotFoundError:
+        return []
+    live = []
+    for pid in pids:
+        try:
+            tail = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            if tail[0] not in ("Z", "X", "x"):
+                live.append(pid)
+        except (OSError, IndexError):
+            continue
+    return live
+
+
+def _signal_adopted(children: list[int], sig: int, leader: int) -> None:
+    for pid in children:
+        if pid == leader:
+            continue
+        identity = _identity(pid)
+        if identity is None:
+            continue
+        try:
+            fd = os.pidfd_open(pid)
+            try:
+                if _alive(identity):
+                    signal.pidfd_send_signal(fd, sig)
+            finally:
+                os.close(fd)
+        except ProcessLookupError:
+            continue
+
+
 def _signal_group(pgid: int, sig: int) -> None:
     try:
         os.killpg(pgid, sig)
@@ -218,6 +262,7 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
             return 125
         os.environ.clear()
         os.environ.update(received)
+    _enable_subreaper()
     child = None
     released = False
     stop_requested = False
@@ -268,8 +313,10 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
                 exited = _child_exited_unreaped(child.pid)
                 members = (_running_group_members(child.pid)
                            if exited or reason is not None or stop_requested else [])
+                adopted = _adopted_children() if exited or reason is not None else []
+                remaining_descendants = bool(members or [pid for pid in adopted if pid != child.pid])
                 if reason is None:
-                    if exited and not members:
+                    if exited and not remaining_descendants:
                         break
                     if stop_requested or (directory / "stop.request").exists():
                         reason = "cancelled"
@@ -278,13 +325,15 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
                     if reason is not None:
                         term_at = now
                         _signal_group(child.pid, signal.SIGTERM)
+                        _signal_adopted(adopted, signal.SIGTERM, child.pid)
                 else:
-                    if exited and members and reason == "cancelled":
+                    if exited and remaining_descendants and reason == "cancelled":
                         descendant_outlived_shell_after_stop = True
-                    if not members:
+                    if not remaining_descendants:
                         break
                     if not hard_killed and now - term_at >= 0.5:
                         _signal_group(child.pid, signal.SIGKILL)
+                        _signal_adopted(adopted, signal.SIGKILL, child.pid)
                         hard_killed = True
                     if hard_killed and now - term_at >= 4:
                         # Do not claim successful cancellation when unable to
@@ -292,7 +341,7 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
                         break
                 time.sleep(0.025)
             remaining = _running_group_members(child.pid) if reason else []
-            verified = not remaining
+            verified = not remaining and not any(pid != child.pid for pid in _adopted_children())
             if not verified:
                 code = None
             else:
