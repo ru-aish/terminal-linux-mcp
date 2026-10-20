@@ -143,6 +143,25 @@ class ThreadState:
             db.execute('UPDATE bindings SET conversation_id=? WHERE thread_id=?', (conversation_id, thread_id))
         return self.get(thread_id)
 
+    def reset_conversation(self, thread_id: str, expected_conversation_id: str | None = None) -> dict:
+        """Fence old native callbacks while preserving thread-owned process receipts."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT conversation_id FROM bindings WHERE thread_id=?',
+                             (thread_id,)).fetchone()
+            if row is None:
+                raise ValueError('Unknown T3 thread')
+            if row['conversation_id'] is not None:
+                if (expected_conversation_id is not None and
+                        row['conversation_id'] != expected_conversation_id):
+                    raise ValueError('Conversation changed before reset')
+                self._stale_automations(db, thread_id)
+                db.execute('''UPDATE bindings SET conversation_id=NULL, epoch=epoch+1,
+                    revision=revision+1, last_activity=?, deadline=NULL
+                    WHERE thread_id=?''', (time.time(), thread_id))
+        self.arm(thread_id)
+        return self.get(thread_id)
+
     def _event(self, db, thread_id: str, kind: str, payload: dict) -> str:
         row = db.execute('SELECT epoch,revision FROM bindings WHERE thread_id=?', (thread_id,)).fetchone()
         event_id = str(uuid.uuid4())

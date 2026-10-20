@@ -503,3 +503,56 @@ def test_startup_process_recovery_delivers_attached_continuation(state, core, li
                 process.kill()
             await process.wait()
     asyncio.run(run())
+
+
+def test_conversation_reset_preserves_detached_process_event_and_fences_native_epoch(state):
+    async def run():
+        import uuid
+
+        previous = str(uuid.uuid4())
+        next_conversation = str(uuid.uuid4())
+        state.activate('thread-one', 'active-run')
+        state.bind('thread-one', previous)
+        state.ensure_durable_process('thread-one', 'durable-job', detached=True)
+        state.finish('durable:durable-job', 'exit_code=0',
+                     receipt={'status': 'exited', 'exit_code': 0})
+        event, = [e for e in state.events('test-env', 'chatgpt')
+                  if e['kind'] == 'process.completed']
+        before = state.get('thread-one')
+        with pytest.raises(ValueError, match='Conversation changed'):
+            state.reset_conversation('thread-one', next_conversation)
+        assert state.get('thread-one')['conversation_id'] == previous
+        reset = state.reset_conversation('thread-one', previous)
+        assert reset['conversation_id'] is None
+        assert reset['epoch'] == before['epoch'] + 1
+        assert state.reset_conversation('thread-one')['epoch'] == reset['epoch']
+        assert state.claim(event['event_id'], 'test-env', 'chatgpt')['valid']
+        assert state.bind('thread-one', next_conversation)['conversation_id'] == next_conversation
+        assert state.claim(event['event_id'], 'test-env', 'chatgpt')['valid']
+
+    asyncio.run(run())
+
+
+def test_authenticated_control_reset_is_scoped_to_original_t3_binding(state, core):
+    import uuid
+    import httpx
+    from t3_terminal_server import build
+
+    async def run():
+        _, control = build(core, state, 'test-token')
+        before = str(uuid.uuid4())
+        state.bind('thread-one', before)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=control),
+                                    base_url='http://test') as client:
+            body = {'threadId': 'thread-one', 'environmentId': 'test-env',
+                    'providerId': 'chatgpt', 'expectedConversationId': before}
+            assert (await client.post('/v1/reset', json=body)).status_code == 401
+            other = {**body, 'providerId': 'another-provider'}
+            headers = {'authorization': 'Bearer test-token'}
+            assert (await client.post('/v1/reset', json=other, headers=headers)).status_code == 409
+            response = await client.post('/v1/reset', json=body, headers=headers)
+            assert response.status_code == 200, response.text
+            assert response.json()['conversation_id'] is None
+            assert state.bind('thread-one', str(uuid.uuid4()))['conversation_id'] is not None
+
+    asyncio.run(run())

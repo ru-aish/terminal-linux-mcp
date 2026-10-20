@@ -474,6 +474,8 @@ def build(core, state: ThreadState, control_token: str):
                     raise ValueError('Thread belongs to another T3 environment/provider')
                 if action == 'bind':
                     result = state.bind(body['threadId'], body['conversationId'])
+                elif action == 'reset':
+                    result = state.reset_conversation(body['threadId'], body.get('expectedConversationId'))
                 elif action == 'activate':
                     result = state.activate(body['threadId'], body['requestId'])
                 elif action == 'pause':
