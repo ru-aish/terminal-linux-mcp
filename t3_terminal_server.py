@@ -21,7 +21,7 @@ from starlette.routing import Route
 import uvicorn
 
 from t3_thread_state import ThreadState
-from durable_process_supervisor import DurableProcessSupervisor
+from durable_process_supervisor import DurableProcessSupervisor, _job_id
 
 FOREGROUND_DETACH_SECONDS = 180.0
 CURRENT_OPERATION = contextvars.ContextVar('t3_terminal_operation', default=None)
@@ -73,7 +73,7 @@ def build(core, state: ThreadState, control_token: str):
     async def start_durable(thread_id: str, session_id: str, command: str,
                             cwd: str | None, env: dict[str, str] | None,
                             idempotency_key: str | None, timeout: float | None = None,
-                            *, detached: bool = False):
+                            *, detached: bool = False, track_cwd: bool = False):
         session = await core._get_session(session_id)
         binding = state.require_terminal(session_id)
         workspace = Path(binding['cwd']).resolve()
@@ -88,9 +88,14 @@ def build(core, state: ThreadState, control_token: str):
         key = idempotency_key if idempotency_key is not None else CURRENT_OPERATION.get()
         if not key:
             key = uuid.uuid4().hex
+        if track_cwd:
+            marker = "__MCP_PWD_" + _job_id(thread_id, key) + "__"
+            command = (f'{command}\n__mcp_status=$?\n'
+                       f'printf "\\n{marker}:%s\\n" "$PWD"\n'
+                       'exit "$__mcp_status"')
         launch = asyncio.create_task(asyncio.to_thread(
             durable_jobs.start, command, owner=thread_id, cwd=run_cwd,
-            env=env, idempotency_key=key, hard_timeout=timeout,
+            env=core._build_env(session, env), idempotency_key=key, hard_timeout=timeout,
         ))
         try:
             job = await asyncio.shield(launch)
@@ -130,6 +135,8 @@ def build(core, state: ThreadState, control_token: str):
             return header[:max_chars]
         output = durable_jobs.output(process_id, owner=job['owner'],
                                      max_bytes=min(262144, remaining))
+        output['stdout']['text'], _ = core._strip_pwd_marker(
+            output['stdout']['text'], "__MCP_PWD_" + process_id + "__")
         for name in ('stdout', 'stderr'):
             value = output[name]['text']
             if not value or remaining <= 0:
@@ -245,10 +252,28 @@ def build(core, state: ThreadState, control_token: str):
                 raise ValueError('max_output_chars must be at least 128')
             deadline = time.monotonic() + FOREGROUND_DETACH_SECONDS
             job = await start_durable(binding['thread_id'], session_id, command,
-                                      cwd, env, idempotency_key, timeout)
+                                      cwd, env, idempotency_key, timeout, track_cwd=True)
             while True:
                 job = durable_jobs.status(job['job_id'], owner=binding['thread_id'])
                 if job['result'] is not None or job['status'] == 'outcome_unknown':
+                    if job['result'] is not None and job['result']['status'] == 'exited':
+                        # A trailing shell marker captures "cd" even though
+                        # each job is launched in a fresh process. It is stable
+                        # across retries because it derives from the job ID.
+                        end = Path(job['stdout_path']).stat().st_size
+                        tail = durable_jobs.output(
+                            job['job_id'], owner=binding['thread_id'],
+                            stdout_offset=max(0, end - 16384),
+                            max_bytes=16384)['stdout']['text']
+                        _, updated = core._strip_pwd_marker(
+                            tail, "__MCP_PWD_" + job['job_id'] + "__")
+                        if updated:
+                            candidate = Path(updated).expanduser().resolve()
+                            if candidate.is_dir() and candidate.is_relative_to(
+                                    Path(binding['cwd']).resolve()):
+                                session.cwd = candidate
+                        session.command_count += 1
+                        session.updated_at = time.time()
                     if job['result'] is not None:
                         state.finish('durable:' + job['job_id'],
                                      json.dumps(job['result']), receipt={**job['result'],

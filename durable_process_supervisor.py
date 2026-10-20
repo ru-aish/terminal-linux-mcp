@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -94,7 +96,82 @@ def _exec_after_gate(directory: Path, fd: int) -> None:
     os.execv(spec["shell"], [spec["shell"], "-lc", spec["command"]])
 
 
-def _worker(directory: Path) -> int:
+def _recv_exact(connection: socket.socket, count: int) -> bytes:
+    output = bytearray()
+    while len(output) < count:
+        chunk = connection.recv(count - len(output))
+        if not chunk:
+            raise ConnectionError("Environment broker disconnected")
+        output.extend(chunk)
+    return bytes(output)
+
+
+def _receive_launch_env(token: str) -> dict[str, str]:
+    """Receive intended environment through a one-time Unix socket, not argv/disk."""
+    if not token.startswith("@") or len(token) != 33:
+        raise ValueError("Invalid environment broker identity")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(10)
+        connection.connect("\0mcp-env-" + token[1:])
+        size = struct.unpack("!I", _recv_exact(connection, 4))[0]
+        if size > 1_048_576:
+            raise ValueError("Environment payload exceeds limit")
+        values = json.loads(_recv_exact(connection, size))
+        if not isinstance(values, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in values.items()
+        ):
+            raise ValueError("Invalid environment payload")
+        connection.sendall(b"1")
+        return values
+
+
+def _send_launch_env(listener: socket.socket, values: dict[str, str]) -> None:
+    payload = json.dumps(values, separators=(",", ":")).encode()
+    if len(payload) > 1_048_576:
+        raise ValueError("Environment payload exceeds limit")
+    listener.settimeout(10)
+    with listener.accept()[0] as connection:
+        connection.settimeout(10)
+        credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        _, uid, _ = struct.unpack("3i", credentials)
+        if uid != os.getuid():
+            raise PermissionError("Environment broker peer UID mismatch")
+        connection.sendall(struct.pack("!I", len(payload)) + payload)
+        if connection.recv(1) != b"1":
+            raise ConnectionError("Worker did not acknowledge environment delivery")
+
+
+def _child_exited_unreaped(pid: int) -> bool:
+    """Never reap the process-group leader until descendant cleanup completes."""
+    result = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    return result is not None
+
+
+def _running_group_members(pgid: int) -> list[int]:
+    """Count non-zombie members in the child's original process group."""
+    members = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            # comm is parenthesized and may itself contain spaces.
+            tail = stat.rsplit(")", 1)[1].split()
+            if int(tail[2]) == pgid and tail[0] not in ("Z", "X", "x"):
+                members.append(int(entry.name))
+        except (OSError, IndexError, ValueError):
+            continue
+    return members
+
+
+def _signal_group(pgid: int, sig: int) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _worker(directory: Path, env_token: str | None = None) -> int:
     # A worker owns exactly one launch. An accidentally repeated invocation
     # cannot start a second command, even after the first worker has died.
     try:
@@ -113,6 +190,15 @@ def _worker(directory: Path) -> int:
     spec = _read_json(directory / "request.json")
     if spec is None:
         return 125
+    if env_token is not None:
+        try:
+            received = _receive_launch_env(env_token)
+        except Exception:
+            # Missing broker means no execution: never fall back to an
+            # incomplete environment or expose secrets in an error log.
+            return 125
+        os.environ.clear()
+        os.environ.update(received)
     child = None
     released = False
     stop_requested = False
@@ -120,16 +206,8 @@ def _worker(directory: Path) -> int:
     timed_out = False
 
     def on_stop(_signal, _frame):
-        nonlocal stop_requested, stop_effective
+        nonlocal stop_requested
         stop_requested = True
-        if child is not None and released and child.poll() is None:
-            # The supervisor still owns an unreaped child, so its PID cannot
-            # have been reused between the identity check and group signal.
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-                stop_effective = True
-            except ProcessLookupError:
-                pass
 
     signal.signal(signal.SIGTERM, on_stop)
     _atomic_json(directory / "supervisor.json", _identity(os.getpid()))
@@ -156,30 +234,72 @@ def _worker(directory: Path) -> int:
                 stop_effective = True  # The execution gate stays closed.
             os.close(write_gate)
             write_gate = -1
-            if stop_requested and released:
-                on_stop(signal.SIGTERM, None)
-            try:
-                code = child.wait(timeout=spec.get("hard_timeout"))
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                if child.poll() is None:
-                    try:
-                        os.killpg(child.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                try:
-                    code = child.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    if child.poll() is None:
-                        try:
-                            os.killpg(child.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    code = child.wait()
+            gate_stopped = stop_effective
+            # SIGTERM alone is insufficient: shells often exit on TERM while
+            # a descendant ignores it. Keep the group leader unreaped, so its
+            # PGID cannot be recycled before hard-killing the entire group.
+            reason = None
+            deadline = (time.monotonic() + spec["hard_timeout"]
+                        if spec.get("hard_timeout") is not None else None)
+            term_at = None
+            hard_killed = False
+            descendant_outlived_shell_after_stop = False
+            while True:
+                now = time.monotonic()
+                exited = _child_exited_unreaped(child.pid)
+                members = (_running_group_members(child.pid)
+                           if exited or reason is not None or stop_requested else [])
+                if reason is None:
+                    if exited and not members:
+                        break
+                    if stop_requested or (directory / "stop.request").exists():
+                        reason = "cancelled"
+                    elif deadline is not None and now >= deadline:
+                        reason = "timed_out"
+                    if reason is not None:
+                        term_at = now
+                        _signal_group(child.pid, signal.SIGTERM)
+                else:
+                    if exited and members and reason == "cancelled":
+                        descendant_outlived_shell_after_stop = True
+                    if not members:
+                        break
+                    if not hard_killed and now - term_at >= 0.5:
+                        _signal_group(child.pid, signal.SIGKILL)
+                        hard_killed = True
+                    if hard_killed and now - term_at >= 4:
+                        # Do not claim successful cancellation when unable to
+                        # verify that the descendants actually terminated.
+                        break
+                time.sleep(0.025)
+            remaining = _running_group_members(child.pid) if reason else []
+            verified = not remaining
+            if not verified:
+                code = None
+            else:
+                code = child.wait()
+            timed_out = reason == "timed_out" and verified
+            # A requested stop is not proof of cancellation: the command may
+            # ignore TERM and write its final output during the grace period.
+            stop_effective = verified and (gate_stopped or (
+                reason == "cancelled" and code is not None and code < 0
+                and not descendant_outlived_shell_after_stop))
+            descendants_stopped = (reason == "cancelled" and verified and
+                                   not stop_effective and hard_killed)
+            ineffective_stop = (reason == "cancelled" and verified and
+                                not stop_effective and not hard_killed)
             os.fsync(stdout.fileno())
             os.fsync(stderr.fileno())
         _atomic_json(directory / "result.json", {
-            "status": "timed_out" if timed_out else ("cancelled" if stop_effective else "exited"), "exit_code": code,
+            "status": ("termination_unverified" if not verified else
+                       "timed_out" if timed_out else
+                       "descendants_stopped" if descendants_stopped else
+                       "cancelled" if stop_effective else
+                       "stop_not_effective" if ineffective_stop else
+                       "exited"), "exit_code": code,
+            "stop_requested": bool(stop_requested or (directory / "stop.request").exists()),
+            "stop_effective": bool(stop_effective),
+            "hard_killed": bool(hard_killed), "group_verified": bool(verified),
             "finished_at": time.time(), "child": identity,
             "stdout_bytes": (directory / "stdout.log").stat().st_size,
             "stderr_bytes": (directory / "stderr.log").stat().st_size,
@@ -262,8 +382,6 @@ class DurableProcessSupervisor:
             hard_timeout = float(hard_timeout)
             if not math.isfinite(hard_timeout) or hard_timeout <= 0:
                 raise ValueError("hard_timeout must be positive and finite")
-        if self.launch_mode == "systemd" and env:
-            raise ValueError("Systemd job launch does not support environment overrides")
         workdir = str(Path(cwd).expanduser().resolve(strict=True))
         if not Path(workdir).is_dir() or not Path(shell).is_file():
             raise ValueError("Working directory and shell must exist")
@@ -303,11 +421,22 @@ class DurableProcessSupervisor:
         args = [sys.executable, str(Path(__file__).resolve()), "_worker", str(directory)]
         try:
             if self.launch_mode == "systemd":
-                unit = "mcp-supervised-" + job_id[:32]
-                subprocess.run(
-                    ["systemd-run", "--user", "--quiet", "--collect", f"--unit={unit}", "--", *args],
-                    cwd=workdir, env=launcher_env, capture_output=True, check=True, timeout=10,
-                )
+                # systemd user services do NOT inherit the subprocess caller's
+                # environment. --setenv/EnvironmentFile leak credentials via
+                # argv or persistent files, so use a short-lived same-UID socket.
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    token = secrets.token_hex(16)
+                    listener.bind("\0mcp-env-" + token)
+                    listener.listen(1)
+                    unit = "mcp-supervised-" + job_id[:32]
+                    subprocess.run(
+                        ["systemd-run", "--user", "--quiet", "--collect",
+                         "--property=KillMode=control-group",
+                         f"--unit={unit}", "--", *args, "@" + token],
+                        cwd=workdir, env=os.environ.copy(), capture_output=True,
+                        check=True, timeout=10,
+                    )
+                    _send_launch_env(listener, launcher_env)
             else:
                 subprocess.Popen(
                     args, cwd=workdir, env=launcher_env,
@@ -401,13 +530,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=["_worker", "_exec"])
     parser.add_argument("directory", type=Path)
-    parser.add_argument("gate_fd", type=int, nargs="?")
+    parser.add_argument("gate_fd", nargs="?")
     args = parser.parse_args()
     if args.mode == "_worker":
-        return _worker(args.directory)
+        return _worker(args.directory, args.gate_fd)
     if args.gate_fd is None:
         parser.error("Execution gate fd is required")
-    _exec_after_gate(args.directory, args.gate_fd)
+    _exec_after_gate(args.directory, int(args.gate_fd))
     return 125
 
 

@@ -59,9 +59,27 @@ For production, jobs default to independent **systemd user services**. Use
 `MCP_T3_DURABLE_LAUNCH_MODE=process` only on hosts/tests without a working
 user systemd manager; direct-process jobs cannot survive a service-manager
 cgroup kill. `MCP_T3_DURABLE_JOBS_DIR` overrides the private on-disk registry
-(default beside the T3 SQLite database). For security, systemd job launches do
-not accept environment overrides, and launched commands must remain inside
-their thread's bound workspace. Never treat `outcome_unknown` (supervisor
+(default beside the T3 SQLite database). Session environment and per-call
+environment overrides are combined using the regular `core._build_env` behavior.
+Systemd-launched workers receive the complete intended environment over a
+short-lived, same-UID authenticated Unix socket—not systemd command-line
+`--setenv` flags or an on-disk secrets file. A lost handoff fails closed and
+never launches a command with an incomplete environment. Normal shell output
+and session cwd markers are persisted separately in the private job directory;
+quick foreground commands restore session cwd when it remains within the
+bound workspace. Changing into a new GPT project root can still require
+`bootstrap_thread` or `get_thread_context` before the next command.
+
+On explicit hard timeout or stop, the supervisor sends SIGTERM to the complete
+child process group, then escalates to SIGKILL after a 0.5-second grace period;
+this also handles a shell that exits while a descendant ignores TERM. Its
+leader stays unreaped until descendant cleanup has been checked, preventing
+process-group-ID reuse. The receipt records whether the group is verified
+stopped and distinguishes `cancelled`, `descendants_stopped`,
+`stop_not_effective`, and `termination_unverified`. Direct-process mode cannot
+contain descendants that deliberately escape their process group with
+`setsid` or another cgroup; systemd uses `KillMode=control-group` for unit
+cleanup. Launched commands must stay inside their thread's bound workspace. Never treat `outcome_unknown` (supervisor
 crash/reboot before its exit receipt) as success, and never retry execution by
 reusing a new key to resolve an uncertain outcome. Workspace checkpoint rollback
 must still be coordinated externally with any running job modifying that tree.
