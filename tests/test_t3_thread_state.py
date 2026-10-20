@@ -192,6 +192,8 @@ def test_replay_and_request_idempotency(tmp_path):
 def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypatch):
     async def run():
         monkeypatch.setenv('MCP_GPT_HOME',str(tmp_path/'gpt-home'))
+        monkeypatch.setenv('MCP_T3_DURABLE_JOBS_DIR',str(tmp_path/'durable'))
+        monkeypatch.setenv('MCP_T3_DURABLE_LAUNCH_MODE','process')
         import terminal_mcp as core
         from t3_terminal_server import build
         for name in ('mcp', '_spawn_workload', '_set_startup_instructions', '_core_behavior_prompt'):
@@ -216,9 +218,9 @@ def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypa
         assert state.get('thread-one')['state']=='done'
         assert state.active('thread-one')
         assert not state.blocking_active('thread-one')
-        process = next(p.process for p in core.processes.values() if p.session_id == 'thread-one')
-        await asyncio.wait_for(process.wait(), 10)
-        await asyncio.sleep(.07)
+        deadline = asyncio.get_running_loop().time() + 10
+        while state.active('thread-one') and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(.05)
         assert not state.active('thread-one')
         assert not any(e['kind']=='continue' for e in state.events('test-env','chatgpt'))
         state.close()

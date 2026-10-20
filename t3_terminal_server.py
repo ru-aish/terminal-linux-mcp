@@ -5,6 +5,8 @@ import argparse
 import asyncio
 import contextvars
 import json
+import math
+import time
 import os
 import secrets
 import uuid
@@ -20,7 +22,9 @@ from starlette.routing import Route
 import uvicorn
 
 from t3_thread_state import ThreadState
+from durable_process_supervisor import DurableProcessSupervisor, _job_id
 
+FOREGROUND_DETACH_SECONDS = 180.0
 CURRENT_OPERATION = contextvars.ContextVar('t3_terminal_operation', default=None)
 
 
@@ -28,6 +32,133 @@ def build(core, state: ThreadState, control_token: str):
     if not control_token:
         raise ValueError('Private control-plane token must be configured')
     watchers: set[asyncio.Task] = set()
+    durable_jobs = DurableProcessSupervisor(
+        Path(os.environ.get('MCP_T3_DURABLE_JOBS_DIR', str(state.path.parent / 'durable-jobs'))),
+        launch_mode=os.environ.get('MCP_T3_DURABLE_LAUNCH_MODE', 'systemd'),
+    )
+
+    # The native T3 conversation ID is often longer than 128 bytes and includes
+    # percent-encoded separators. Generic Terminal MCP must not truncate it.
+    core._normalize_session_id = lambda value: (value or 'default').strip() or 'default'
+    tracked_jobs: set[str] = set()
+
+    async def supervise_durable(thread_id: str, job_id: str):
+        operation_id = 'durable:' + job_id
+        try:
+            while True:
+                job = durable_jobs.status(job_id, owner=thread_id)
+                if job['result'] is not None:
+                    state.finish(operation_id, json.dumps(job['result']), receipt={**job['result'],
+                               'stdoutPath': job['stdout_path'], 'stderrPath': job['stderr_path']})
+                    return
+                if job['status'] == 'outcome_unknown':
+                    state.finish(operation_id, 'outcome_unknown',
+                                 receipt={'status': 'outcome_unknown', 'exit_code': None})
+                    return
+                await asyncio.sleep(.1)
+        finally:
+            tracked_jobs.discard(job_id)
+
+    def watch_durable(thread_id: str, job_id: str):
+        if job_id not in tracked_jobs:
+            tracked_jobs.add(job_id)
+            task = asyncio.create_task(supervise_durable(thread_id, job_id))
+            watchers.add(task)
+            task.add_done_callback(watchers.discard)
+
+    def track_durable(thread_id: str, job: dict, *, detached: bool = False):
+        state.ensure_durable_process(thread_id, job['job_id'], detached=detached)
+        watch_durable(thread_id, job['job_id'])
+        return job
+
+    async def start_durable(thread_id: str, session_id: str, command: str,
+                            cwd: str | None, env: dict[str, str] | None,
+                            idempotency_key: str | None, timeout: float | None = None,
+                            *, detached: bool = False, track_cwd: bool = False):
+        session = await core._get_session(session_id)
+        binding = state.require_terminal(session_id)
+        workspace = Path(binding['cwd']).resolve()
+        if idempotency_key is not None and cwd is None:
+            # Replaying a completed 'cd sub' must use its original launch cwd,
+            # not the session cwd that the same command already changed.
+            try:
+                existing = durable_jobs.status(
+                    _job_id(thread_id, idempotency_key), owner=thread_id)
+                cwd = existing['cwd']
+            except ValueError:
+                pass
+        run_cwd = core._resolve_cwd(cwd, session.cwd)
+        if not run_cwd.is_relative_to(workspace):
+            raise ValueError('Durable job cwd must remain inside the bound T3 workspace')
+        gate = core._require_project_context(session, run_cwd)
+        if gate:
+            raise ValueError(gate)
+        # A unique MCP invocation ID is the fallback when the caller does not
+        # supply a stable key for retries. Never derive identity from command.
+        key = idempotency_key if idempotency_key is not None else CURRENT_OPERATION.get()
+        if not key:
+            key = uuid.uuid4().hex
+        if track_cwd:
+            marker = "__MCP_PWD_" + _job_id(thread_id, key) + "__"
+            command = (f'{command}\n__mcp_status=$?\n'
+                       f'printf "\\n{marker}:%s\\n" "$PWD"\n'
+                       'exit "$__mcp_status"')
+        launch = asyncio.create_task(asyncio.to_thread(
+            durable_jobs.start, command, owner=thread_id, cwd=run_cwd,
+            env=core._build_env(session, env), idempotency_key=key, hard_timeout=timeout,
+        ))
+        try:
+            job = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            # The job might already have launched on another thread. A client
+            # interruption must not abandon the durable SQLite association.
+            async def register_late_launch():
+                try:
+                    launched = await launch
+                    track_durable(thread_id, launched, detached=True)
+                except Exception:
+                    # The registry is also reconciled on MCP startup.
+                    return
+            task = asyncio.create_task(register_late_launch())
+            watchers.add(task)
+            task.add_done_callback(watchers.discard)
+            raise
+        return track_durable(thread_id, job, detached=detached)
+
+    def format_command(job: dict, max_chars: int):
+        process_id = job['job_id']
+        result = job['result']
+        lines = [f'Process ID: {process_id}', f'Status: {job["status"]}',
+                 f'Working Directory: {job["cwd"]}']
+        if result is not None:
+            lines.append(f'Exit Code: {result.get("exit_code")}')
+            lines.append(f'Result: {result.get("status")}')
+        elif job['status'] == 'outcome_unknown':
+            lines.append('Outcome: unknown; supervisor or exit receipt was lost.')
+        else:
+            lines.append('Presentation: detached after foreground budget; execution continues.')
+        # Log paths must survive truncation of large command output.
+        lines.append('Durable Output Logs:\n' + job['stdout_path'] + '\n' + job['stderr_path'])
+        header = '\n'.join(lines)
+        remaining = max_chars - len(header) - len('\n[Output truncated]') - 16
+        if remaining <= 0:
+            return header[:max_chars]
+        output = durable_jobs.output(process_id, owner=job['owner'],
+                                     max_bytes=min(262144, remaining))
+        output['stdout']['text'], _ = core._strip_pwd_marker(
+            output['stdout']['text'], "__MCP_PWD_" + process_id + "__")
+        for name in ('stdout', 'stderr'):
+            value = output[name]['text']
+            if not value or remaining <= 0:
+                continue
+            prefix = '\n' + name.upper() + ':\n'
+            if len(prefix) + len(value) > remaining:
+                lines.append(prefix + value[:max(0, remaining - len(prefix))] +
+                             '\n[Output truncated]')
+                break
+            lines.append(prefix + value)
+            remaining -= len(prefix) + len(value)
+        return '\n'.join(lines)[:max_chars]
 
     class T3FastMCP(core.AccountingFastMCP):
         async def call_tool(self, name, arguments):
@@ -49,13 +180,23 @@ def build(core, state: ThreadState, control_token: str):
 
     @asynccontextmanager
     async def service_lifespan(_):
-        # The MCP SDK invokes Server.run/lifespan once PER HTTP CLIENT.
-        # Recovery and global resources must instead belong to the ASGI app.
+        # FastMCP session lifespans run per client. Durable recovery and
+        # shared observers belong to the ASGI service instead.
         loop = asyncio.get_running_loop()
         try:
             with state.connect() as db:
                 rows = [dict(r) for r in db.execute('SELECT * FROM operations WHERE finished IS NULL')]
+                owners = [r[0] for r in db.execute('SELECT thread_id FROM bindings')]
+            # A lost MCP response may precede the operation insert. Discover
+            # committed reservations without relaunching their commands.
+            for owner in owners:
+                for job in durable_jobs.discover(owner=owner):
+                    track_durable(owner, job, detached=True)
             for row in rows:
+                if row['durable']:
+                    state.mark_detached(row['thread_id'], row['process_id'])
+                    watch_durable(row['thread_id'], row['process_id'])
+                    continue
                 pid = row['pid']
                 if pid and core.read_process_start_ticks(pid) == row['start_ticks']:
                     fd = os.pidfd_open(pid)
@@ -102,6 +243,108 @@ def build(core, state: ThreadState, control_token: str):
     for name, tool in core.mcp._tool_manager._tools.items():
         if not name.startswith(('agent_', 'chat_runtime_')) and name not in excluded:
             mcp.add_tool(tool.fn, name=tool.name, description=tool.description)
+    mcp.remove_tool('run_command')
+    # The legacy background tool trio used an in-memory process registry. Route
+    # new launches through the same durable supervisor as run_command while
+    # preserving access to legacy IDs that predate this upgrade.
+    for name in ('start_process', 'poll_process', 'stop_process'):
+        mcp.remove_tool(name)
+
+    @mcp.tool()
+    async def start_process(command: str, session_id: str = '',
+                            cwd: str | None = None, env: dict[str, str] | None = None,
+                            idempotency_key: str | None = None) -> str:
+        """Start a restart-recoverable process; the caller does not wait for exit."""
+        session = await core._get_session(session_id)
+        async with session.lock:
+            binding = state.require_terminal(session_id)
+            job = await start_durable(binding['thread_id'], session_id, command,
+                                      cwd, env, idempotency_key, detached=True)
+            return format_command(job, 24000)
+
+    @mcp.tool()
+    async def poll_process(process_id: str, max_lines: int = 200,
+                           session_id: str = '') -> str:
+        """Read bounded durable output even when the spawning turn has ended."""
+        binding = state.require_terminal(session_id)
+        if process_id.startswith('proc-'):
+            return await core.poll_process(process_id, max_lines=max_lines,
+                                           session_id=session_id)
+        job = durable_jobs.status(process_id, owner=binding['thread_id'])
+        return format_command(job, max(128, min(24000, max_lines * 160)))
+
+    @mcp.tool()
+    async def stop_process(process_id: str, session_id: str = '') -> str:
+        """Stop the original supervised process, with identity-verified cleanup."""
+        binding = state.require_terminal(session_id)
+        if process_id.startswith('proc-'):
+            return await core.stop_process(process_id, session_id=session_id)
+        job = durable_jobs.stop(process_id, owner=binding['thread_id'])
+        return format_command(job, 24000)
+
+
+    @mcp.tool()
+    async def run_command(
+        command: str, timeout: float | None = None, session_id: str = '',
+        cwd: str | None = None, max_output_chars: int = 24000,
+        env: dict[str, str] | None = None, idempotency_key: str | None = None,
+    ) -> str:
+        """Run under a durable supervisor; after 180 seconds detach only the tool presentation.
+
+        timeout is an independent hard execution deadline, enforced inside the
+        surviving supervisor even after an MCP restart. Provide a stable
+        idempotency_key to deduplicate client retries.
+        """
+        session = await core._get_session(session_id)
+        async with session.lock:
+            binding = state.require_terminal(session_id)
+            if timeout is not None:
+                timeout = float(timeout)
+                if not math.isfinite(timeout) or timeout <= 0:
+                    raise ValueError('timeout must be positive and finite')
+            if max_output_chars < 128:
+                raise ValueError('max_output_chars must be at least 128')
+            deadline = time.monotonic() + FOREGROUND_DETACH_SECONDS
+            job = await start_durable(binding['thread_id'], session_id, command,
+                                      cwd, env, idempotency_key, timeout, track_cwd=True)
+            while True:
+                job = durable_jobs.status(job['job_id'], owner=binding['thread_id'])
+                if job['result'] is not None or job['status'] == 'outcome_unknown':
+                    if job['result'] is not None and job['result']['status'] == 'exited':
+                        # A trailing shell marker captures "cd" even though
+                        # each job is launched in a fresh process. It is stable
+                        # across retries because it derives from the job ID.
+                        end = Path(job['stdout_path']).stat().st_size
+                        tail = durable_jobs.output(
+                            job['job_id'], owner=binding['thread_id'],
+                            stdout_offset=max(0, end - 16384),
+                            max_bytes=16384)['stdout']['text']
+                        _, updated = core._strip_pwd_marker(
+                            tail, "__MCP_PWD_" + job['job_id'] + "__")
+                        if updated:
+                            candidate = Path(updated).expanduser().resolve()
+                            if candidate.is_dir() and candidate.is_relative_to(
+                                    Path(binding['cwd']).resolve()):
+                                session.cwd = candidate
+                        session.command_count += 1
+                        session.updated_at = time.time()
+                    if job['result'] is not None:
+                        state.finish('durable:' + job['job_id'],
+                                     json.dumps(job['result']), receipt={**job['result'],
+                                         'stdoutPath': job['stdout_path'], 'stderrPath': job['stderr_path']})
+                    else:
+                        state.finish('durable:' + job['job_id'], 'outcome_unknown',
+                                     receipt={'status': 'outcome_unknown', 'exit_code': None})
+                    return format_command(job, max_output_chars)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if state.mark_detached(binding['thread_id'], job['job_id']):
+                        return format_command(job, max_output_chars)
+                    # A receipt won the finish/detach race; return its terminal status.
+                    return format_command(durable_jobs.status(job['job_id'],
+                                            owner=binding['thread_id']), max_output_chars)
+                await asyncio.sleep(min(.04, remaining))
+
     core.mcp = mcp
     core._set_startup_instructions = lambda: instructions
     # The context loader builds its manifest from core.mcp, which now contains only this flavor.
@@ -328,6 +571,46 @@ def build(core, state: ThreadState, control_token: str):
         binding = state.require_terminal(session_id)
         return json.dumps(state.continue_after_process(binding['thread_id'], process_id, idempotency_key))
 
+
+    @mcp.tool()
+    async def start_durable_process(command: str, idempotency_key: str, session_id: str,
+                                    cwd: str | None = None, env: dict[str, str] | None = None) -> str:
+        """Launch one restart-discoverable background job; retries never launch a second."""
+        binding = state.require_terminal(session_id)
+        job = await start_durable(binding['thread_id'], session_id, command,
+                                  cwd, env, idempotency_key, detached=True)
+        return json.dumps(job)
+
+    @mcp.tool()
+    async def durable_process_status(job_id: str, session_id: str) -> str:
+        """Read a supervised job's durable identity and exit receipt; never relaunch it."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(durable_jobs.status(job_id, owner=binding['thread_id']))
+
+    @mcp.tool()
+    async def durable_process_output(job_id: str, session_id: str, stream: str = 'stdout',
+                                     offset: int = 0, limit: int = 65536) -> str:
+        """Read a bounded byte range of durable stdout/stderr after an MCP restart."""
+        binding = state.require_terminal(session_id)
+        if stream not in ('stdout', 'stderr'):
+            raise ValueError('stream must be stdout or stderr')
+        return json.dumps(durable_jobs.output(job_id, owner=binding['thread_id'],
+            stdout_offset=offset if stream == 'stdout' else 0,
+            stderr_offset=offset if stream == 'stderr' else 0,
+            max_bytes=limit)[stream])
+
+    @mcp.tool()
+    async def list_durable_processes(session_id: str) -> str:
+        """Discover this thread's persisted jobs without searching projects or spawning."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(durable_jobs.discover(owner=binding['thread_id']))
+
+    @mcp.tool()
+    async def stop_durable_process(job_id: str, session_id: str) -> str:
+        """Request identity-verified termination of a supervised job."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(durable_jobs.stop(job_id, owner=binding['thread_id']))
+
     original_spawn = core._spawn_workload
     async def spawn(*args, **kwargs):
         process, unit_name = await original_spawn(*args, **kwargs)
@@ -382,6 +665,8 @@ def build(core, state: ThreadState, control_token: str):
                     raise ValueError('Thread belongs to another T3 environment/provider')
                 if action == 'bind':
                     result = state.bind(body['threadId'], body['conversationId'])
+                elif action == 'reset':
+                    result = state.reset_conversation(body['threadId'], body.get('expectedConversationId'))
                 elif action == 'activate':
                     result = state.activate(body['threadId'], body['requestId'])
                 elif action == 'pause':

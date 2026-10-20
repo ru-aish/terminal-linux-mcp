@@ -40,7 +40,8 @@ class ThreadState:
                 operation_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
                 kind TEXT NOT NULL, pid INTEGER, start_ticks INTEGER,
                 started REAL NOT NULL, finished REAL, result TEXT,
-                blocks_thread INTEGER NOT NULL DEFAULT 1
+                blocks_thread INTEGER NOT NULL DEFAULT 1,
+                detached INTEGER NOT NULL DEFAULT 0, durable INTEGER NOT NULL DEFAULT 0
               );
               CREATE TABLE IF NOT EXISTS events (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL,
@@ -73,6 +74,11 @@ class ThreadState:
                 db.execute('ALTER TABLE operations ADD COLUMN process_id TEXT')
             if 'blocks_thread' not in {r[1] for r in db.execute('PRAGMA table_info(operations)')}:
                 db.execute('ALTER TABLE operations ADD COLUMN blocks_thread INTEGER NOT NULL DEFAULT 1')
+            columns = {r[1] for r in db.execute('PRAGMA table_info(operations)')}
+            if 'detached' not in columns:
+                db.execute('ALTER TABLE operations ADD COLUMN detached INTEGER NOT NULL DEFAULT 0')
+            if 'durable' not in columns:
+                db.execute('ALTER TABLE operations ADD COLUMN durable INTEGER NOT NULL DEFAULT 0')
             db.execute('CREATE UNIQUE INDEX IF NOT EXISTS operations_process ON operations(thread_id, process_id)')
 
     @contextmanager
@@ -90,7 +96,7 @@ class ThreadState:
 
     @staticmethod
     def identifier(value: Any) -> str:
-        if not isinstance(value, str) or not value or value != value.strip() or value == 'default':
+        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:%-]{0,2047}', value) or value == 'default':
             raise ValueError('A non-default registered thread identifier is required')
         return value
 
@@ -185,6 +191,25 @@ class ThreadState:
             db.execute('UPDATE bindings SET conversation_id=? WHERE thread_id=?', (conversation_id, thread_id))
         return self.get(thread_id)
 
+    def reset_conversation(self, thread_id: str, expected_conversation_id: str | None = None) -> dict:
+        """Fence old native callbacks while preserving thread-owned process receipts."""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT conversation_id FROM bindings WHERE thread_id=?',
+                             (thread_id,)).fetchone()
+            if row is None:
+                raise ValueError('Unknown T3 thread')
+            if row['conversation_id'] is not None:
+                if (expected_conversation_id is not None and
+                        row['conversation_id'] != expected_conversation_id):
+                    raise ValueError('Conversation changed before reset')
+                self._stale_automations(db, thread_id)
+                db.execute('''UPDATE bindings SET conversation_id=NULL, epoch=epoch+1,
+                    revision=revision+1, last_activity=?, deadline=NULL
+                    WHERE thread_id=?''', (time.time(), thread_id))
+        self.arm(thread_id)
+        return self.get(thread_id)
+
     def _event(self, db, thread_id: str, kind: str, payload: dict) -> str:
         row = db.execute('SELECT epoch,revision FROM bindings WHERE thread_id=?', (thread_id,)).fetchone()
         event_id = str(uuid.uuid4())
@@ -237,15 +262,52 @@ class ThreadState:
             db.execute('UPDATE bindings SET revision=revision+1,last_activity=?,deadline=NULL WHERE thread_id=?', (time.time(), thread_id))
         self.cancel_timer(thread_id)
 
-    def finish(self, operation_id: str, result: str):
+    def ensure_durable_process(self, thread_id: str, process_id: str, detached: bool = False):
+        """Commit a launch identity once; recovery never launches the command."""
+        self.get(thread_id)
+        operation_id = 'durable:' + process_id
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT thread_id,finished,blocks_thread FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
+            existing = db.execute('SELECT * FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
+            if existing is not None:
+                if existing['thread_id'] != thread_id or existing['process_id'] != process_id:
+                    raise ValueError('Durable operation identity collision')
+                if detached and existing['finished'] is None:
+                    db.execute('UPDATE operations SET detached=1,blocks_thread=0 WHERE operation_id=?', (operation_id,))
+                return operation_id
+            db.execute('INSERT INTO operations(operation_id,thread_id,kind,started,process_id,durable,detached,blocks_thread) VALUES(?,?,?,?,?,?,?,?)',
+                       (operation_id, thread_id, 'process', time.time(), process_id, 1, int(detached),
+                        0 if detached else 1))
+            db.execute('UPDATE bindings SET revision=revision+1,last_activity=?,deadline=NULL WHERE thread_id=?',
+                       (time.time(), thread_id))
+        self.cancel_timer(thread_id)
+        return operation_id
+
+    def mark_detached(self, thread_id: str, process_id: str) -> bool:
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            changed = db.execute('UPDATE operations SET detached=1,blocks_thread=0 WHERE thread_id=? AND process_id=? AND durable=1 AND finished IS NULL',
+                                 (thread_id, process_id)).rowcount
+        if changed:
+            self.arm(thread_id)
+        return bool(changed)
+
+    def finish(self, operation_id: str, result: str, receipt: dict | None = None):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT thread_id,finished,blocks_thread,detached,durable,process_id FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
             if row is None or row['finished'] is not None:
                 return
             thread_id = row['thread_id']
             now = time.time()
             db.execute('UPDATE operations SET finished=?,result=? WHERE operation_id=?', (now, result[:1000], operation_id))
+            if row['durable'] and row['detached']:
+                self._event(db, thread_id, 'process.completed', {
+                    'processId': row['process_id'],
+                    'status': receipt.get('status', 'outcome_unknown') if receipt else 'outcome_unknown',
+                    'exitCode': receipt.get('exit_code') if receipt else None,
+                    'result': receipt or {'status': result[:1000]},
+                })
             db.execute("UPDATE automations SET status='due',updated=? WHERE operation_id=? AND status='pending'", (now, operation_id))
             if row['blocks_thread']:
                 db.execute('UPDATE bindings SET revision=revision+1,last_activity=? WHERE thread_id=?', (now, thread_id))
@@ -271,7 +333,7 @@ class ThreadState:
                 raise ValueError('Tools are still active')
             # Explicit completion is authoritative for the task. Long-lived
             # processes remain controllable, but no longer pin thread idleness.
-            db.execute("UPDATE operations SET blocks_thread=0 WHERE thread_id=? AND finished IS NULL AND kind='process'", (thread_id,))
+            db.execute("UPDATE operations SET blocks_thread=0,detached=1 WHERE thread_id=? AND finished IS NULL AND kind='process'", (thread_id,))
             db.execute("UPDATE bindings SET state='done',revision=revision+1,deadline=NULL WHERE thread_id=?", (thread_id,))
             self._stale_automations(db, thread_id)
             self._event(db, thread_id, 'state', {'state': 'done', 'evidence': evidence})
