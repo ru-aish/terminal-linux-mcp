@@ -216,7 +216,7 @@ def test_launch_without_sqlite_registration_recovered_without_resubmitting(tmp_p
         state.close()
         reopened = ThreadState(tmp_path / "state.db", inactivity_seconds=3600)
         rebuilt, _ = t3.build(core, reopened, "test-token")
-        async with rebuilt.settings.lifespan(rebuilt):
+        async with rebuilt.service_lifespan(rebuilt):
             deadline = time.monotonic() + 7
             while time.monotonic() < deadline and not completed_events(reopened):
                 await asyncio.sleep(.04)

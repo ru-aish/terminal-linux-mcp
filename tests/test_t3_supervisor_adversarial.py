@@ -87,6 +87,13 @@ def test_systemd_worker_receives_environment_over_ephemeral_same_uid_socket(tmp_
         assert override not in repr(argv)
         assert "env" in kwargs and override not in repr(kwargs["env"])
         command = argv[argv.index("--") + 1:]
+        # This transport double has no delegated systemd cgroup. Exercise the
+        # real environment broker with a process-mode worker; real-systemd
+        # containment is covered by test_supervisor_real_systemd.py.
+        directory = Path(command[command.index("_worker") + 1])
+        request = json.loads((directory / "request.json").read_text())
+        request["launch_mode"] = "process"
+        (directory / "request.json").write_text(json.dumps(request))
         subprocess.Popen(command, cwd=kwargs["cwd"],
                          env={"PATH": os.environ.get("PATH", "/usr/bin"), "HOME": str(tmp_path)},
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
