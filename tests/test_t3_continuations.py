@@ -609,3 +609,56 @@ def test_recovery_partial_startup_failure_releases_pidfd(state, core, monkeypatc
             await asyncio.wait_for(process.wait(), 10)
 
     asyncio.run(run())
+
+
+def test_real_http_clients_do_not_restart_or_stop_recovery(state, core, monkeypatch):
+    import os
+    import httpx
+    from unittest.mock import AsyncMock
+    from mcp.client.streamable_http import streamablehttp_client
+    from mcp import ClientSession
+    from t3_terminal_server import build, build_public_app
+
+    async def run():
+        state.activate('thread-one', 'activate')
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-c', 'import sys; sys.stdin.read()', stdin=asyncio.subprocess.PIPE,
+        )
+        monkeypatch.setattr(core, '_close_all_mcp_connections', AsyncMock())
+        original_open = os.pidfd_open
+        opened = []
+        monkeypatch.setattr(os, 'pidfd_open', lambda pid: (opened.append(original_open(pid)), opened[-1])[1])
+        try:
+            state.begin('thread-one', 'recover-me', 'process', process.pid,
+                        core.read_process_start_ticks(process.pid), process_id='recorded')
+            mcp, _ = build(core, state, 'test-token')
+            app = build_public_app(core, mcp)
+            def client_factory(headers=None, timeout=None, auth=None):
+                return httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url='http://testserver',
+                    headers=headers, timeout=timeout, auth=auth,
+                )
+            async with app.router.lifespan_context(app):
+                for _ in range(5):
+                    async with streamablehttp_client('http://testserver/mcp',
+                                                     httpx_client_factory=client_factory) as (reader, writer, _):
+                        async with ClientSession(reader, writer) as session:
+                            await session.initialize()
+                            tools = await session.list_tools()
+                            assert any(t.name == 'thread_task' for t in tools.tools)
+                            assert opened == [opened[0]]
+                            assert len(mcp.recovery_watchers) == 1
+                    assert not core._close_all_mcp_connections.await_count
+                    assert len(mcp.recovery_watchers) == 1
+                process.stdin.close()
+                await asyncio.wait_for(process.wait(), 10)
+                await asyncio.sleep(.03)
+                assert not mcp.recovery_watchers
+            assert len(opened) == 1
+            assert core._close_all_mcp_connections.await_count == 1
+        finally:
+            if process.returncode is None:
+                process.stdin.close()
+            await process.wait()
+
+    asyncio.run(run())
