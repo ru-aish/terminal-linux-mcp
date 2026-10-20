@@ -234,6 +234,29 @@ def _signal_group(pgid: int, sig: int) -> None:
         pass
 
 
+def _delegated_workload_cgroup() -> Path:
+    """Isolate the shell below the delegated service cgroup, not alongside its worker."""
+    rows = Path("/proc/self/cgroup").read_text().splitlines()
+    paths = [row.split(":", 2)[2] for row in rows if row.startswith("0::/")]
+    if len(paths) != 1:
+        raise RuntimeError("Systemd workload requires unified cgroup v2")
+    parent = Path("/sys/fs/cgroup") / paths[0].lstrip("/")
+    group = parent / "workload"
+    group.mkdir(mode=0o700)
+    if not (group / "cgroup.kill").exists():
+        raise RuntimeError("Systemd workload cgroup.kill is unavailable")
+    return group
+
+
+def _cgroup_populated(group: Path) -> bool:
+    fields = dict(line.split(" ", 1) for line in (group / "cgroup.events").read_text().splitlines())
+    return fields["populated"] == "1"
+
+
+def _cgroup_kill(group: Path) -> None:
+    (group / "cgroup.kill").write_text("1")
+
+
 def _worker(directory: Path, env_token: str | None = None) -> int:
     # A worker owns exactly one launch. An accidentally repeated invocation
     # cannot start a second command, even after the first worker has died.
@@ -263,6 +286,7 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
         os.environ.clear()
         os.environ.update(received)
     _enable_subreaper()
+    workload = _delegated_workload_cgroup() if spec["launch_mode"] == "systemd" else None
     child = None
     released = False
     stop_requested = False
@@ -290,6 +314,8 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
             identity = _identity(child.pid)
             if identity is None:
                 raise RuntimeError("Cannot identify supervised process before execution")
+            if workload is not None:
+                (workload / "cgroup.procs").write_text(str(child.pid))
             _atomic_json(directory / "child.json", identity)
             if not stop_requested and not (directory / "stop.request").exists():
                 os.write(write_gate, b"1")
@@ -314,7 +340,8 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
                 members = (_running_group_members(child.pid)
                            if exited or reason is not None or stop_requested else [])
                 adopted = _adopted_children() if exited or reason is not None else []
-                remaining_descendants = bool(members or [pid for pid in adopted if pid != child.pid])
+                remaining_descendants = (_cgroup_populated(workload) if workload is not None else
+                                         bool(members or [pid for pid in adopted if pid != child.pid]))
                 if reason is None:
                     if exited and not remaining_descendants:
                         break
@@ -334,6 +361,8 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
                     if not hard_killed and now - term_at >= 0.5:
                         _signal_group(child.pid, signal.SIGKILL)
                         _signal_adopted(adopted, signal.SIGKILL, child.pid)
+                        if workload is not None:
+                            _cgroup_kill(workload)
                         hard_killed = True
                     if hard_killed and now - term_at >= 4:
                         # Do not claim successful cancellation when unable to
@@ -341,7 +370,8 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
                         break
                 time.sleep(0.025)
             remaining = _running_group_members(child.pid) if reason else []
-            verified = not remaining and not any(pid != child.pid for pid in _adopted_children())
+            verified = (not _cgroup_populated(workload) if workload is not None else
+                        not remaining and not any(pid != child.pid for pid in _adopted_children()))
             if not verified:
                 code = None
             else:
@@ -527,6 +557,7 @@ class DurableProcessSupervisor:
                     subprocess.run(
                         ["systemd-run", "--user", "--quiet", "--collect",
                          "--property=KillMode=control-group",
+                         "--property=Delegate=yes",
                          f"--unit={unit}", "--", *args, "@" + token],
                         cwd=workdir, env=os.environ.copy(), capture_output=True,
                         check=True, timeout=10,

@@ -78,7 +78,10 @@ process-group-ID reuse. The receipt records whether the group is verified
 stopped and distinguishes `cancelled`, `descendants_stopped`,
 `stop_not_effective`, and `termination_unverified`. Direct-process mode cannot
 contain descendants that deliberately escape their process group with
-`setsid` or another cgroup; systemd uses `KillMode=control-group` for unit
+`setsid` or another cgroup; systemd uses `Delegate=yes` to isolate each
+child in a workload cgroup and confirms `populated=0` (with `cgroup.kill`
+escalation when necessary) before writing a terminal receipt. The worker stays
+outside that subgroup. `KillMode=control-group` for unit
 cleanup. Launched commands must stay inside their thread's bound workspace. Never treat `outcome_unknown` (supervisor
 crash/reboot before its exit receipt) as success, and never retry execution by
 reusing a new key to resolve an uncertain outcome. Workspace checkpoint rollback
