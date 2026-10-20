@@ -120,6 +120,11 @@ def test_t3_cd_marker_and_session_env_and_foreground_serialization(tmp_path, mon
         assert "Exit Code: 0" in first
         assert "__MCP_PWD_" not in first
         assert session.cwd == sub
+        replay = decode(await mcp.call_tool("run_command", {
+            "command": "cd sub", "session_id": session_id, "idempotency_key": "cd"}))
+        assert first.split("Process ID: ", 1)[1].splitlines()[0] == (
+            replay.split("Process ID: ", 1)[1].splitlines()[0])
+        assert session.cwd == sub
         # A newly entered project root still requires its own GPT context gate.
         await mcp.call_tool("bootstrap_thread", {
             "thread_id": session_id, "cwd": str(sub), "max_chars": 0})

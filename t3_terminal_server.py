@@ -77,6 +77,15 @@ def build(core, state: ThreadState, control_token: str):
         session = await core._get_session(session_id)
         binding = state.require_terminal(session_id)
         workspace = Path(binding['cwd']).resolve()
+        if idempotency_key is not None and cwd is None:
+            # Replaying a completed 'cd sub' must use its original launch cwd,
+            # not the session cwd that the same command already changed.
+            try:
+                existing = durable_jobs.status(
+                    _job_id(thread_id, idempotency_key), owner=thread_id)
+                cwd = existing['cwd']
+            except ValueError:
+                pass
         run_cwd = core._resolve_cwd(cwd, session.cwd)
         if not run_cwd.is_relative_to(workspace):
             raise ValueError('Durable job cwd must remain inside the bound T3 workspace')
