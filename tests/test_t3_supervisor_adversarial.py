@@ -235,3 +235,39 @@ def test_stop_does_not_claim_cancelled_when_shell_dies_but_child_writes(tmp_path
     assert outcome["result"]["status"] == "stop_not_effective"
     assert outcome["result"]["stop_effective"] is False
     assert outcome["result"]["group_verified"] is True
+
+
+def test_producer_publishes_workspace_fence_and_reserves_under_lock(tmp_path, monkeypatch):
+    import durable_process_supervisor as module
+    root = tmp_path / "durable"
+    manager = DurableProcessSupervisor(root)
+    assert (root / "workspace-fence-version").read_text() == "1\n"
+    seen = []
+    original = module._atomic_json
+
+    def check_reservation(path, value):
+        if path.name == "request.json":
+            assert (root / "workspace-mutation.lock").is_dir()
+            seen.append(value["cwd"])
+        return original(path, value)
+
+    monkeypatch.setattr(module, "_atomic_json", check_reservation)
+    job = manager.start("printf fenced", owner="owner", cwd=tmp_path,
+                        idempotency_key="fenced")
+    assert seen == [str(tmp_path)]
+    assert not (root / "workspace-mutation.lock").exists()
+    assert terminal(manager, job["job_id"])["result"]["group_verified"]
+
+
+def test_held_workspace_fence_prevents_new_job_reservation(tmp_path):
+    import pytest
+    root = tmp_path / "durable"
+    manager = DurableProcessSupervisor(root)
+    (root / "workspace-mutation.lock").mkdir()
+    try:
+        with pytest.raises(TimeoutError, match="fence is held"):
+            manager.start("printf must-not-launch", owner="owner", cwd=tmp_path,
+                          idempotency_key="blocked")
+        assert list((root / "jobs").iterdir()) == []
+    finally:
+        (root / "workspace-mutation.lock").rmdir()

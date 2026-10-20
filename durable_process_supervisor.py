@@ -7,6 +7,7 @@ once written. A missing receipt is never mistaken for a successful command.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -54,6 +55,24 @@ def _atomic_json(path: Path, value: dict) -> None:
         with temporary.open("xb") as output:
             os.chmod(temporary, 0o600)
             output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_text(path: Path, value: str) -> None:
+    temporary = path.with_name("." + path.name + "." + secrets.token_hex(8))
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            os.chmod(temporary, 0o600)
+            output.write(value)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
@@ -333,6 +352,25 @@ def _worker(directory: Path, env_token: str | None = None) -> int:
             os.close(write_gate)
 
 
+@contextmanager
+def _workspace_mutation_lock(root: Path):
+    """Share the consumer's fail-closed atomic-directory workspace fence."""
+    path = root / "workspace-mutation.lock"
+    deadline = time.monotonic() + 3
+    while True:
+        try:
+            path.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Durable workspace mutation fence is held")
+            time.sleep(.025)
+    try:
+        yield
+    finally:
+        path.rmdir()
+
+
 class DurableProcessSupervisor:
     """Filesystem facade; every job is independently owned by a detached worker.
 
@@ -355,6 +393,13 @@ class DurableProcessSupervisor:
         if self.jobs.stat().st_uid != os.getuid() or self.jobs.stat().st_mode & 0o077:
             raise PermissionError('Durable jobs directory must be owned by the current user and private')
         self.launch_mode = launch_mode
+        # Publish only for roots served by this fence-aware producer.
+        with _workspace_mutation_lock(self.root):
+            marker = self.root / "workspace-fence-version"
+            if marker.exists() and marker.read_text().strip() != "1":
+                raise RuntimeError("Unsupported durable workspace fence version")
+            if not marker.exists():
+                _atomic_text(marker, "1\n")
 
     def _directory(self, job_id: str) -> Path:
         if len(job_id) not in (32, 64) or any(c not in "0123456789abcdef" for c in job_id):
@@ -391,28 +436,29 @@ class DurableProcessSupervisor:
             "owner": owner, "command": command, "cwd": workdir, "shell": shell,
             "env": env or {}, "launch_mode": self.launch_mode, "hard_timeout": hard_timeout,
         })
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            # Another caller may have created the reservation but not committed
-            # request.json yet. Never launch a second worker for the same key.
-            deadline = time.monotonic() + 1
-            existing = _read_json(directory / "request.json")
-            while existing is None and time.monotonic() < deadline:
-                time.sleep(0.01)
+        with _workspace_mutation_lock(self.root):
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                # Another caller may have created the reservation but not committed
+                # request.json yet. Never launch a second worker for the same key.
+                deadline = time.monotonic() + 1
                 existing = _read_json(directory / "request.json")
-            if existing is None:
-                raise RuntimeError("Existing reserved job is not yet recoverable; refusing duplicate spawn")
-            if existing["fingerprint"] != fingerprint or existing["owner"] != owner:
-                raise ValueError("Idempotency key was reused for a different command")
-            return self.status(job_id, owner=owner)
-        request = {
-            "job_id": job_id, "owner": owner, "fingerprint": fingerprint,
-            "command": command, "cwd": workdir, "shell": shell,
-            "created_at": time.time(), "launch_mode": self.launch_mode, "hard_timeout": hard_timeout,
-        }
-        # No environment secrets are persisted; only a digest participates in matching.
-        _atomic_json(directory / "request.json", request)
+                while existing is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    existing = _read_json(directory / "request.json")
+                if existing is None:
+                    raise RuntimeError("Existing reserved job is not yet recoverable; refusing duplicate spawn")
+                if existing["fingerprint"] != fingerprint or existing["owner"] != owner:
+                    raise ValueError("Idempotency key was reused for a different command")
+                return self.status(job_id, owner=owner)
+            request = {
+                "job_id": job_id, "owner": owner, "fingerprint": fingerprint,
+                "command": command, "cwd": workdir, "shell": shell,
+                "created_at": time.time(), "launch_mode": self.launch_mode, "hard_timeout": hard_timeout,
+            }
+            # No environment secrets are persisted; only a digest participates in matching.
+            _atomic_json(directory / "request.json", request)
         (directory / "stdout.log").touch(mode=0o600)
         (directory / "stderr.log").touch(mode=0o600)
         launcher_env = os.environ.copy()
