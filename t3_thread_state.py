@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class ThreadState:
@@ -54,6 +55,11 @@ class ThreadState:
                 operation_id TEXT, status TEXT NOT NULL,
                 idempotency_key TEXT, event_id TEXT UNIQUE,
                 created REAL NOT NULL, updated REAL NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS t3_mcp_credentials (
+                thread_id TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL,
+                authorization TEXT NOT NULL
               );
               CREATE UNIQUE INDEX IF NOT EXISTS automations_idempotency
                 ON automations(thread_id, kind, idempotency_key);
@@ -109,13 +115,47 @@ class ThreadState:
             raise ValueError('Thread ID was not registered by T3; tool execution refused')
         return dict(row)
 
-    def register(self, *, thread_id: str, environment_id: str, provider_id: str, cwd: str, model: str, terminal_id: str | None = None, inactivity_seconds: float | None = None) -> dict:
+    @staticmethod
+    def _normalize_t3_mcp_credentials(endpoint: Any, authorization: Any) -> tuple[str | None, str | None]:
+        endpoint = endpoint.strip() if isinstance(endpoint, str) else ''
+        authorization = authorization.strip() if isinstance(authorization, str) else ''
+        if not endpoint and not authorization:
+            return None, None
+        if not endpoint or not authorization:
+            raise ValueError('T3 MCP endpoint and authorization must be provided together')
+        parsed = urlsplit(endpoint)
+        if (
+            parsed.scheme != 'http'
+            or parsed.hostname not in {'127.0.0.1', 'localhost', '::1'}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError('T3 MCP endpoint must be a loopback HTTP URL without credentials, query, or fragment')
+        if not authorization.startswith('Bearer ') or len(authorization) > 4096:
+            raise ValueError('T3 MCP authorization must be a bounded Bearer credential')
+        return endpoint, authorization
+
+    def t3_mcp_credentials(self, thread_id: str) -> dict | None:
+        self.get(thread_id)
+        with self.connect() as db:
+            row = db.execute(
+                'SELECT endpoint,authorization FROM t3_mcp_credentials WHERE thread_id=?',
+                (thread_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def register(self, *, thread_id: str, environment_id: str, provider_id: str, cwd: str, model: str, terminal_id: str | None = None, inactivity_seconds: float | None = None, t3_mcp_endpoint: str | None = None, t3_mcp_authorization: str | None = None) -> dict:
         thread_id = self.identifier(thread_id)
         terminal_id = self.identifier(terminal_id or thread_id)
         environment_id = self.identifier(environment_id)
         provider_id = self.identifier(provider_id)
         if inactivity_seconds is not None and not 1 <= float(inactivity_seconds) <= 3600:
             raise ValueError('Inactivity interval must be between 1 and 3600 seconds')
+        t3_mcp_endpoint, t3_mcp_authorization = self._normalize_t3_mcp_credentials(
+            t3_mcp_endpoint, t3_mcp_authorization
+        )
         directory = Path(cwd).expanduser().resolve(strict=True)
         if not directory.is_dir() or not isinstance(model, str) or not model.strip():
             raise ValueError('Existing workspace directory and model are required')
@@ -131,6 +171,14 @@ class ThreadState:
                            (thread_id, terminal_id, environment_id, provider_id, str(directory), model, time.time()))
             if inactivity_seconds is not None:
                 db.execute('UPDATE bindings SET inactivity_seconds=? WHERE thread_id=?', (float(inactivity_seconds), thread_id))
+            if t3_mcp_endpoint is None:
+                db.execute('DELETE FROM t3_mcp_credentials WHERE thread_id=?', (thread_id,))
+            else:
+                db.execute(
+                    '''INSERT INTO t3_mcp_credentials(thread_id,endpoint,authorization) VALUES(?,?,?)
+                       ON CONFLICT(thread_id) DO UPDATE SET endpoint=excluded.endpoint,authorization=excluded.authorization''',
+                    (thread_id, t3_mcp_endpoint, t3_mcp_authorization),
+                )
         return self.get(thread_id)
 
     def bind(self, thread_id: str, conversation_id: str) -> dict:

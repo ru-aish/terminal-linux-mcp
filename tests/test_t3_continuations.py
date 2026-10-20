@@ -440,7 +440,7 @@ def test_public_tools_target_only_injected_terminal_and_observe_process_exit(sta
     async def run():
         mcp, _ = build(core, state, 'test-token')
         tools = {t.name: t for t in await mcp.list_tools()}
-        assert not any(n.startswith(('agent_', 'chat_runtime_')) for n in tools)
+        assert not {'agent_register_parent','agent_spawn','agent_wait','chat_runtime_status'} & tools.keys()
         for name in ('schedule_continue', 'continue_after_process'):
             assert 'thread_id' not in tools[name].inputSchema['properties']
             assert 'session_id' in tools[name].inputSchema['required']

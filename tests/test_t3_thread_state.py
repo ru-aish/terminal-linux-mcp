@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from pathlib import Path
 
@@ -58,6 +59,18 @@ def test_immutable_bindings_and_allowlist(tmp_path):
     import sqlite3
     with pytest.raises(sqlite3.IntegrityError):
         state.bind('thread-two', cid)
+
+
+def test_t3_delegated_thread_ids_are_valid_registration_ids(tmp_path):
+    state = ThreadState(tmp_path/'state.db')
+    child = (
+        'thread:delegated-task:command%3Amcp%3A72181fd6-2c86-49b4-b74a-'
+        '5a11dd60f7dd%3Adelegate-task%3Ab5b20555-system-specs-chatgpt-56-sol-v1'
+    )
+    binding = register(state, tmp_path, child)
+    assert binding['thread_id'] == child
+    assert state.require_terminal(child)['thread_id'] == child
+    state.close()
 
 
 def test_final_process_exit_starts_one_deadline(tmp_path):
@@ -179,6 +192,8 @@ def test_replay_and_request_idempotency(tmp_path):
 def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypatch):
     async def run():
         monkeypatch.setenv('MCP_GPT_HOME',str(tmp_path/'gpt-home'))
+        monkeypatch.setenv('MCP_T3_DURABLE_JOBS_DIR',str(tmp_path/'durable'))
+        monkeypatch.setenv('MCP_T3_DURABLE_LAUNCH_MODE','process')
         import terminal_mcp as core
         from t3_terminal_server import build
         for name in ('mcp', '_spawn_workload', '_set_startup_instructions', '_core_behavior_prompt'):
@@ -188,7 +203,7 @@ def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypa
         mcp,private=build(core,state,'test-control-token')
         names={t.name for t in await mcp.list_tools()}
         assert 'bootstrap_thread' in names and 'thread_task' in names
-        assert not any(n.startswith(('agent_','chat_runtime_')) for n in names)
+        assert not {'agent_register_parent','agent_spawn','chat_runtime_status'} & names
         denied=await mcp.call_tool('run_command',{'command':'touch forbidden','session_id':'unknown'})
         assert not (tmp_path/'forbidden').exists()
         assert 'refused' in str(denied)
@@ -203,9 +218,9 @@ def test_real_tools_are_gated_and_background_exit_is_observed(tmp_path, monkeypa
         assert state.get('thread-one')['state']=='done'
         assert state.active('thread-one')
         assert not state.blocking_active('thread-one')
-        process = next(p.process for p in core.processes.values() if p.session_id == 'thread-one')
-        await asyncio.wait_for(process.wait(), 10)
-        await asyncio.sleep(.07)
+        deadline = asyncio.get_running_loop().time() + 10
+        while state.active('thread-one') and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(.05)
         assert not state.active('thread-one')
         assert not any(e['kind']=='continue' for e in state.events('test-env','chatgpt'))
         state.close()
@@ -230,3 +245,153 @@ def test_t3_public_app_mounts_usage_dashboard_without_legacy_features(tmp_path, 
     assert '/dashboard/events' in paths
     assert '/dashboard/assets/{name:str}' in paths
     state.close()
+
+
+def test_t3_mcp_credentials_are_private_durable_and_replaceable(tmp_path):
+    path = tmp_path / 'state.db'
+    state = ThreadState(path)
+    state.register(
+        thread_id='thread-one', environment_id='test-env', provider_id='chatgpt',
+        cwd=str(tmp_path), model='test-model',
+        t3_mcp_endpoint='http://127.0.0.1:43123/mcp',
+        t3_mcp_authorization='Bearer first-secret',
+    )
+    assert 'first-secret' not in json.dumps(state.get('thread-one'))
+    assert state.t3_mcp_credentials('thread-one') == {
+        'endpoint': 'http://127.0.0.1:43123/mcp',
+        'authorization': 'Bearer first-secret',
+    }
+    state.close()
+
+    restarted = ThreadState(path)
+    assert restarted.t3_mcp_credentials('thread-one')['authorization'] == 'Bearer first-secret'
+    restarted.register(
+        thread_id='thread-one', environment_id='test-env', provider_id='chatgpt',
+        cwd=str(tmp_path), model='test-model',
+        t3_mcp_endpoint='http://localhost:43124/mcp',
+        t3_mcp_authorization='Bearer second-secret',
+    )
+    assert restarted.t3_mcp_credentials('thread-one')['authorization'] == 'Bearer second-secret'
+    with pytest.raises(ValueError, match='loopback'):
+        restarted.register(
+            thread_id='thread-one', environment_id='test-env', provider_id='chatgpt',
+            cwd=str(tmp_path), model='test-model',
+            t3_mcp_endpoint='https://example.com/mcp',
+            t3_mcp_authorization='Bearer nope',
+        )
+    restarted.register(
+        thread_id='thread-one', environment_id='test-env', provider_id='chatgpt',
+        cwd=str(tmp_path), model='test-model',
+    )
+    assert restarted.t3_mcp_credentials('thread-one') is None
+    restarted.close()
+
+
+def test_t3_owned_subagent_tools_are_stateless_proxies(tmp_path, monkeypatch):
+    async def run():
+        monkeypatch.setenv('MCP_GPT_HOME', str(tmp_path / 'gpt-home'))
+        import terminal_mcp as core
+        from t3_terminal_server import build
+
+        for name in ('mcp', '_spawn_workload', '_set_startup_instructions', '_core_behavior_prompt', 'PUBLIC_TOOL_ORDER'):
+            monkeypatch.setattr(core, name, getattr(core, name))
+        monkeypatch.setattr(core, 'WORKSPACE_DIR', tmp_path)
+        calls = []
+
+        async def fake_with_mcp_session(session_id, server_name, config, operation, tool_name='', arguments=None, meta=None, elicitation_callback=None):
+            calls.append((session_id, server_name, config, operation, tool_name, arguments))
+            payloads = {
+                'orchestrator_capabilities': {'features': {'appOwnedSubagents': True}, 'providers': []},
+                'delegate_task': {
+                    'taskId': 'task-one',
+                    'childThreadId': 'child-one',
+                    'status': 'running',
+                    'providerInstanceId': 'chatgpt',
+                    'model': 'gpt-test',
+                },
+                'task_status': {
+                    'taskId': 'task-one',
+                    'childThreadId': 'child-one',
+                    'status': 'running',
+                    'summary': None,
+                },
+                't3_thread_send': {
+                    'threadId': 'child-one',
+                    'taskId': 'task-two',
+                    'status': 'running',
+                    'delivery': 'started',
+                },
+                'task_cancel': {'taskId': 'task-one', 'status': 'cancel_requested'},
+                't3_thread_read': {'thread': {'id': 'thread-one'}, 'items': []},
+            }
+            return core.mcp_types.CallToolResult(
+                content=[core.mcp_types.TextContent(type='text', text=json.dumps(payloads[tool_name]))]
+            )
+
+        monkeypatch.setattr(core, '_with_mcp_session', fake_with_mcp_session)
+        state = ThreadState(tmp_path / 'state.db')
+        state.register(
+            thread_id='thread-one', environment_id='test-env', provider_id='chatgpt',
+            cwd=str(tmp_path), model='test-model',
+            t3_mcp_endpoint='http://127.0.0.1:43123/mcp',
+            t3_mcp_authorization='Bearer private-token',
+        )
+        mcp, _private = build(core, state, 'test-control-token')
+        names = {tool.name for tool in await mcp.list_tools()}
+        assert {'agents_available','spawn_agent','agent_status','send_input','close_agent','list_agents'} <= names
+        assert 'agent_spawn' not in names and 'agent_register_parent' not in names
+
+        def payload(result):
+            content = result[0] if isinstance(result, tuple) else result.content
+            text = next(item.text for item in content if getattr(item, 'text', None))
+            return json.loads(text)
+
+        available = payload(await mcp.call_tool('agents_available', {'session_id': 'thread-one'}))
+        assert available['features']['appOwnedSubagents'] is True
+
+        spawned = payload(await mcp.call_tool('spawn_agent', {
+            'session_id': 'thread-one',
+            'task': 'review this',
+            'provider_instance_id': 'chatgpt',
+            'model': 'gpt-test',
+            'client_request_id': 'spawn-one',
+        }))
+        assert spawned == {
+            'agent_id': 'task-one',
+            'task_id': 'task-one',
+            'child_thread_id': 'child-one',
+            'status': 'running',
+            'provider_instance_id': 'chatgpt',
+            'model': 'gpt-test',
+        }
+        delegate = next(call for call in calls if call[4] == 'delegate_task')
+        assert delegate[5]['mode'] == 'async'
+        assert delegate[5]['target'] == {'providerInstanceId': 'chatgpt', 'model': 'gpt-test'}
+        assert delegate[2]['headers']['Authorization'] == 'Bearer private-token'
+
+        status = payload(await mcp.call_tool('agent_status', {
+            'session_id': 'thread-one', 'agent_id': 'task-one',
+        }))
+        assert status['childThreadId'] == 'child-one'
+
+        sent = payload(await mcp.call_tool('send_input', {
+            'session_id': 'thread-one', 'agent_id': 'task-one', 'message': 'also test edge cases',
+        }))
+        assert sent['agent_id'] == 'task-two'
+        send_call = next(call for call in calls if call[4] == 't3_thread_send')
+        assert send_call[5]['threadId'] == 'child-one'
+        assert send_call[5]['message'] == 'also test edge cases'
+
+        cancelled = payload(await mcp.call_tool('close_agent', {
+            'session_id': 'thread-one', 'agent_id': 'task-one',
+        }))
+        assert cancelled['status'] == 'cancel_requested'
+        listing = payload(await mcp.call_tool('list_agents', {'session_id': 'thread-one'}))
+        assert listing['thread']['id'] == 'thread-one'
+
+        with state.connect() as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert 'subagent_links' not in tables
+        state.close()
+
+    asyncio.run(run())
