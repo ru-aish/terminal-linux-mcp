@@ -7,7 +7,6 @@ import contextvars
 import json
 import os
 import secrets
-import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
