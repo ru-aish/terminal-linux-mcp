@@ -28,3 +28,42 @@ Run focused tests using the existing deployment Python environment:
 ```
 
 Run all T3 tests with `tests/test_t3_*.py` in place of the focused test file.
+
+
+## Durable T3 commands and 180-second presentation detachment
+
+In the T3 flavor only, ordinary `run_command` launches through
+`DurableProcessSupervisor` from the start. Short commands return their real
+exit code, stdout and stderr normally. If still running at **180 seconds**, the
+MCP response returns the stable `Process ID` and private log paths without
+stopping the process. The command's optional `timeout` is a **separate,
+supervisor-enforced hard execution limit** and survives an MCP restart. No
+hard timeout is assumed when omitted. Supply an `idempotency_key` for retries:
+the same thread/key/parameters identify one command forever; a reused key with
+different parameters is rejected. Without it, each tool invocation receives a
+new identity (automatic replay deduplication across separate requests is not
+guaranteed).
+
+The `durable_process_status`, `durable_process_output`,
+`list_durable_processes`, and `stop_durable_process` tools also work for
+commands detached by `run_command`. Jobs have separately fsynced stdout/stderr
+and an atomic `result.json` receipt. A restarted Terminal MCP discovers only
+its own job registry, never rescans project processes or re-executes commands.
+SQLite `operations` rows are associated with the persistent job ID.
+A detached process's terminal result publishes exactly one durable
+`process.completed` event (including after the parent task is `done`).
+Long native T3 IDs containing percent-encoded separators are preserved without
+128-character truncation.
+
+For production, jobs default to independent **systemd user services**. Use
+`MCP_T3_DURABLE_LAUNCH_MODE=process` only on hosts/tests without a working
+user systemd manager; direct-process jobs cannot survive a service-manager
+cgroup kill. `MCP_T3_DURABLE_JOBS_DIR` overrides the private on-disk registry
+(default beside the T3 SQLite database). For security, systemd job launches do
+not accept environment overrides, and launched commands must remain inside
+their thread's bound workspace. Never treat `outcome_unknown` (supervisor
+crash/reboot before its exit receipt) as success, and never retry execution by
+reusing a new key to resolve an uncertain outcome. Workspace checkpoint rollback
+must still be coordinated externally with any running job modifying that tree.
+The T3 control-plane consumer must separately render/handle the
+`process.completed` event if it wants an in-app notification.

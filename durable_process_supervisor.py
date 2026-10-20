@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -116,6 +117,7 @@ def _worker(directory: Path) -> int:
     released = False
     stop_requested = False
     stop_effective = False
+    timed_out = False
 
     def on_stop(_signal, _frame):
         nonlocal stop_requested, stop_effective
@@ -156,11 +158,28 @@ def _worker(directory: Path) -> int:
             write_gate = -1
             if stop_requested and released:
                 on_stop(signal.SIGTERM, None)
-            code = child.wait()
+            try:
+                code = child.wait(timeout=spec.get("hard_timeout"))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                if child.poll() is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    code = child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    if child.poll() is None:
+                        try:
+                            os.killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    code = child.wait()
             os.fsync(stdout.fileno())
             os.fsync(stderr.fileno())
         _atomic_json(directory / "result.json", {
-            "status": "cancelled" if stop_effective else "exited", "exit_code": code,
+            "status": "timed_out" if timed_out else ("cancelled" if stop_effective else "exited"), "exit_code": code,
             "finished_at": time.time(), "child": identity,
             "stdout_bytes": (directory / "stdout.log").stat().st_size,
             "stderr_bytes": (directory / "stderr.log").stat().st_size,
@@ -231,6 +250,7 @@ class DurableProcessSupervisor:
         env: dict[str, str] | None = None,
         idempotency_key: str | None = None,
         shell: str = "/bin/bash",
+        hard_timeout: float | None = None,
     ) -> dict:
         if not command or not command.strip() or not owner or not owner.strip():
             raise ValueError("Command and owner must be nonempty")
@@ -238,6 +258,10 @@ class DurableProcessSupervisor:
             raise ValueError("Idempotency key must be nonempty if given")
         if env is not None and not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
             raise ValueError("Environment overrides must be strings")
+        if hard_timeout is not None:
+            hard_timeout = float(hard_timeout)
+            if not math.isfinite(hard_timeout) or hard_timeout <= 0:
+                raise ValueError("hard_timeout must be positive and finite")
         if self.launch_mode == "systemd" and env:
             raise ValueError("Systemd job launch does not support environment overrides")
         workdir = str(Path(cwd).expanduser().resolve(strict=True))
@@ -247,7 +271,7 @@ class DurableProcessSupervisor:
         directory = self._directory(job_id)
         fingerprint = _digest({
             "owner": owner, "command": command, "cwd": workdir, "shell": shell,
-            "env": env or {}, "launch_mode": self.launch_mode,
+            "env": env or {}, "launch_mode": self.launch_mode, "hard_timeout": hard_timeout,
         })
         try:
             directory.mkdir(mode=0o700)
@@ -267,7 +291,7 @@ class DurableProcessSupervisor:
         request = {
             "job_id": job_id, "owner": owner, "fingerprint": fingerprint,
             "command": command, "cwd": workdir, "shell": shell,
-            "created_at": time.time(), "launch_mode": self.launch_mode,
+            "created_at": time.time(), "launch_mode": self.launch_mode, "hard_timeout": hard_timeout,
         }
         # No environment secrets are persisted; only a digest participates in matching.
         _atomic_json(directory / "request.json", request)
@@ -310,12 +334,12 @@ class DurableProcessSupervisor:
             status = "running" if child is not None else "starting"
         elif _alive(child):
             status = "supervisor_lost_child_running"
-        elif supervisor is None and not (directory / "launch_error.json").exists() and time.time() - request["created_at"] < 3:
+        elif supervisor is None and not (directory / "launch_error.json").exists() and time.time() - request["created_at"] < 15:
             status = "starting"
         else:
             status = "outcome_unknown"
         return {
-            "job_id": job_id, "owner": owner, "status": status,
+            "job_id": job_id, "owner": owner, "status": status, "cwd": request.get("cwd"),
             "supervisor": supervisor, "child": child, "result": result,
             "stdout_path": str(directory / "stdout.log"),
             "stderr_path": str(directory / "stderr.log"),
