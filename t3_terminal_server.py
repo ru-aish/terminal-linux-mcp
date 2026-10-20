@@ -178,59 +178,65 @@ def build(core, state: ThreadState, control_token: str):
                 state.finish(operation, 'tool_returned')
 
     @asynccontextmanager
-    async def lifespan(_):
-        # Recover only our locally registered operations, once at startup.
-        # Live process handles are observed with pidfd exit notifications, never project scans.
-        with state.connect() as db:
-            rows = [dict(r) for r in db.execute('SELECT * FROM operations WHERE finished IS NULL')]
-        # Recover only this registered T3 environment's durable job registry.
-        # A lost MCP response may precede the SQLite operation insert; discover
-        # such launches without executing them again.
-        with state.connect() as db:
-            owners = [r[0] for r in db.execute('SELECT thread_id FROM bindings')]
-        for owner in owners:
-            for job in durable_jobs.discover(owner=owner):
-                track_durable(owner, job, detached=True)
-        for row in rows:
-            if row['durable']:
-                # The foreground presentation was lost on MCP restart.
-                # Its supervisor, logs and eventual receipt are independent.
-                state.mark_detached(row['thread_id'], row['process_id'])
-                watch_durable(row['thread_id'], row['process_id'])
-                continue
-            pid = row['pid']
-            if pid and core.read_process_start_ticks(pid) == row['start_ticks']:
-                fd = os.pidfd_open(pid)
-                async def restored_exit(row=row, fd=fd):
-                    loop = asyncio.get_running_loop()
+    async def service_lifespan(_):
+        # FastMCP session lifespans run per client. Durable recovery and
+        # shared observers belong to the ASGI service instead.
+        loop = asyncio.get_running_loop()
+        try:
+            with state.connect() as db:
+                rows = [dict(r) for r in db.execute('SELECT * FROM operations WHERE finished IS NULL')]
+                owners = [r[0] for r in db.execute('SELECT thread_id FROM bindings')]
+            # A lost MCP response may precede the operation insert. Discover
+            # committed reservations without relaunching their commands.
+            for owner in owners:
+                for job in durable_jobs.discover(owner=owner):
+                    track_durable(owner, job, detached=True)
+            for row in rows:
+                if row['durable']:
+                    state.mark_detached(row['thread_id'], row['process_id'])
+                    watch_durable(row['thread_id'], row['process_id'])
+                    continue
+                pid = row['pid']
+                if pid and core.read_process_start_ticks(pid) == row['start_ticks']:
+                    fd = os.pidfd_open(pid)
                     future = loop.create_future()
-                    loop.add_reader(fd, lambda: None if future.done() else future.set_result(None))
                     try:
-                        await future
-                        state.finish(row['operation_id'], 'process_exited_after_recovery')
-                    finally:
+                        loop.add_reader(fd, lambda f=future: None if f.done() else f.set_result(None))
+                        async def restored_exit(row=row, future=future):
+                            await future
+                            state.finish(row['operation_id'], 'process_exited_after_recovery')
+                        task = asyncio.create_task(restored_exit())
+                    except BaseException:
                         loop.remove_reader(fd)
                         os.close(fd)
-                task = asyncio.create_task(restored_exit())
-                watchers.add(task)
-                task.add_done_callback(watchers.discard)
-            else:
-                state.finish(row['operation_id'], 'interrupted_by_restart')
-        with state.connect() as db:
-            ids = [r[0] for r in db.execute("SELECT thread_id FROM bindings WHERE state='working' AND paused=0")]
-        for thread_id in ids:
-            state.arm(thread_id)
-        try:
+                        raise
+                    watchers.add(task)
+                    def release(done, fd=fd):
+                        loop.remove_reader(fd)
+                        os.close(fd)
+                        watchers.discard(done)
+                    task.add_done_callback(release)
+                else:
+                    state.finish(row['operation_id'], 'interrupted_by_restart')
+            with state.connect() as db:
+                ids = [r[0] for r in db.execute("SELECT thread_id FROM bindings WHERE state='working' AND paused=0")]
+            for thread_id in ids:
+                state.arm(thread_id)
             yield
         finally:
-            state.close()
-            for task in list(watchers):
+            for task in tuple(watchers):
                 task.cancel()
             await asyncio.gather(*watchers, return_exceptions=True)
+            state.close()
             await core._close_all_mcp_connections()
 
+    @asynccontextmanager
+    async def session_lifespan(_):
+        # No global side effects: this context is entered for each MCP session.
+        yield
+
     instructions = '''This is the T3-specific Terminal MCP. Bootstrap using exactly the permanent Terminal MCP ID injected by T3; use it as session_id on every tool call. Unregistered IDs are rejected. Never invent IDs. T3 owns ChatGPT prompts and streaming; Terminal MCP owns task working/done and inactivity recovery. Use schedule_continue with exactly one of after_seconds or wake_at (Unix seconds or timezone-aware ISO-8601), or continue_after_process with a managed process_id, to resume this task when no blocking tools/processes are active. These durable continuations belong to the current task epoch; pause, completion, or a new activation invalidates them. Reuse an idempotency_key to retry scheduling safely. When all requested work is verified, call thread_task(action="complete", evidence=[...]). Intentionally long-lived background processes such as development servers may remain running after explicit completion; completion detaches them from thread-idleness accounting while leaving them controllable. If completion is not called, active processes keep the task working exactly as before. End of model output does not finish the task. For a pending question, call thread_task(action="wait", reason="..."). There are no project scanning, watchdog, scheduled-send, or ChatGPT runtime-control tools here.'''
-    mcp = T3FastMCP('T3 Terminal MCP', instructions=instructions, lifespan=lifespan,
+    mcp = T3FastMCP('T3 Terminal MCP', instructions=instructions, lifespan=session_lifespan,
                     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
     excluded = {'thread_goal', 'refresh_startup_context'}
     for name, tool in core.mcp._tool_manager._tools.items():
@@ -490,6 +496,8 @@ def build(core, state: ThreadState, control_token: str):
 
     import sqlite3
     private = Starlette(routes=[Route('/v1/{action}', control, methods=['GET', 'POST'])])
+    mcp.service_lifespan = service_lifespan
+    mcp.recovery_watchers = watchers
     return mcp, private
 
 
@@ -500,6 +508,13 @@ def build_public_app(core, mcp):
     orchestration surface, so those optional dashboard capabilities stay off.
     """
     app = mcp.streamable_http_app()
+    session_manager_lifespan = app.router.lifespan_context
+    @asynccontextmanager
+    async def app_lifespan(app):
+        async with mcp.service_lifespan(app):
+            async with session_manager_lifespan(app):
+                yield
+    app.router.lifespan_context = app_lifespan
     core.install_usage_dashboard(app, core.GPT_STORE)
     return app
 
