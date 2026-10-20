@@ -453,15 +453,21 @@ def test_public_tools_target_only_injected_terminal_and_observe_process_exit(sta
         await mcp.call_tool('bootstrap_thread', {'thread_id': 'terminal-one', 'cwd': str(tmp_path), 'max_chars': 0})
         result = await mcp.call_tool('start_process', {'session_id': 'terminal-one', 'command': 'sleep 0.15; exit 9', 'cwd': str(tmp_path)})
         assert 'Process ID' in str(result)
-        process = next(p for p in core.processes.values() if p.session_id == 'terminal-one')
-        await mcp.call_tool('continue_after_process', {'session_id': 'terminal-one', 'process_id': process.process_id, 'idempotency_key': 'process'})
+        response = result.content if hasattr(result, 'content') else result[0]
+        response_text = next(part.text for part in response if part.type == 'text')
+        process_id = response_text.split('Process ID: ', 1)[1].splitlines()[0]
+        assert process_id not in core.processes  # no legacy in-memory process
+        await mcp.call_tool('continue_after_process', {'session_id': 'terminal-one', 'process_id': process_id, 'idempotency_key': 'process'})
         assert automations(state)[1]['status'] == 'pending'
-        await asyncio.wait_for(process.process.wait(), 10)
-        await asyncio.sleep(.03)
+        end = time.monotonic() + 10
+        while len(continues(state)) < 2 and time.monotonic() < end:
+            await asyncio.sleep(.03)
         assert len(continues(state)) == 2
-        await mcp.call_tool('continue_after_process', {'session_id': 'terminal-one', 'process_id': process.process_id, 'idempotency_key': 'process'})
+        polled = await mcp.call_tool('poll_process', {'session_id': 'terminal-one', 'process_id': process_id})
+        assert 'Exit Code: 9' in str(polled)
+        await mcp.call_tool('continue_after_process', {'session_id': 'terminal-one', 'process_id': process_id, 'idempotency_key': 'process'})
         assert len(continues(state)) == 2
-        await mcp.call_tool('continue_after_process', {'session_id': 'terminal-one', 'process_id': process.process_id})
+        await mcp.call_tool('continue_after_process', {'session_id': 'terminal-one', 'process_id': process_id})
         assert len(continues(state)) == 3
     asyncio.run(run())
 

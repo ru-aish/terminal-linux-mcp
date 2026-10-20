@@ -237,6 +237,44 @@ def build(core, state: ThreadState, control_token: str):
         if not name.startswith(('agent_', 'chat_runtime_')) and name not in excluded:
             mcp.add_tool(tool.fn, name=tool.name, description=tool.description)
     mcp.remove_tool('run_command')
+    # The legacy background tool trio used an in-memory process registry. Route
+    # new launches through the same durable supervisor as run_command while
+    # preserving access to legacy IDs that predate this upgrade.
+    for name in ('start_process', 'poll_process', 'stop_process'):
+        mcp.remove_tool(name)
+
+    @mcp.tool()
+    async def start_process(command: str, session_id: str = '',
+                            cwd: str | None = None, env: dict[str, str] | None = None,
+                            idempotency_key: str | None = None) -> str:
+        """Start a restart-recoverable process; the caller does not wait for exit."""
+        session = await core._get_session(session_id)
+        async with session.lock:
+            binding = state.require_terminal(session_id)
+            job = await start_durable(binding['thread_id'], session_id, command,
+                                      cwd, env, idempotency_key, detached=True)
+            return format_command(job, 24000)
+
+    @mcp.tool()
+    async def poll_process(process_id: str, max_lines: int = 200,
+                           session_id: str = '') -> str:
+        """Read bounded durable output even when the spawning turn has ended."""
+        binding = state.require_terminal(session_id)
+        if process_id.startswith('proc-'):
+            return await core.poll_process(process_id, max_lines=max_lines,
+                                           session_id=session_id)
+        job = durable_jobs.status(process_id, owner=binding['thread_id'])
+        return format_command(job, max(128, min(24000, max_lines * 160)))
+
+    @mcp.tool()
+    async def stop_process(process_id: str, session_id: str = '') -> str:
+        """Stop the original supervised process, with identity-verified cleanup."""
+        binding = state.require_terminal(session_id)
+        if process_id.startswith('proc-'):
+            return await core.stop_process(process_id, session_id=session_id)
+        job = durable_jobs.stop(process_id, owner=binding['thread_id'])
+        return format_command(job, 24000)
+
 
     @mcp.tool()
     async def run_command(
