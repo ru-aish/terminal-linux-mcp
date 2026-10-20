@@ -7,6 +7,7 @@ import contextvars
 import json
 import os
 import secrets
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +20,7 @@ from starlette.routing import Route
 import uvicorn
 
 from t3_thread_state import ThreadState
+from durable_process_supervisor import DurableProcessSupervisor
 
 CURRENT_OPERATION = contextvars.ContextVar('t3_terminal_operation', default=None)
 
@@ -27,6 +29,10 @@ def build(core, state: ThreadState, control_token: str):
     if not control_token:
         raise ValueError('Private control-plane token must be configured')
     watchers: set[asyncio.Task] = set()
+    durable_jobs = DurableProcessSupervisor(
+        Path(os.environ.get('MCP_T3_DURABLE_JOBS_DIR', str(state.path.parent / 'durable-jobs'))),
+        launch_mode=os.environ.get('MCP_T3_DURABLE_LAUNCH_MODE', 'systemd'),
+    )
 
     class T3FastMCP(core.AccountingFastMCP):
         async def call_tool(self, name, arguments):
@@ -133,6 +139,53 @@ def build(core, state: ThreadState, control_token: str):
         """Continue this task after its managed process exits (any exit code), once blocking tools/processes are idle."""
         binding = state.require_terminal(session_id)
         return json.dumps(state.continue_after_process(binding['thread_id'], process_id, idempotency_key))
+
+
+    @mcp.tool()
+    async def start_durable_process(command: str, idempotency_key: str, session_id: str,
+                                    cwd: str | None = None, env: dict[str, str] | None = None) -> str:
+        """Launch one restart-discoverable background job; retries never launch a second."""
+        binding = state.require_terminal(session_id)
+        session = await core._get_session(session_id)
+        workspace = Path(binding['cwd']).resolve()
+        run_cwd = core._resolve_cwd(cwd, workspace)
+        if not run_cwd.is_relative_to(workspace):
+            raise ValueError('Durable job cwd must remain inside the bound T3 workspace')
+        gate = core._require_project_context(session, run_cwd)
+        if gate:
+            raise ValueError(gate)
+        return json.dumps(durable_jobs.start(command, owner=binding['thread_id'],
+                                             cwd=run_cwd, idempotency_key=idempotency_key, env=env))
+
+    @mcp.tool()
+    async def durable_process_status(job_id: str, session_id: str) -> str:
+        """Read a supervised job's durable identity and exit receipt; never relaunch it."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(durable_jobs.status(job_id, owner=binding['thread_id']))
+
+    @mcp.tool()
+    async def durable_process_output(job_id: str, session_id: str, stream: str = 'stdout',
+                                     offset: int = 0, limit: int = 65536) -> str:
+        """Read a bounded byte range of durable stdout/stderr after an MCP restart."""
+        binding = state.require_terminal(session_id)
+        if stream not in ('stdout', 'stderr'):
+            raise ValueError('stream must be stdout or stderr')
+        return json.dumps(durable_jobs.output(job_id, owner=binding['thread_id'],
+            stdout_offset=offset if stream == 'stdout' else 0,
+            stderr_offset=offset if stream == 'stderr' else 0,
+            max_bytes=limit)[stream])
+
+    @mcp.tool()
+    async def list_durable_processes(session_id: str) -> str:
+        """Discover this thread's persisted jobs without searching projects or spawning."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(durable_jobs.discover(owner=binding['thread_id']))
+
+    @mcp.tool()
+    async def stop_durable_process(job_id: str, session_id: str) -> str:
+        """Request identity-verified termination of a supervised job."""
+        binding = state.require_terminal(session_id)
+        return json.dumps(durable_jobs.stop(job_id, owner=binding['thread_id']))
 
     original_spawn = core._spawn_workload
     async def spawn(*args, **kwargs):
