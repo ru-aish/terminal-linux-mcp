@@ -482,7 +482,7 @@ def test_startup_process_recovery_delivers_attached_continuation(state, core, li
                 await process.wait()
             restarted = ThreadState(state.path, inactivity_seconds=3600)
             mcp, _ = build(core, restarted, 'test-token')
-            async with mcp.settings.lifespan(mcp):
+            async with mcp.service_lifespan(mcp):
                 if live:
                     assert not continues(restarted)
                     process.stdin.close()
@@ -496,4 +496,116 @@ def test_startup_process_recovery_delivers_attached_continuation(state, core, li
             if process.returncode is None:
                 process.kill()
             await process.wait()
+    asyncio.run(run())
+
+
+def test_repeated_mcp_sessions_share_one_recovery_observer(state, core, tmp_path, monkeypatch):
+    """Hundreds of client lifetimes must not each acquire the same pidfd."""
+    import os
+    from unittest.mock import AsyncMock
+    from t3_terminal_server import build, build_public_app
+
+    async def run():
+        state.activate('thread-one', 'activate')
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-c', 'import sys; sys.stdin.read()', stdin=asyncio.subprocess.PIPE,
+        )
+        close_connections = AsyncMock()
+        monkeypatch.setattr(core, '_close_all_mcp_connections', close_connections)
+        opened = []
+        original_open = os.pidfd_open
+        monkeypatch.setattr(os, 'pidfd_open', lambda pid: (opened.append(pid), original_open(pid))[1])
+        mcp = None
+        try:
+            state.begin('thread-one', 'recover-me', 'process', process.pid,
+                        core.read_process_start_ticks(process.pid), process_id='recorded')
+            mcp, _ = build(core, state, 'test-token')
+            app = build_public_app(core, mcp)
+            async with app.router.lifespan_context(app):
+                assert opened == [process.pid]
+                for _ in range(250):
+                    async with mcp.settings.lifespan(mcp):
+                        assert len(mcp.recovery_watchers) == 1
+                    assert len(opened) == 1
+                    assert not close_connections.await_count
+                process.stdin.close()
+                await asyncio.wait_for(process.wait(), 10)
+                await asyncio.sleep(.03)
+                with state.connect() as db:
+                    assert db.execute('SELECT finished FROM operations WHERE operation_id=?', ('recover-me',)).fetchone()[0]
+                assert not mcp.recovery_watchers
+            assert close_connections.await_count == 1
+            assert len(opened) == 1
+        finally:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+
+    asyncio.run(run())
+
+
+
+def test_shutdown_with_live_recovered_process_closes_observer(state, core, monkeypatch):
+    import os
+    from unittest.mock import AsyncMock
+    from t3_terminal_server import build
+
+    async def run():
+        state.activate('thread-one', 'activate')
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-c', 'import sys; sys.stdin.read()', stdin=asyncio.subprocess.PIPE,
+        )
+        monkeypatch.setattr(core, '_close_all_mcp_connections', AsyncMock())
+        opened = []
+        original_open = os.pidfd_open
+        monkeypatch.setattr(os, 'pidfd_open', lambda pid: (opened.append(original_open(pid)), opened[-1])[1])
+        try:
+            state.begin('thread-one', 'recover-me', 'process', process.pid,
+                        core.read_process_start_ticks(process.pid), process_id='recorded')
+            mcp, _ = build(core, state, 'test-token')
+            async with mcp.service_lifespan(mcp):
+                assert len(mcp.recovery_watchers) == 1
+                assert process.returncode is None
+            assert not mcp.recovery_watchers
+            assert opened and all(not os.path.exists(f'/proc/self/fd/{fd}') for fd in opened)
+            assert process.returncode is None
+            assert core._close_all_mcp_connections.await_count == 1
+        finally:
+            process.stdin.close()
+            await asyncio.wait_for(process.wait(), 10)
+
+    asyncio.run(run())
+
+
+def test_recovery_partial_startup_failure_releases_pidfd(state, core, monkeypatch):
+    import os
+    from unittest.mock import AsyncMock
+    from t3_terminal_server import build
+
+    async def run():
+        state.activate('thread-one', 'activate')
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-c', 'import sys; sys.stdin.read()', stdin=asyncio.subprocess.PIPE,
+        )
+        monkeypatch.setattr(core, '_close_all_mcp_connections', AsyncMock())
+        opened = []
+        original_open = os.pidfd_open
+        monkeypatch.setattr(os, 'pidfd_open', lambda pid: (opened.append(original_open(pid)), opened[-1])[1])
+        try:
+            state.begin('thread-one', 'recover-me', 'process', process.pid,
+                        core.read_process_start_ticks(process.pid), process_id='recorded')
+            mcp, _ = build(core, state, 'test-token')
+            def fail_arm(_):
+                raise RuntimeError('injected arm failure')
+            monkeypatch.setattr(state, 'arm', fail_arm)
+            with pytest.raises(RuntimeError, match='injected arm failure'):
+                async with mcp.service_lifespan(mcp):
+                    pass
+            assert not mcp.recovery_watchers
+            assert opened and all(not os.path.exists(f'/proc/self/fd/{fd}') for fd in opened)
+            assert core._close_all_mcp_connections.await_count == 1
+        finally:
+            process.stdin.close()
+            await asyncio.wait_for(process.wait(), 10)
+
     asyncio.run(run())
