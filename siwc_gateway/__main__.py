@@ -73,11 +73,15 @@ async def login(no_browser: bool = False) -> None:
 
 def main():
     parser = argparse.ArgumentParser(prog="python -m siwc_gateway", description="Headless ChatGPT-plan login for Terminal MCP")
-    parser.add_argument("action", choices=["login", "status"])
+    parser.add_argument("action", choices=["login", "status", "serve"])
+    parser.add_argument("--port", type=int, default=8768, help="Loopback port for the standalone HTTP daemon")
     parser.add_argument("--no-browser", action="store_true", help="Print authorization URL instead of opening a browser")
     args = parser.parse_args()
     try:
-        if args.action == "login":
+        if args.action == "serve":
+            from .standalone import serve
+            serve(port=args.port)
+        elif args.action == "login":
             asyncio.run(login(args.no_browser))
         else:
             record = CredentialStore().load()

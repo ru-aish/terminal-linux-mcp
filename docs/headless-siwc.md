@@ -30,7 +30,7 @@ Add `MCP_SIWC_ENABLED=1` **only to an isolated test deployment** of `t3_terminal
 
 SSE streams preserve upstream `response.*` events and include gateway status events. **Only** `response.completed` indicates success; `response.failed`, `response.incomplete`, network interruption and explicit cancellation are not successes. A stream without a terminal event ends with `gateway.failed`.
 
-This prototype deliberately does not implement a T3 provider adapter, ChatGPT conversation import/history, durable conversation persistence, unsupported hosted OpenAI tools or Android packaging. The first deployment should remain isolated until the T3 adapter supports these endpoints and lifecycle guarantees. Existing ChatGPT UI provider remains unchanged.
+The standalone daemon now implements **local**, durable conversation persistence and resumable session APIs; it still does not implement a T3 Code provider adapter, import ChatGPT account history, expose unsupported hosted OpenAI tools, or package an Android APK. The first deployment should remain isolated until the T3 adapter supports these endpoints and lifecycle guarantees. Existing ChatGPT UI provider remains unchanged.
 
 ### Sources
 
@@ -51,7 +51,7 @@ The authorized SIWC token is for **documented `/v1/models` and `/v1/responses` u
 | Function calls and tool-result continuation | Namespaced `function`/`custom`, full client-owned input history | Live-verified with local echo and a second request |
 | In-flight HTTP request cancellation | Private `/v1/siwc/cancel/{request_id}` | Mocked concurrent cancellation test; not yet live-verified |
 | Authenticated status/feature discovery | Private `/v1/siwc/status` and `/v1/siwc/capabilities` | Tested |
-| Durable local conversation history/resume | To be implemented by T3 local session adapter | Not implemented here |
+| Durable local conversation history/resume | Standalone `/v1/siwc/sessions` APIs and SQLite | Live two-turn and restart verified |
 | ChatGPT account conversation history, native hosted connectors | Not granted by SIWC | Unavailable |
 | Image-generation/hosted file-search/hosted Code Interpreter/native computer-use APIs | Not supported by SIWC plan usage | Unavailable; use separate authorized services or local application tools |
 
@@ -75,4 +75,8 @@ The previous experimental direct worker (`chat_direct_worker.mjs`) relied on pri
 | ChatGPT project/gizmo and hosted plugins | Cannot be recreated with SIWC grant; implement app-owned equivalents if needed |
 | Sentinel or ChatGPT browser challenge endpoints | Not part of this architecture; no calls required |
 
-The remaining **engineering task** is connecting T3's provider driver to these local daemon methods, using the existing T3 thread store for durable chat/project operations, and wiring explicit cancellation and tool outputs to its orchestration events. Then the standalone daemon can be packaged for Linux/Android. This is not native ChatGPT chat/account endpoint parity: importing or modifying ChatGPT's own chat history requires a separately supported delegated API permission that SIWC currently does not provide.
+The remaining **integration task** is connecting T3's provider driver to these local daemon methods, using the existing T3 thread store for durable chat/project operations, and wiring explicit cancellation and tool outputs to its orchestration events. Then the standalone daemon can be packaged for Linux/Android. This is not native ChatGPT chat/account endpoint parity: importing or modifying ChatGPT's own chat history requires a separately supported delegated API permission that SIWC currently does not provide.
+
+## Standalone daemon and live proof
+
+See [standalone-siwc-proof.md](standalone-siwc-proof.md) for minimal dependencies, local session APIs, repeatable live smoke tests, and explicit feature boundaries.

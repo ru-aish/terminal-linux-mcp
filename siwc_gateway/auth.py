@@ -124,12 +124,16 @@ class CredentialStore:
                 new = response.json()
             except (httpx.HTTPError, ValueError) as exc:
                 raise AuthError("ChatGPT token renewal failed; sign in again if necessary") from exc
-            if not new.get("access_token") or not new.get("refresh_token"):
-                raise AuthError("ChatGPT token renewal omitted required credentials")
-            scopes = str(new.get("scope", "")).split()
-            if REQUIRED_SCOPE not in scopes:
+            if not isinstance(new, dict) or not isinstance(new.get("access_token"), str) or not new["access_token"]:
+                raise AuthError("ChatGPT token renewal omitted an access token")
+            # RFC 6749: a refresh response may omit scope and refresh_token.
+            # An explicit reduced scope must still be rejected, never silently restored.
+            refresh_token = new.get("refresh_token", record["refresh_token"])
+            scopes = new.get("scope")
+            scopes = str(scopes).split() if scopes is not None else record["scopes"]
+            if not isinstance(refresh_token, str) or not refresh_token or REQUIRED_SCOPE not in scopes:
                 raise AuthError("Renewed grant does not permit ChatGPT plan usage")
-            record.update(access_token=new["access_token"], refresh_token=new["refresh_token"],
+            record.update(access_token=new["access_token"], refresh_token=refresh_token,
                           scopes=scopes, expires_in=int(new.get("expires_in", 3600)),
                           saved_at=time.time())
             self.save(record)

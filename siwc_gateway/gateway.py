@@ -21,7 +21,7 @@ from .auth import AuthError, CredentialStore, RESOURCE
 
 
 def _event(kind: str, value: dict[str, Any]) -> bytes:
-    return ("event: " + kind + "\ndata: " + json.dumps(value, separators=(",", ":")) + "\n\n").encode()
+    return ("event: " + kind + "\ndata: " + json.dumps({"type": kind, **value}, separators=(",", ":")) + "\n\n").encode()
 
 
 def _validate_response_body(body: Any) -> dict[str, Any]:
@@ -63,9 +63,11 @@ def _validate_response_body(body: Any) -> dict[str, Any]:
                 raise ValueError("reasoning replay items require an id")
         else:
             raise ValueError("Unsupported Responses input item")
-    allowed = {"model", "input", "instructions", "reasoning", "tools", "tool_choice"}
+    allowed = {"model", "input", "instructions", "reasoning", "tools", "tool_choice", "include"}
     if set(body) - allowed:
         raise ValueError("Unsupported parameter for ChatGPT-plan inference")
+    if "include" in body and body["include"] != ["reasoning.encrypted_content"]:
+        raise ValueError("Only encrypted reasoning replay may be included")
     if "instructions" in body and not isinstance(body["instructions"], str):
         raise ValueError("instructions must be text")
     if "reasoning" in body and not isinstance(body["reasoning"], dict):
@@ -78,7 +80,7 @@ def _validate_response_body(body: Any) -> dict[str, Any]:
             raise ValueError("tools must be objects")
         if tool.get("type") == "namespace":
             nested = tool.get("tools")
-            if not isinstance(tool.get("name"), str) or not tool["name"] or not isinstance(nested, list) or not nested or len(nested) > 50:
+            if not isinstance(tool.get("name"), str) or not tool["name"] or not isinstance(tool.get("description"), str) or not isinstance(nested, list) or not nested or len(nested) > 50:
                 raise ValueError("tool namespace requires a name and nonempty tools")
             if any(not isinstance(t, dict) or t.get("type") not in ("function", "custom") or not isinstance(t.get("name"), str) for t in nested):
                 raise ValueError("namespaces may contain only function or custom tools")
@@ -184,10 +186,11 @@ class SIWCGateway:
 
         request_id = str(uuid.uuid4())
         cancelled = asyncio.Event()
-        self.active[request_id] = (cancelled, None)
 
         async def output() -> AsyncIterator[bytes]:
             terminal = False
+            # Do not register before the iterator begins: a disconnect before
+            # response-header delivery must not leave a permanent active entry.
             self.active[request_id] = (cancelled, asyncio.current_task())
             try:
                 if cancelled.is_set():
@@ -200,7 +203,20 @@ class SIWCGateway:
                                              headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
                                              json=body) as response:
                         if response.status_code != 200:
-                            yield _event("gateway.failed", {"request_id": request_id, "upstream_status": response.status_code})
+                            failure = {"request_id": request_id, "upstream_status": response.status_code}
+                            # Preserve machine-readable errors, never echo the upstream message
+                            # (which may contain private user prompts or credential context).
+                            try:
+                                payload = await response.aread()
+                                error = json.loads(payload).get("error", {})
+                                if isinstance(error, dict):
+                                    for field in ("code", "param"):
+                                        value = error.get(field)
+                                        if isinstance(value, str) and len(value) <= 128:
+                                            failure["upstream_" + field] = value
+                            except (ValueError, TypeError):
+                                pass
+                            yield _event("gateway.failed", failure)
                             return
                         buffer: list[str] = []
                         async for line in response.aiter_lines():
@@ -212,9 +228,16 @@ class SIWCGateway:
                                 continue
                             if not buffer:
                                 continue
-                            frame = "\n".join(buffer)
-                            buffer.clear()
-                            data = next((part[5:].strip() for part in frame.splitlines() if part.startswith("data:")), None)
+                            frame = buffer
+                            buffer = []
+                            # SSE data fields are joined with newlines; reading
+                            # only the first one corrupts valid multiline JSON.
+                            fields = []
+                            for part in frame:
+                                if part.startswith("data:"):
+                                    value = part[5:]
+                                    fields.append(value[1:] if value.startswith(" ") else value)
+                            data = "\n".join(fields)
                             if not data or data == "[DONE]":
                                 continue
                             try:

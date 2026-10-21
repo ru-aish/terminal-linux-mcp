@@ -1,0 +1,5 @@
+# Minimal standalone daemon dependencies; no ChatGPT Desktop or Codex packages.
+httpx>=0.28,<1
+starlette>=1.2,<2
+uvicorn>=0.48,<1
+PyJWT[crypto]>=2.10,<3

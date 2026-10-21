@@ -389,3 +389,79 @@ def test_cancel_active_upstream_does_not_complete(tmp_path):
             await asyncio.wait_for(stream_closed.wait(), 3)
             assert gateway.active == {}
     asyncio.run(test())
+
+
+def test_oauth_refresh_preserves_optional_fields_and_rejects_reduced_scope(tmp_path):
+    store = CredentialStore(tmp_path / "siwc")
+    record(store, saved_at=0)
+    answer = {"access_token": "refreshed-access", "expires_in": 3600}
+    def upstream(_request):
+        return httpx.Response(200, json=answer)
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as client:
+            assert await store.access_token(client) == "refreshed-access"
+            saved = store.load()
+            assert saved["refresh_token"] == "mock-secret-refresh"
+            assert "chatgpt.tokens.use.direct" in saved["scopes"]
+            saved["saved_at"] = 0
+            store.save(saved)
+            answer.update(access_token="reduced-access", scope="openid email")
+            with pytest.raises(AuthError, match="does not permit"):
+                await store.access_token(client)
+            assert store.load()["access_token"] == "refreshed-access"
+    asyncio.run(run())
+
+
+def test_encrypted_reasoning_include_acceptance_and_strict_allowlist():
+    from siwc_gateway.gateway import _validate_response_body
+    body = {"model": "gpt-6-astra", "input": [{"role": "user", "content": "Hi"}],
+            "include": ["reasoning.encrypted_content"]}
+    prepared = _validate_response_body(body)
+    assert prepared["include"] == ["reasoning.encrypted_content"]
+    assert prepared["store"] is False
+    for invalid in ["reasoning.encrypted_content", [], ["file_search_call.results"],
+                    ["reasoning.encrypted_content", "file_search_call.results"]]:
+        with pytest.raises(ValueError, match="encrypted reasoning"):
+            _validate_response_body({**body, "include": invalid})
+
+
+def test_multiline_sse_data_is_parsed_as_one_valid_event(tmp_path):
+    store = CredentialStore(tmp_path / "siwc")
+    record(store)
+    # A standard SSE frame can contain several data fields; together they
+    # represent one JSON document with a newline between the fragments.
+    multiline = ('event: response.completed\n'
+                 'data: {"type": "response.completed",\n'
+                 'data: "response": {"output": []}}\n\n')
+    gateway = SIWCGateway("local-control-token", store,
+                          httpx.MockTransport(lambda _: httpx.Response(200, text=multiline)))
+    app = Starlette(routes=gateway.routes())
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://local") as c:
+            r = await c.post("/v1/siwc/responses", headers={"Authorization": "Bearer local-control-token"},
+                             json={"model": "gpt-6-astra", "input": [{"role": "user", "content": "Hi"}]})
+            assert "event: response.completed" in r.text
+            assert "gateway.failed" not in r.text
+        assert gateway.active == {}
+    asyncio.run(run())
+
+
+def test_unstarted_stream_never_registers_live_request(tmp_path):
+    store = CredentialStore(tmp_path / "siwc")
+    record(store)
+    gateway = SIWCGateway("local-control-token", store, httpx.MockTransport(lambda _: httpx.Response(200)))
+    class Request:
+        headers = {"authorization": "Bearer local-control-token"}
+        async def body(self):
+            return b'{"model":"gpt-6-astra","input":[{"role":"user","content":"Hi"}]}'
+    async def run():
+        result = await gateway.responses(Request())
+        assert isinstance(result, StreamingResponse)
+        assert result.headers["X-Inference-Request-Id"]
+        # A lost client before the ASGI server calls the iterator has no task
+        # to cancel and must not leave an active record indefinitely.
+        assert gateway.active == {}
+        await result.body_iterator.aclose()
+        assert gateway.active == {}
+    from starlette.responses import StreamingResponse
+    asyncio.run(run())
