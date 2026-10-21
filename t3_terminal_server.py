@@ -200,7 +200,12 @@ def build(core, state: ThreadState, control_token: str):
             return JSONResponse({'error': str(exc)}, status_code=409)
 
     import sqlite3
-    private = Starlette(routes=[Route('/v1/{action}', control, methods=['GET', 'POST'])])
+    private_routes = [Route('/v1/{action}', control, methods=['GET', 'POST'])]
+    # Separate, opt-in headless inference. Never expose OAuth bearer tokens on /mcp.
+    if os.environ.get('MCP_SIWC_ENABLED') == '1':
+        from siwc_gateway.gateway import SIWCGateway
+        private_routes = SIWCGateway(control_token).routes() + private_routes
+    private = Starlette(routes=private_routes)
     return mcp, private
 
 
