@@ -9,6 +9,7 @@ import asyncio
 import json
 import re
 import secrets
+import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -24,6 +25,11 @@ def _event(kind: str, value: dict[str, Any]) -> bytes:
 
 
 def _validate_response_body(body: Any) -> dict[str, Any]:
+    """Validate the direct SIWC subset; reject unsupported API capabilities early.
+
+    Keeping this strict avoids sending parameters reserved for paid API keys or
+    private ChatGPT endpoints. The caller owns the full stateless input history.
+    """
     if not isinstance(body, dict) or not isinstance(body.get("model"), str) or not body["model"] or len(body["model"]) > 160:
         raise ValueError("model must be a nonempty model slug")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", body["model"]):
@@ -31,20 +37,55 @@ def _validate_response_body(body: Any) -> dict[str, Any]:
     messages = body.get("input")
     if not isinstance(messages, list) or not messages or len(messages) > 200:
         raise ValueError("input must be a nonempty array with at most 200 messages")
-    # Direct SIWC usage does not accept system-role messages. Keep full history
-    # client-owned; no previous_response_id or server-side ChatGPT chat access.
+    # The public Responses API uses typed tool-call/output input items, not
+    # role=tool chat-completion messages. Reasoning items must be replayed on
+    # follow-up turns when provided by the model.
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant", "developer", "tool"):
-            raise ValueError("input must contain supported messages, not system messages")
-        if not isinstance(message.get("content"), (str, list)):
-            raise ValueError("input message content must be text or a typed content array")
-    allowed = {"model", "input", "instructions", "reasoning"}
+        if not isinstance(message, dict):
+            raise ValueError("input items must be objects")
+        if "role" in message:
+            if message.get("type", "message") != "message" or message["role"] not in ("user", "assistant", "developer"):
+                raise ValueError("Unsupported input message role or type")
+            content = message.get("content")
+            if not isinstance(content, (str, list)) or (isinstance(content, list) and
+                    (not content or len(content) > 32 or any(
+                        not isinstance(part, dict) or part.get("type") not in
+                        ("input_text", "output_text", "input_image", "input_file") for part in content))):
+                raise ValueError("message content must be text or supported text/image/file items")
+        elif message.get("type") in ("function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"):
+            if not isinstance(message.get("call_id"), str) or not message["call_id"]:
+                raise ValueError("tool call items require call_id")
+            if message["type"].endswith("_output") and not isinstance(message.get("output"), (str, list)):
+                raise ValueError("tool output must be text or supported content")
+        elif message.get("type") == "reasoning":
+            # Model-returned reasoning items carry replay state; never modify.
+            if not isinstance(message.get("id"), str):
+                raise ValueError("reasoning replay items require an id")
+        else:
+            raise ValueError("Unsupported Responses input item")
+    allowed = {"model", "input", "instructions", "reasoning", "tools", "tool_choice"}
     if set(body) - allowed:
         raise ValueError("Unsupported parameter for ChatGPT-plan inference")
     if "instructions" in body and not isinstance(body["instructions"], str):
         raise ValueError("instructions must be text")
     if "reasoning" in body and not isinstance(body["reasoning"], dict):
         raise ValueError("reasoning must be an object")
+    tools = body.get("tools", [])
+    if not isinstance(tools, list) or len(tools) > 25:
+        raise ValueError("tools must be an array of at most 25 supported tool groups")
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise ValueError("tools must be objects")
+        if tool.get("type") == "namespace":
+            nested = tool.get("tools")
+            if not isinstance(tool.get("name"), str) or not tool["name"] or not isinstance(nested, list) or not nested or len(nested) > 50:
+                raise ValueError("tool namespace requires a name and nonempty tools")
+            if any(not isinstance(t, dict) or t.get("type") not in ("function", "custom") or not isinstance(t.get("name"), str) for t in nested):
+                raise ValueError("namespaces may contain only function or custom tools")
+        elif tool.get("type") not in ("web_search", "web_search_preview"):
+            raise ValueError("Unsupported hosted tool; use local function/custom tools")
+    if "tool_choice" in body and not isinstance(body["tool_choice"], (dict, str)):
+        raise ValueError("tool_choice must be a string or supported tool choice object")
     return {**body, "store": False, "stream": True}
 
 
@@ -63,10 +104,40 @@ class SIWCGateway:
 
     def routes(self) -> list[Route]:
         return [
+            Route("/v1/siwc/status", self.status, methods=["GET"]),
+            Route("/v1/siwc/capabilities", self.capabilities, methods=["GET"]),
             Route("/v1/siwc/models", self.models, methods=["GET"]),
             Route("/v1/siwc/responses", self.responses, methods=["POST"]),
             Route("/v1/siwc/cancel/{request_id}", self.cancel, methods=["POST"]),
         ]
+
+    async def status(self, request):
+        if not self._authorized(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        try:
+            record = self.store.load()
+        except AuthError:
+            return JSONResponse({"authenticated": False, "plan_usage_granted": False})
+        # Never include identity, access/refresh tokens, or the on-disk path.
+        granted = "chatgpt.tokens.use.direct" in record.get("scopes", [])
+        expiry = float(record.get("saved_at", 0)) + int(record.get("expires_in", 0))
+        return JSONResponse({"authenticated": bool(record.get("client_id")),
+                             "plan_usage_granted": granted,
+                             "token_refresh_needed": time.time() >= expiry - 300})
+
+    async def capabilities(self, request):
+        if not self._authorized(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        # Authenticated caller can feature-detect supported behavior without
+        # probing undocumented ChatGPT endpoints or receiving credentials.
+        return JSONResponse({
+            "upstream": "public_responses_api",
+            "methods": ["models", "responses_stream", "cancel_request"],
+            "inputs": ["text", "images", "files", "function_call_output", "reasoning_replay"],
+            "tools": ["namespace_function", "namespace_custom", "web_search_if_available"],
+            "conversation_state": "client_owned_full_history",
+            "not_available": ["chatgpt_conversation_history", "hosted_connectors", "native_computer_use", "file_upload_api", "audio_video"],
+        })
 
     def client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=self.transport, timeout=httpx.Timeout(45, read=None))

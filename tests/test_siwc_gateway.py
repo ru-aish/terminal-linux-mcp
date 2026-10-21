@@ -233,6 +233,8 @@ def test_opt_in_route_only_on_private_t3_plane(tmp_path, monkeypatch):
     try:
         public, private = build(core, state, "test-control-token")
         paths = [route.path for route in private.routes]
+        assert "/v1/siwc/status" in paths
+        assert "/v1/siwc/capabilities" in paths
         assert "/v1/siwc/models" in paths
         assert "/v1/siwc/responses" in paths
         assert "/v1/siwc/cancel/{request_id}" in paths
@@ -247,3 +249,143 @@ def test_invalid_credential_payload_fails_safely(tmp_path):
     store.credentials_path.write_text("{not-json}")
     with pytest.raises(AuthError, match="not valid JSON"):
         store.load()
+
+
+def test_capabilities_are_private_and_report_actual_limits(tmp_path):
+    gateway, app, _ = mock_service(tmp_path, [])
+    async def test():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://local") as client:
+            assert (await client.get("/v1/siwc/capabilities")).status_code == 401
+            result = await client.get("/v1/siwc/capabilities", headers={"Authorization": "Bearer local-control-token"})
+            assert result.status_code == 200
+            assert "namespace_function" in result.json()["tools"]
+            assert "chatgpt_conversation_history" in result.json()["not_available"]
+    asyncio.run(test())
+
+
+def test_function_call_roundtrip_preserves_client_owned_history(tmp_path):
+    store = CredentialStore(tmp_path / "siwc")
+    record(store)
+    recorded = []
+    function = {"type": "namespace", "name": "local", "description": "Local tools", "tools": [{
+        "type": "function", "name": "echo", "description": "Echo text", "strict": True,
+        "parameters": {"type": "object", "properties": {"message": {"type": "string"}},
+                       "required": ["message"], "additionalProperties": False},
+    }]}
+    call = {"type": "function_call", "call_id": "call_example", "name": "echo", "arguments": '{"message":"hello"}'}
+    def event(kind, extra=None):
+        return f"event: {kind}\ndata: {json.dumps({'type': kind, **(extra or {})})}\n\n"
+    def upstream(request):
+        body = json.loads(request.content)
+        recorded.append(body)
+        if len(recorded) == 1:
+            stream = event("response.output_item.done", {"item": call}) + event("response.completed")
+        else:
+            stream = event("response.output_text.delta", {"delta": "ECHO_OK"}) + event("response.completed")
+        return httpx.Response(200, text=stream)
+
+    gateway = SIWCGateway("local-control-token", store, httpx.MockTransport(upstream))
+    app = Starlette(routes=gateway.routes())
+    async def test():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://local") as client:
+            headers = {"Authorization": "Bearer local-control-token"}
+            user = {"role": "user", "content": "Echo hello"}
+            first = await client.post("/v1/siwc/responses", headers=headers,
+                                      json={"model": "test-model", "input": [user], "tools": [function]})
+            assert first.status_code == 200
+            assert "response.output_item.done" in first.text
+            assert '"call_id":"call_example"' in first.text
+            history = [user, call, {"type": "function_call_output", "call_id": "call_example", "output": "hello"}]
+            second = await client.post("/v1/siwc/responses", headers=headers,
+                                       json={"model": "test-model", "input": history, "tools": [function]})
+            assert second.status_code == 200
+            assert "ECHO_OK" in second.text
+            assert "event: response.completed" in second.text
+            assert gateway.active == {}
+    asyncio.run(test())
+    assert len(recorded) == 2
+    assert recorded[0]["tools"] == recorded[1]["tools"] == [function]
+    assert recorded[1]["input"][-1]["output"] == "hello"
+    assert all(x["store"] is False and x["stream"] is True for x in recorded)
+
+
+def test_disallow_non_siwc_endpoints_and_unsupported_tools(tmp_path):
+    gateway, app, upstream = mock_service(tmp_path, [])
+    body = {"model": "test-model", "input": [{"role": "user", "content": "Hi"}]}
+    invalid = [
+        {**body, "tools": [{"type": "file_search"}]},
+        {**body, "tools": [{"type": "function", "name": "echo"}]},
+        {**body, "tools": [{"type": "namespace", "name": "x", "tools": [{"type": "tool_search"}]}]},
+        {**body, "input": [{"role": "tool", "content": "Hello"}]},
+        {**body, "input": [{"type": "function_call_output", "output": "missing call id"}]},
+        {**body, "input": [{"role": "user", "content": [{"type": "input_audio", "audio": "invalid"}]}]},
+        {**body, "previous_response_id": "not-supported"},
+    ]
+    async def test():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://local") as client:
+            for rejected in invalid:
+                response = await client.post("/v1/siwc/responses", headers={"Authorization": "Bearer local-control-token"}, json=rejected)
+                assert response.status_code == 400, response.text
+    asyncio.run(test())
+    assert not upstream
+
+
+def test_status_is_private_and_never_returns_credentials(tmp_path):
+    gateway, app, _ = mock_service(tmp_path, [])
+    async def test():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://local") as client:
+            assert (await client.get("/v1/siwc/status")).status_code == 401
+            result = await client.get("/v1/siwc/status", headers={"Authorization": "Bearer local-control-token"})
+            assert result.status_code == 200
+            assert result.json()["authenticated"] and result.json()["plan_usage_granted"]
+            assert "mock-secret-access" not in result.text and "mock-secret-refresh" not in result.text
+            gateway.store.credentials_path.unlink()
+            missing = await client.get("/v1/siwc/status", headers={"Authorization": "Bearer local-control-token"})
+            assert missing.status_code == 200
+            assert missing.json()["authenticated"] is False
+    asyncio.run(test())
+
+
+def test_cancel_active_upstream_does_not_complete(tmp_path):
+    store = CredentialStore(tmp_path / "siwc")
+    record(store)
+    started = asyncio.Event()
+    stream_closed = asyncio.Event()
+
+    class SuspendedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            try:
+                yield b'event: response.created\ndata: {"type":"response.created"}\n\n'
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                stream_closed.set()
+        async def aclose(self):
+            stream_closed.set()
+
+    def upstream(request):
+        return httpx.Response(200, stream=SuspendedStream())
+
+    gateway = SIWCGateway("local-control-token", store, httpx.MockTransport(upstream))
+    app = Starlette(routes=gateway.routes())
+
+    async def test():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://local", timeout=5) as client:
+            headers = {"Authorization": "Bearer local-control-token"}
+            pending = asyncio.create_task(client.post('/v1/siwc/responses', headers=headers,
+                json={"model": "test-model", "input": [{"role": "user", "content": "Hello"}]}))
+            await asyncio.wait_for(started.wait(), 3)
+            assert len(gateway.active) == 1
+            rid = next(iter(gateway.active))
+            cancelled = await client.post(f'/v1/siwc/cancel/{rid}', headers=headers)
+            assert cancelled.status_code == 200
+            assert cancelled.json()["cancellationRequested"] is True
+            try:
+                result = await asyncio.wait_for(pending, 3)
+            except asyncio.CancelledError:
+                pass  # A disconnected downstream may receive cancellation directly.
+            else:
+                assert 'response.completed' not in result.text
+            await asyncio.wait_for(stream_closed.wait(), 3)
+            assert gateway.active == {}
+    asyncio.run(test())
