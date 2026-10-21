@@ -1149,13 +1149,23 @@ class InternalChatClient:
             f"const resolved = await resolveClient(); const id = {json.dumps(conversation_id)};"
             "const handle = handles.get(id);"
             "try {"
-            " if (handle && typeof handle.cancel === 'function') await handle.cancel();"
-            " else if (typeof resolved.client.stopCompletion === 'function') await resolved.client.stopCompletion({conversationId:id});"
-            " else if (typeof resolved.client.cancelStream === 'function') await resolved.client.cancelStream(id);"
-            " else return {cancelled:false, reason:'cancel is unavailable'};"
-            " streams.delete(id); handles.delete(id); return {cancelled:true, reason:''};"
-            "} catch { return {cancelled:false, reason:'cancel failed'}; }",
+            " if (handle && typeof handle.cancel === 'function') {"
+            "   const result = await handle.cancel();"
+            "   if (result === false || result?.cancelled === false) return {cancelled:false, reason:'stream handle rejected cancellation'};"
+            "   streams.delete(id); handles.delete(id); return {cancelled:true, reason:''};"
+            " }"
+            " if (typeof resolved.client.stopCompletion === 'function') {"
+            "   const result = await resolved.client.stopCompletion({conversationId:id});"
+            "   if (result === false || result?.cancelled === false) return {cancelled:false, reason:'renderer rejected stop request'};"
+            "   return {cancelled:false, stop_requested:true, reason:'renderer stop requested, but no owned stream or canonical stop confirmation'};"
+            " }"
+            " return {cancelled:false, reason:'no owned stream and renderer stop is unavailable'};"
+            "} catch (error) { return {cancelled:false, reason:'stop request failed: '+String(error?.message || error).slice(0,160)}; }",
             retry_on_transport=False,
             timeout=max(self.timeout, 15.0),
         )
-        return payload if isinstance(payload, dict) else {"cancelled": False, "reason": "invalid result"}
+        if not isinstance(payload, dict):
+            return {"cancelled": False, "reason": "invalid result"}
+        if payload.get("reason"):
+            payload["reason"] = sanitize_runtime_error(payload["reason"])
+        return payload

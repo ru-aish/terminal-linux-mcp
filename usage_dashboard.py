@@ -114,7 +114,13 @@ def install_usage_dashboard(
     async def dashboard_page(request: Request) -> Response:
         if not _authorized(request):
             return _unauthorized_page()
-        return _security_headers(FileResponse(ASSET_DIR / "index.html", media_type="text/html"))
+        page = (ASSET_DIR / "index.html").read_text(encoding="utf-8")
+        capabilities = (
+            f'data-watchdog-enabled="{str(watchdog is not None).lower()}" '
+            f'data-agents-enabled="{str(agent_coordinator is not None).lower()}"'
+        )
+        page = page.replace("<body>", f"<body {capabilities}>", 1)
+        return _security_headers(HTMLResponse(page))
 
     async def agents_page(request: Request) -> Response:
         if agent_coordinator is None:
