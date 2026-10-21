@@ -533,6 +533,44 @@ def test_conversation_reset_preserves_detached_process_event_and_fences_native_e
     asyncio.run(run())
 
 
+def test_mcp_inventory_is_injected_from_authenticated_workspace_without_secrets(state, core, tmp_path, monkeypatch):
+    import httpx
+    from t3_terminal_server import build
+
+    roots = []
+
+    def manifest(root):
+        roots.append(root)
+        return [
+            {'name': 'configured-browser', 'transport': 'stdio', 'status': 'configured',
+             'source': '/private/secret-path', 'endpoint': 'private-token'},
+            {'name': 'disabled-recursive', 'transport': 'stdio', 'status': 'blocked_recursive'},
+        ]
+
+    monkeypatch.setattr(core, '_configured_mcp_manifest', manifest)
+
+    async def run():
+        _, control = build(core, state, 'test-token')
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=control),
+                                    base_url='http://test') as client:
+            body = {'threadId': 'thread-one', 'environmentId': 'test-env',
+                    'providerId': 'chatgpt', 'cwd': '/untrusted'}
+            assert (await client.post('/v1/mcp-inventory', json=body)).status_code == 401
+            headers = {'authorization': 'Bearer test-token'}
+            assert (await client.post('/v1/mcp-inventory', json={**body, 'providerId': 'other'},
+                                      headers=headers)).status_code == 409
+            response = await client.post('/v1/mcp-inventory', json=body, headers=headers)
+            assert response.status_code == 200, response.text
+            assert response.json() == {'servers': [
+                {'name': 'configured-browser', 'transport': 'stdio', 'status': 'configured'},
+                {'name': 'disabled-recursive', 'transport': 'stdio', 'status': 'blocked_recursive'},
+            ]}
+            assert roots == [tmp_path.resolve()]
+            assert 'private-token' not in response.text
+
+    asyncio.run(run())
+
+
 def test_authenticated_control_reset_is_scoped_to_original_t3_binding(state, core):
     import uuid
     import httpx

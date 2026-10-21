@@ -673,6 +673,14 @@ def build(core, state: ThreadState, control_token: str):
                     result = state.pause(body['threadId'], body['requestId'])
                 elif action == 'get':
                     result = binding
+                elif action == 'mcp-inventory':
+                    # Trust only the authenticated binding, never a supplied cwd.
+                    # Return names and status, not paths, env vars or credentials.
+                    root = core._find_project_root(Path(binding['cwd']).resolve())
+                    result = {'servers': [
+                        {'name': row['name'], 'transport': row['transport'], 'status': row['status']}
+                        for row in core._configured_mcp_manifest(root)
+                    ]}
                 else:
                     return JSONResponse({'error': 'Unknown action'}, status_code=404)
             return JSONResponse(result or {'ok': True})
