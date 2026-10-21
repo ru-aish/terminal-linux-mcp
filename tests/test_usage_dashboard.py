@@ -96,6 +96,8 @@ def test_dashboard_routes_assets_api_and_cookie_auth(tmp_path, monkeypatch):
         page = client.get("/dashboard")
         assert page.status_code == 200
         assert "Usage ledger" in page.text
+        assert 'data-watchdog-enabled="false"' in page.text
+        assert 'data-agents-enabled="false"' in page.text
         assert page.headers["cache-control"] == "no-store"
 
         css = client.get("/dashboard/assets/dashboard.css")
@@ -104,6 +106,7 @@ def test_dashboard_routes_assets_api_and_cookie_auth(tmp_path, monkeypatch):
         assert "--exact" in css.text
         assert js.status_code == 200
         assert "EventSource" in js.text
+        assert "features.watchdog" in js.text
 
         api = client.get("/dashboard/api?hours=6")
         assert api.status_code == 200

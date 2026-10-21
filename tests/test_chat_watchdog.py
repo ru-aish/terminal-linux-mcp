@@ -162,6 +162,9 @@ class FakeAdapter:
         self.inspected_conversation_ids: list[str] = []
         self.restored: list[str] = []
         self.forced_sends: list[bool] = []
+        self.stopped: list[str] = []
+        self.stop_result = {"cancelled": True}
+        self.after_stop: ThreadSnapshot | None = None
         self.projects = list(projects or [])
         self.project_threads = {key: list(value) for key, value in (project_threads or {}).items()}
         self.project_list_calls = 0
@@ -240,6 +243,12 @@ class FakeAdapter:
         if result.clicked and not result.parent_message_id:
             result = replace(result, parent_message_id=expected_current_node)
         return result
+
+    async def stop_generation(self, item):
+        self.stopped.append(item.conversation_id)
+        if self.after_stop is not None:
+            self.snapshots[item.conversation_id] = self.after_stop
+        return self.stop_result
 
     async def restore(self, conversation_id):
         self.restored.append(conversation_id)
@@ -2373,3 +2382,192 @@ def test_watchdog_config_keeps_legacy_positional_adapter_argument(tmp_path):
     )
     assert config.adapter_mode == "direct"
     assert config.projects_path is None
+
+
+@pytest.mark.parametrize('active_stream', [False, True])
+def test_running_recovery_after_two_scans_resets_after_send(tmp_path, active_stream):
+    async def run():
+        now = [1000.0]
+        working = canonical_snapshot(running=True, active_stream=active_stream,
+                                     assistant_status='in_progress', assistant_end_turn=False)
+        fake = FakeAdapter(working)
+        fake.after_stop = canonical_snapshot(assistant_status='interrupted')
+        watchdog = make_watchdog(tmp_path, fake, clock=lambda: now[0])
+        await watchdog.scan_once()
+        assert not fake.stopped and not fake.sent
+        # Progress does not indefinitely reset the working-generation limit.
+        fake.snapshot = replace(working, current_node='a-next',
+                                turns=(*working.turns[:-1], replace(working.turns[-1], key='a-next', text='new progress')))
+        now[0] += 600
+        result = await watchdog.scan_once()
+        assert fake.stopped == [link().conversation_id]
+        assert fake.sent == [DEFAULT_CONTINUE_MESSAGE]
+        assert fake.forced_sends == [True]
+        assert result['queue']['entries'][0]['state']['running_scan_count'] == 0
+        fake.snapshots.clear()
+        fake.snapshot = canonical_snapshot(running=True, active_stream=active_stream,
+                                          assistant_status='in_progress', assistant_end_turn=False,
+                                          update_time=now[0])
+        await watchdog.scan_once()
+        assert len(fake.stopped) == 1
+        # A fresh watchdog instance keeps the persisted scan count.
+        restarted = ChatWatchdog(watchdog.config, adapter_factory=lambda: fake, clock=lambda: now[0])
+        await restarted.scan_once()
+        assert len(fake.stopped) == 2
+    asyncio.run(run())
+
+
+def test_running_recovery_twenty_minutes_on_first_observation(tmp_path):
+    async def run():
+        working = canonical_snapshot(running=True, assistant_status='in_progress', assistant_end_turn=False)
+        fake = FakeAdapter(working)
+        fake.after_stop = canonical_snapshot(assistant_status='interrupted')
+        watchdog = make_watchdog(tmp_path, fake, clock=lambda: 2200.0)
+        await watchdog.scan_once()
+        assert fake.stopped == [link().conversation_id]
+        assert fake.sent == [DEFAULT_CONTINUE_MESSAGE]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('case', ['stop_failed', 'still_running', 'completed_before_stop',
+                                  'completed_after_stop', 'new_task', 'unverified', 'draft', 'dry_run'])
+def test_running_recovery_revalidates_before_continuation(tmp_path, case):
+    async def run():
+        working = canonical_snapshot(running=True, assistant_status='in_progress', assistant_end_turn=False)
+        fake = FakeAdapter(working)
+        fake.after_stop = canonical_snapshot(assistant_status='interrupted')
+        watchdog = make_watchdog(tmp_path, fake, dry_run=case == 'dry_run')
+        await watchdog.scan_once()
+        complete = canonical_snapshot(assistant_text='DONE_I_HAVE_COMPLETED_ALL_THE_STEPS')
+        if case == 'stop_failed':
+            fake.stop_result = {'cancelled': False, 'reason': 'stop rejected'}
+        elif case == 'still_running':
+            fake.after_stop = working
+        elif case == 'completed_before_stop':
+            fake.snapshot_sequences[link().conversation_id] = [working, complete]
+        elif case == 'completed_after_stop':
+            fake.after_stop = complete
+        elif case == 'new_task':
+            new = replace(working, turns=(replace(working.turns[0], key='u-new', text='another task'), *working.turns[1:]))
+            fake.snapshot_sequences[link().conversation_id] = [working, new]
+        elif case == 'unverified':
+            fake.snapshot_sequences[link().conversation_id] = [working, replace(working, state_verified=False)]
+        elif case == 'draft':
+            fake.snapshot_sequences[link().conversation_id] = [working, replace(working, composer_text='my draft')]
+        result = await watchdog.scan_once()
+        assert not fake.sent
+        if case in {'completed_before_stop', 'new_task', 'unverified', 'draft', 'dry_run'}:
+            assert not fake.stopped
+        else:
+            assert fake.stopped == [link().conversation_id]
+        if case.startswith('completed'):
+            assert not result['queue']['entries']
+    asyncio.run(run())
+
+
+def test_running_recovery_does_not_count_confirmation_as_another_scan(tmp_path):
+    async def run():
+        stopped = canonical_snapshot()
+        working = canonical_snapshot(running=True, assistant_status='in_progress', assistant_end_turn=False)
+        fake = FakeAdapter(stopped, snapshot_sequences={link().conversation_id: [stopped, working]})
+        watchdog = make_watchdog(tmp_path, fake)
+        await watchdog.scan_once()
+        assert not fake.sent and not fake.stopped
+        assert watchdog.state.get(link().conversation_id).get('running_scan_count', 0) == 0
+    asyncio.run(run())
+
+
+def test_running_recovery_resets_for_new_generation(tmp_path):
+    async def run():
+        working = canonical_snapshot(running=True, assistant_status='in_progress', assistant_end_turn=False)
+        fake = FakeAdapter(working)
+        watchdog = make_watchdog(tmp_path, fake)
+        await watchdog.scan_once()
+        fake.snapshot = replace(working, turns=(replace(working.turns[0], key='u-new'), *working.turns[1:]))
+        await watchdog.scan_once()
+        assert not fake.stopped and not fake.sent
+        assert watchdog.state.get(link().conversation_id)['running_scan_count'] == 1
+    asyncio.run(run())
+
+
+def test_watchdog_adapter_returns_after_dispatch_so_timer_can_scan():
+    from conversation_gateway import DeliveryResult, DeliveryState
+    async def run():
+        class Gateway:
+            async def send(self, *args, **kwargs):
+                self.kwargs = kwargs
+                return DeliveryResult(state=DeliveryState.DELIVERED, running=True)
+            async def cancel(self, conversation_id):
+                self.cancelled_id = conversation_id
+                return {'cancelled': True}
+        adapter = CodexInternalChatAdapter()
+        adapter._gateway = Gateway()
+        result = await adapter.send_continue(link(), DEFAULT_CONTINUE_MESSAGE,
+                                             expected_current_node='a-current')
+        assert result.clicked and result.running
+        assert adapter._gateway.kwargs['wait_for_completion'] is False
+        assert adapter._gateway.kwargs['force'] is False
+        assert await adapter.stop_generation(link()) == {'cancelled': True}
+        assert adapter._gateway.cancelled_id == link().conversation_id
+    asyncio.run(run())
+
+
+def test_running_recovery_with_continuation_as_latest_user(tmp_path):
+    async def run():
+        working = canonical_snapshot(running=True, active_stream=True,
+                                     latest_user_text=DEFAULT_CONTINUE_MESSAGE)
+        fake = FakeAdapter(working)
+        fake.after_stop = replace(working, running=False, active_stream=False)
+        watchdog = make_watchdog(tmp_path, fake)
+        await watchdog.scan_once()
+        await watchdog.scan_once()
+        assert fake.stopped == [link().conversation_id]
+        assert fake.sent == [DEFAULT_CONTINUE_MESSAGE]
+    asyncio.run(run())
+
+
+def test_running_recovery_regenerated_answer_uses_new_assistant_start(tmp_path):
+    async def run():
+        working = canonical_snapshot(running=True, assistant_status='in_progress',
+                                     assistant_end_turn=False, update_time=2200.0)
+        working = replace(working, turns=(replace(working.turns[0], create_time=100.0), *working.turns[1:]))
+        fake = FakeAdapter(working)
+        watchdog = make_watchdog(tmp_path, fake, clock=lambda: 2200.0)
+        await watchdog.scan_once()
+        assert not fake.stopped and not fake.sent
+    asyncio.run(run())
+
+
+def test_running_recovery_selects_one_overdue_chat_per_scan(tmp_path):
+    async def run():
+        first = link()
+        second = link('22222222-2222-2222-2222-222222222222')
+        working = canonical_snapshot(running=True, assistant_status='in_progress', assistant_end_turn=False)
+        fake = FakeAdapter(working)
+        fake.after_stop = canonical_snapshot(assistant_status='interrupted')
+        watchdog = make_watchdog(tmp_path, fake)
+        watchdog.add_url(second.url)
+        await watchdog.scan_once()
+        await watchdog.scan_once()
+        assert fake.stopped == [first.conversation_id]
+        assert fake.sent_conversation_ids == [first.conversation_id]
+        await watchdog.scan_once()
+        assert fake.stopped == [first.conversation_id, second.conversation_id]
+        assert fake.sent_conversation_ids == [first.conversation_id, second.conversation_id]
+    asyncio.run(run())
+
+
+def test_running_recovery_unconfirmed_submission_does_not_duplicate(tmp_path):
+    async def run():
+        working = canonical_snapshot(running=True, assistant_status='in_progress', assistant_end_turn=False)
+        fake = FakeAdapter(working)
+        fake.after_stop = canonical_snapshot(assistant_status='interrupted')
+        fake.send_results[link().conversation_id] = SendResult(True, False, False)
+        watchdog = make_watchdog(tmp_path, fake)
+        await watchdog.scan_once()
+        await watchdog.scan_once()
+        assert len(fake.sent) == 1
+        await watchdog.scan_once()
+        await watchdog.scan_once()
+        assert len(fake.sent) == 1
+    asyncio.run(run())

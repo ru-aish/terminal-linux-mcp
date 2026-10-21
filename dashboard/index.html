@@ -21,7 +21,7 @@
       </a>
       <nav class="dashboard-nav" aria-label="Dashboard sections">
         <a href="/dashboard" aria-current="page">Usage</a>
-        <a href="/dashboard/agents">Agents</a>
+        <a href="/dashboard/agents" data-dashboard-feature="agents">Agents</a>
       </nav>
       <div class="connection" id="connection" data-state="connecting" aria-live="polite">
         <span class="connection-dot" aria-hidden="true"></span>
@@ -71,7 +71,7 @@
         </article>
       </section>
 
-      <section class="watchdog-section" aria-labelledby="watchdogTitle">
+      <section class="watchdog-section" aria-labelledby="watchdogTitle" data-dashboard-feature="watchdog">
         <div class="section-heading">
           <div><p class="eyebrow">ChatGPT task watchdog</p><h2 id="watchdogTitle">Active task queue</h2></div>
           <button type="button" id="watchdogScan">Scan now</button>
