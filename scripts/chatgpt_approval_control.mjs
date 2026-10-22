@@ -111,6 +111,21 @@ async function submitApproval(client, conversation, args, jobs) {
   }
 }
 
+function watcherSnapshot(watcher) {
+  if (!watcher) return null;
+  return {
+    conversationId: watcher.conversationId,
+    level: watcher.level,
+    intervalMs: watcher.intervalMs,
+    state: watcher.state,
+    startedAt: watcher.startedAt,
+    approvals: watcher.approvals,
+    lastCheckedAt: watcher.lastCheckedAt ?? null,
+    lastError: watcher.lastError ?? null,
+    lastApproval: watcher.lastApproval ?? null,
+  };
+}
+
 // These three functions run in the same authenticated renderer as T3's API client.
 export async function nativeOperation(operation, args) {
   const client = window[Symbol.for('terminal-mcp.chat-runtime.client.v5')];
@@ -128,7 +143,7 @@ export async function nativeOperation(operation, args) {
   const watchers = window[watcherKey] ?? new Map();
   if (operation === 'watch') {
     const previous = watchers.get(args.conversationId);
-    if (previous) return { alreadyWatching: true, watcher: previous };
+    if (previous) return { alreadyWatching: true, watcher: watcherSnapshot(previous) };
     if (!Number.isInteger(args.intervalMs) || args.intervalMs < 1000 || args.intervalMs > 60000) {
       throw new Error('Watch interval must be between 1000 and 60000 milliseconds');
     }
@@ -168,7 +183,7 @@ export async function nativeOperation(operation, args) {
       }
     };
     void poll(conversation);
-    return { alreadyWatching: false, watcher };
+    return { alreadyWatching: false, watcher: watcherSnapshot(watcher) };
   }
   if (operation === 'unwatch') {
     const watcher = watchers.get(args.conversationId);
@@ -178,7 +193,7 @@ export async function nativeOperation(operation, args) {
       watchers.delete(args.conversationId);
     }
     window[watcherKey] = watchers;
-    return { stopped: !!watcher, watcher: watcher ?? null };
+    return { stopped: !!watcher, watcher: watcherSnapshot(watcher) };
   }
   const jobKey = `${args.conversationId}:${args.messageId}`;
   if (operation === 'status') {
@@ -191,7 +206,7 @@ export async function nativeOperation(operation, args) {
     });
     return {
       job: args.messageId ? jobs.get(jobKey) ?? null : null,
-      watcher: watchers.get(args.conversationId) ?? null,
+      watcher: watcherSnapshot(watchers.get(args.conversationId)),
       pending: pendingApproval(conversation), recordedResponses: responses,
     };
   }
@@ -231,6 +246,7 @@ export async function control(operation, args, endpoint = 'http://127.0.0.1:9234
         const pendingApproval=${pendingApproval.toString()};
         const buildApprovalRequest=${buildApprovalRequest.toString()};
         const submitApproval=${submitApproval.toString()};
+        const watcherSnapshot=${watcherSnapshot.toString()};
         return (${nativeOperation.toString()})(${JSON.stringify(operation)},${JSON.stringify({ ...args, responseMessageId: args.responseMessageId ?? randomUUID() })});
       })()`;
       socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
