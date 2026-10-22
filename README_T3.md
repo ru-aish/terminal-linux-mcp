@@ -180,9 +180,12 @@ accounts, or future API versions. Contract tests check the currently observed
 format without making live approvals in CI.
 
 `watch` keeps a watcher in the existing ChatGPT renderer for that one
-conversation. It checks the conversation every three seconds and submits the
-offered `always_allow` choice when a pending MCP tool approval appears. Set
-`--interval-ms` between 1000 and 60000 to tune the check rate. The watcher
+conversation. It checks the conversation every 15 seconds by default and
+submits the offered `always_allow` choice when a pending MCP tool approval
+appears. Set `--interval-ms` between 1000 and 60000 to tune the check rate.
+Rate-limit responses trigger exponential backoff up to one minute, with small
+random delays to spread requests. `status` without a message ID only reads the
+local watcher state; `unwatch` does not fetch conversation history. The watcher
 continues after the CLI exits while the ChatGPT renderer stays open; use
 `unwatch` to stop it. `status` reports the watcher and approved requests. It
 does not approve authentication prompts, non-MCP prompts, or approvals in other

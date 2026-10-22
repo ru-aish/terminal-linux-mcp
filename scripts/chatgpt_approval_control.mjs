@@ -135,20 +135,39 @@ export async function nativeOperation(operation, args) {
   const key = Symbol.for('terminal-mcp.chatgpt-approval-control.v1');
   const jobs = window[key] ?? new Map();
   window[key] = jobs;
-  const raw = await client.get(args.conversationId);
-  const conversation = raw.data ?? raw;
-  if (conversation.conversation_id !== args.conversationId) throw new Error('Conversation identity mismatch');
-  if (operation === 'inspect') return { pending: pendingApproval(conversation) };
   const watcherKey = Symbol.for('terminal-mcp.chatgpt-approval-watchers.v1');
   const watchers = window[watcherKey] ?? new Map();
+  if (operation === 'unwatch') {
+    const watcher = watchers.get(args.conversationId);
+    if (watcher) {
+      watcher.state = 'stopped';
+      clearTimeout(watcher.timer);
+      watchers.delete(args.conversationId);
+    }
+    window[watcherKey] = watchers;
+    return { stopped: !!watcher, watcher: watcherSnapshot(watcher) };
+  }
+  if (operation === 'status' && !args.messageId) {
+    return {
+      job: null, watcher: watcherSnapshot(watchers.get(args.conversationId)),
+      conversationChecked: false, pending: null, recordedResponses: [],
+    };
+  }
   if (operation === 'watch') {
     const previous = watchers.get(args.conversationId);
     if (previous) return { alreadyWatching: true, watcher: watcherSnapshot(previous) };
     if (!Number.isInteger(args.intervalMs) || args.intervalMs < 1000 || args.intervalMs > 60000) {
       throw new Error('Watch interval must be between 1000 and 60000 milliseconds');
     }
+  }
+  const raw = await client.get(args.conversationId);
+  const conversation = raw.data ?? raw;
+  if (conversation.conversation_id !== args.conversationId) throw new Error('Conversation identity mismatch');
+  if (operation === 'inspect') return { pending: pendingApproval(conversation) };
+  if (operation === 'watch') {
     const watcher = {
-      conversationId: args.conversationId, level: 'always', intervalMs: args.intervalMs,
+      conversationId: args.conversationId, level: 'always',
+      intervalMs: args.intervalMs, baseIntervalMs: args.intervalMs,
       state: 'watching', startedAt: Date.now(), approvals: 0,
     };
     watchers.set(args.conversationId, watcher);
@@ -174,26 +193,23 @@ export async function nativeOperation(operation, args) {
         }
         watcher.lastCheckedAt = Date.now();
         watcher.lastError = null;
+        watcher.intervalMs = watcher.baseIntervalMs;
       } catch (error) {
         watcher.lastCheckedAt = Date.now();
         watcher.lastError = String(error?.message ?? error);
+        if (/too many requests|\b429\b/i.test(watcher.lastError)) {
+          watcher.intervalMs = Math.min(60000, Math.max(watcher.baseIntervalMs, watcher.intervalMs * 2));
+        }
       } finally {
         watcher.inFlight = false;
-        if (watcher.state === 'watching') watcher.timer = setTimeout(() => { void poll(); }, watcher.intervalMs);
+        if (watcher.state === 'watching') {
+          const jitter = Math.floor(Math.random() * Math.min(1000, watcher.intervalMs / 10));
+          watcher.timer = setTimeout(() => { void poll(); }, watcher.intervalMs + jitter);
+        }
       }
     };
     void poll(conversation);
     return { alreadyWatching: false, watcher: watcherSnapshot(watcher) };
-  }
-  if (operation === 'unwatch') {
-    const watcher = watchers.get(args.conversationId);
-    if (watcher) {
-      watcher.state = 'stopped';
-      clearTimeout(watcher.timer);
-      watchers.delete(args.conversationId);
-    }
-    window[watcherKey] = watchers;
-    return { stopped: !!watcher, watcher: watcherSnapshot(watcher) };
   }
   const jobKey = `${args.conversationId}:${args.messageId}`;
   if (operation === 'status') {
@@ -207,7 +223,7 @@ export async function nativeOperation(operation, args) {
     return {
       job: args.messageId ? jobs.get(jobKey) ?? null : null,
       watcher: watcherSnapshot(watchers.get(args.conversationId)),
-      pending: pendingApproval(conversation), recordedResponses: responses,
+      conversationChecked: true, pending: pendingApproval(conversation), recordedResponses: responses,
     };
   }
   if (operation !== 'respond') throw new Error('Unsupported operation');
@@ -268,7 +284,7 @@ async function main() {
     'cdp-endpoint': { type: 'string', default: 'http://127.0.0.1:9234' },
     'message-id': { type: 'string' }, 'connector-id': { type: 'string' },
     'link-id': { type: 'string' }, level: { type: 'string' },
-    'interval-ms': { type: 'string', default: '3000' }, help: { type: 'boolean' },
+    'interval-ms': { type: 'string', default: '15000' }, help: { type: 'boolean' },
   } });
   if (values.help) {
     console.log('Usage: node scripts/chatgpt_approval_control.mjs inspect|respond|status|watch|unwatch --thread-id T3_ID [--message-id ID --connector-id ID --link-id ID --level once|conversation|always|deny]');
