@@ -183,7 +183,7 @@ export async function nativeOperation(operation, args) {
   const jobKey = `${args.conversationId}:${args.messageId}`;
   if (operation === 'status') {
     const responses = Object.values(conversation.mapping ?? {}).flatMap(node => {
-      const message = node.message;
+      const message = node?.message;
       const response = message?.metadata?.jit_plugin_data?.from_client;
       return response?.target_message_id === args.messageId ? [{ messageId: message.id, decision: response }] : [];
     });
