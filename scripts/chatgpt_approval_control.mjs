@@ -185,7 +185,9 @@ export async function nativeOperation(operation, args) {
     const responses = Object.values(conversation.mapping ?? {}).flatMap(node => {
       const message = node?.message;
       const response = message?.metadata?.jit_plugin_data?.from_client;
-      return response?.target_message_id === args.messageId ? [{ messageId: message.id, decision: response }] : [];
+      return args.messageId && response?.target_message_id === args.messageId
+        ? [{ messageId: message.id, decision: response }]
+        : [];
     });
     return {
       job: args.messageId ? jobs.get(jobKey) ?? null : null,
