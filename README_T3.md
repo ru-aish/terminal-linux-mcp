@@ -190,3 +190,11 @@ continues after the CLI exits while the ChatGPT renderer stays open; use
 `unwatch` to stop it. `status` reports the watcher and approved requests. It
 does not approve authentication prompts, non-MCP prompts, or approvals in other
 conversations. Restarting ChatGPT clears its watchers, so start `watch` again.
+
+This watcher is a temporary administrative aid. It follows the native
+conversation selected at startup, so a T3 conversation reset or handoff requires
+restarting it against the new native conversation. An approval submitted by this
+helper also owns a separate completion stream; submission does not guarantee
+that an already closed T3 run receives the resumed output. Reliable automatic
+approval inside T3 needs to preserve that run's stream callbacks and cancellation
+ownership. Installing this script in a Terminal MCP release does not start it.

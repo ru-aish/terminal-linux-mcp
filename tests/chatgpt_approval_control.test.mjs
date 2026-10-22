@@ -1,6 +1,6 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { pendingApproval, buildApprovalRequest, nativeOperation } from '../scripts/chatgpt_approval_control.mjs';
+import { pendingApproval, buildApprovalRequest, nativeOperation, nativeResult } from '../scripts/chatgpt_approval_control.mjs';
 
 function fixture() {
   return {
@@ -120,4 +120,28 @@ test('an uncertain submission is retained and never automatically repeated', asy
   assert.equal(result.alreadyAttempted, true);
   assert.equal(result.job.state, 'submission_error');
   assert.equal(calls, 1);
+});
+
+test('cyclic native rate-limit errors remain serializable across CDP', async () => {
+  const error = { message: '{"detail":"Too many requests"}' };
+  error.cause = error;
+  globalThis.window = { [Symbol.for('terminal-mcp.chat-runtime.client.v5')]: {
+    get: async () => { throw error; },
+    startCompletionStream: async () => assert.fail('Read-only inspection must not submit'),
+  } };
+  const result = await nativeResult('inspect', choice('always'));
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    ok: false, error: '{"detail":"Too many requests"}',
+  });
+});
+
+test('watcher status and stopping do not fetch ChatGPT conversation history', async () => {
+  globalThis.window = { [Symbol.for('terminal-mcp.chat-runtime.client.v5')]: {
+    get: async () => assert.fail('Local watcher management must not use the remote API'),
+    startCompletionStream: async () => assert.fail('Watcher management must not submit'),
+  } };
+  const status = await nativeOperation('status', { conversationId: 'native-one' });
+  assert.equal(status.conversationChecked, false);
+  assert.equal(status.watcher, null);
+  assert.equal((await nativeOperation('unwatch', { conversationId: 'native-one' })).stopped, false);
 });

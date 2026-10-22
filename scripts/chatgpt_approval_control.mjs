@@ -231,6 +231,15 @@ export async function nativeOperation(operation, args) {
   return submitApproval(client, conversation, args, jobs);
 }
 
+export async function nativeResult(operation, args) {
+  try {
+    return { ok: true, value: await nativeOperation(operation, args) };
+  } catch (error) {
+    // Native API errors can contain cyclic objects that CDP cannot serialize.
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
 export async function control(operation, args, endpoint = 'http://127.0.0.1:9234') {
   const url = new URL(endpoint);
   if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.protocol !== 'http:') {
@@ -263,13 +272,15 @@ export async function control(operation, args, endpoint = 'http://127.0.0.1:9234
         const buildApprovalRequest=${buildApprovalRequest.toString()};
         const submitApproval=${submitApproval.toString()};
         const watcherSnapshot=${watcherSnapshot.toString()};
-        return (${nativeOperation.toString()})(${JSON.stringify(operation)},${JSON.stringify({ ...args, responseMessageId: args.responseMessageId ?? randomUUID() })});
+        const nativeOperation=${nativeOperation.toString()};
+        return (${nativeResult.toString()})(${JSON.stringify(operation)},${JSON.stringify({ ...args, responseMessageId: args.responseMessageId ?? randomUUID() })});
       })()`;
       socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
       const result = await response;
       if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
       if (result.result?.value == null) throw new Error('Unknown native approval response format');
-      return result.result.value;
+      if (!result.result.value.ok) throw new Error(result.result.value.error ?? 'Native approval operation failed');
+      return result.result.value.value;
     })()]);
   } finally {
     clearTimeout(timer);
