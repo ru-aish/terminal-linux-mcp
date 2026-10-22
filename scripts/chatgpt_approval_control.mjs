@@ -10,9 +10,12 @@ export function pendingApproval(conversation) {
   const message = conversation.mapping?.[conversation.current_node]?.message;
   const server = message?.metadata?.jit_plugin_data?.from_server
     ?? message?.metadata?.elicitation_metadata?.plugin_data?.from_server;
+  if (message?.author?.role !== 'tool') return null;
   if (server?.type !== 'confirm_action' || server.body?.codex_mcp_elicitation?.kind !== 'mcpToolCall') return null;
   if (server.body.codex_mcp_elicitation.status !== 'pending') return null;
   const body = server.body;
+  if (![conversation.conversation_id, message.id, body.connector_id, body.link_id]
+    .every(value => typeof value === 'string' && value.length > 0 && value.length <= 512)) return null;
   const levels = [];
   for (const action of body.actions ?? []) {
     if (action.allow?.target_message_id === message.id) levels.push('once');
@@ -35,8 +38,12 @@ export function pendingApproval(conversation) {
 }
 
 export function buildApprovalRequest(conversation, choice, messageId, now = Date.now()) {
+  if (![choice.conversationId, choice.messageId, choice.connectorId, choice.linkId, messageId]
+    .every(value => typeof value === 'string' && value.length > 0 && value.length <= 512)) {
+    throw new Error('Approval requires explicit conversation, message, connector, and link identities');
+  }
   const approval = pendingApproval(conversation);
-  if (!approval || approval.messageId !== choice.messageId) throw new Error('Pending approval changed; inspect again');
+  if (!approval || approval.conversationId !== choice.conversationId || approval.messageId !== choice.messageId) throw new Error('Pending approval changed; inspect again');
   if (approval.connectorId !== choice.connectorId || approval.linkId !== choice.linkId) throw new Error('Connector/link identity mismatch');
   if (!approval.levels.includes(choice.level)) throw new Error('Approval level is not offered by this request');
   const action = choice.level === 'always' ? 'always_allow' : choice.level === 'deny' ? 'deny' : 'allow';
@@ -160,7 +167,8 @@ export async function control(operation, args, endpoint = 'http://127.0.0.1:9234
       socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
       const result = await response;
       if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
-      return result.result?.value;
+      if (result.result?.value == null) throw new Error('Unknown native approval response format');
+      return result.result.value;
     })()]);
   } finally {
     clearTimeout(timer);

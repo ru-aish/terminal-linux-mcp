@@ -58,7 +58,7 @@ for (const [level, type, remember] of [
 
 test('refuses stale requests, connector substitutions, and unoffered scopes', () => {
   const conversation = fixture();
-  for (const override of [{ messageId: 'old-request' }, { connectorId: 'other-app' }, { linkId: 'other-link' }, { level: 'full-access' }]) {
+  for (const override of [{ messageId: 'old-request' }, { connectorId: 'other-app' }, { linkId: 'other-link' }, { level: 'full-access' }, { conversationId: 'other-conversation' }, { linkId: undefined }]) {
     assert.throws(() => buildApprovalRequest(conversation, { ...choice('once'), ...override }, 'response-one'));
   }
   conversation.mapping['approval-one'].message.metadata.jit_plugin_data.from_server.body.actions.shift();
@@ -68,6 +68,9 @@ test('refuses stale requests, connector substitutions, and unoffered scopes', ()
 test('does not turn authentication challenges or completed requests into approvals', () => {
   const c = fixture();
   const server = c.mapping['approval-one'].message.metadata.jit_plugin_data.from_server;
+  c.mapping['approval-one'].message.author.role = 'assistant';
+  assert.equal(pendingApproval(c), null);
+  c.mapping['approval-one'].message.author.role = 'tool';
   server.type = 'oauth_required';
   assert.equal(pendingApproval(c), null);
   server.type = 'confirm_action';
