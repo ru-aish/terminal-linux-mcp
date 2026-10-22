@@ -130,3 +130,71 @@ Tool calls persist correlated `tool_started` and `tool_completed` events through
 the same private control stream as task state. Tool input and result previews
 use the accounting sanitizer and size cap; environment overrides are redacted.
 Persistence errors are logged rather than silently discarded.
+
+## Inspect and answer native ChatGPT tool approvals
+
+An empty tool message can contain a pending approval in
+`metadata.jit_plugin_data.from_server`, including a `confirm_action` and a pending
+`codex_mcp_elicitation`. The public Terminal MCP request has not run at that point.
+A T3 permission mode and a ChatGPT connector grant are separate decisions.
+
+`scripts/chatgpt_approval_control.mjs` provides standalone JSON controls through
+T3's existing authenticated ChatGPT API client. It does not open browser tabs,
+modify T3, restart services, or extract login credentials. Use Node 24 or later
+while the normal connection is active:
+
+```sh
+node scripts/chatgpt_approval_control.mjs inspect --thread-id T3_THREAD_ID
+node scripts/chatgpt_approval_control.mjs respond --thread-id T3_THREAD_ID \
+  --message-id PENDING_MESSAGE_ID --connector-id CONNECTOR_ID --link-id LINK_ID \
+  --level conversation
+node scripts/chatgpt_approval_control.mjs status --thread-id T3_THREAD_ID \
+  --message-id PENDING_MESSAGE_ID
+node scripts/chatgpt_approval_control.mjs watch --thread-id T3_THREAD_ID
+node scripts/chatgpt_approval_control.mjs status --thread-id T3_THREAD_ID
+node scripts/chatgpt_approval_control.mjs unwatch --thread-id T3_THREAD_ID
+```
+
+`respond` accepts `once`, `conversation`, `always`, or `deny`. Use `inspect` without
+responding to keep manual approval. Supply the exact message, connector, and link
+IDs returned by inspection; a friendly name does not identify a grant. `fedora`
+and `fedora_t3code` are separate connectors. Only levels offered by the pending
+request are accepted. Changed requests, authentication challenges, and unknown
+approval formats are rejected. Repeated calls in the same renderer return the
+existing attempt instead of submitting twice. After a connection failure, inspect
+status before retrying; restarting the desktop app clears that local attempt
+record. A recorded response confirms submission, not that the resumed task passed.
+
+For programmatic use, import `control` from the module. Its interface is
+`control(operation, {conversationId, messageId, connectorId, linkId, level}, endpoint)`;
+operations are `inspect`, `respond`, and `status`. The default endpoint is the
+existing loopback renderer on port 9234. The CLI can also take a native
+`--conversation-id` instead of a T3 thread ID, or override `--cache-dir` and
+`--cdp-endpoint`.
+
+These are private native-client APIs, not a documented public ChatGPT approval
+endpoint. No general account-wide permission-level setting is assumed. An
+`always` response requests the connector-scoped behavior offered by ChatGPT;
+verify subsequent calls rather than assuming it applies to other connectors,
+accounts, or future API versions. Contract tests check the currently observed
+format without making live approvals in CI.
+
+`watch` keeps a watcher in the existing ChatGPT renderer for that one
+conversation. It checks the conversation every 15 seconds by default and
+submits the offered `always_allow` choice when a pending MCP tool approval
+appears. Set `--interval-ms` between 1000 and 60000 to tune the check rate.
+Rate-limit responses trigger exponential backoff up to one minute, with small
+random delays to spread requests. `status` without a message ID only reads the
+local watcher state; `unwatch` does not fetch conversation history. The watcher
+continues after the CLI exits while the ChatGPT renderer stays open; use
+`unwatch` to stop it. `status` reports the watcher and approved requests. It
+does not approve authentication prompts, non-MCP prompts, or approvals in other
+conversations. Restarting ChatGPT clears its watchers, so start `watch` again.
+
+This watcher is a temporary administrative aid. It follows the native
+conversation selected at startup, so a T3 conversation reset or handoff requires
+restarting it against the new native conversation. An approval submitted by this
+helper also owns a separate completion stream; submission does not guarantee
+that an already closed T3 run receives the resumed output. Reliable automatic
+approval inside T3 needs to preserve that run's stream callbacks and cancellation
+ownership. Installing this script in a Terminal MCP release does not start it.
