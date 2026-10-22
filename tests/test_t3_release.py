@@ -47,7 +47,7 @@ def test_stage_is_reproducible_and_verifies_against_git(tmp_path):
     assert release_tool.verify(staged, repo) == staged.name
 
 
-@pytest.mark.parametrize('change', ['modified', 'missing', 'extra', 'manifest', 'symlink'])
+@pytest.mark.parametrize('change', ['modified', 'missing', 'extra', 'manifest', 'symbolic_ref', 'symlink'])
 def test_damaged_or_mislabeled_release_is_rejected(tmp_path, change):
     repo = repository(tmp_path)
     staged = release_tool.stage(repo, 'HEAD', tmp_path / 'releases')
@@ -61,11 +61,14 @@ def test_damaged_or_mislabeled_release_is_rejected(tmp_path, change):
         source.unlink()
     elif change == 'extra':
         (staged / 'uncommitted.py').write_text('forgotten overlay')
-    elif change == 'manifest':
+    elif change in ('manifest', 'symbolic_ref'):
         manifest = staged / 'RELEASE.json'
         manifest.chmod(0o644)
         value = json.loads(manifest.read_text())
-        value['files']['server.py']['sha256'] = '0' * 64
+        if change == 'symbolic_ref':
+            value['commit'] = 'HEAD'
+        else:
+            value['files']['server.py']['sha256'] = '0' * 64
         manifest.write_text(json.dumps(value))
         manifest.chmod(0o444)
     else:

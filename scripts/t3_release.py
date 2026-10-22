@@ -54,7 +54,8 @@ def verify(release: Path, repo: Path):
     if manifest.get('version') != 1:
         raise ValueError('Unsupported or missing release manifest version')
     commit, tree, files = committed_files(repo, manifest['commit'])
-    if manifest.get('tree') != tree or manifest.get('files') != fingerprints(files):
+    if (manifest.get('commit') != commit or manifest.get('tree') != tree
+            or manifest.get('files') != fingerprints(files)):
         raise ValueError('Release manifest does not match its recorded Git commit')
     actual = set()
     for path in release.rglob('*'):
