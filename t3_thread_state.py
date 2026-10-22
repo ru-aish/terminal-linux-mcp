@@ -218,6 +218,12 @@ class ThreadState:
         self.changed.set()
         return event_id
 
+    def emit_event(self, thread_id: str, kind: str, payload: dict) -> str:
+        self.get(thread_id)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            return self._event(db, thread_id, kind, payload)
+
     def _request(self, db, thread_id: str, request_id: str, action: str) -> bool:
         self.identifier(request_id)
         row = db.execute('SELECT * FROM requests WHERE request_id=?', (request_id,)).fetchone()

@@ -612,6 +612,22 @@ class DurableProcessSupervisor:
                 continue
         return rows
 
+    def discover_owners(self, owners: set[str]) -> list[tuple[str, dict]]:
+        """Recover jobs for many owners with one directory scan."""
+        rows = []
+        for directory in sorted(self.jobs.iterdir()):
+            if not directory.is_dir():
+                continue
+            request = _read_json(directory / "request.json")
+            owner = request.get("owner") if isinstance(request, dict) else None
+            if owner not in owners:
+                continue
+            try:
+                rows.append((owner, self.status(directory.name, owner=owner)))
+            except (ValueError, KeyError):
+                continue
+        return rows
+
     def output(
         self, job_id: str, *, owner: str, stdout_offset: int = 0,
         stderr_offset: int = 0, max_bytes: int = 65536,

@@ -5,12 +5,14 @@ import argparse
 import asyncio
 import contextvars
 import json
+import logging
 import math
 import time
 import os
 import secrets
+import signal
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -161,6 +163,32 @@ def build(core, state: ThreadState, control_token: str):
         return '\n'.join(lines)[:max_chars]
 
     class T3FastMCP(core.AccountingFastMCP):
+        @staticmethod
+        def _event_value(value):
+            text, metadata = core.AccountingFastMCP._text_for_token_accounting(value)
+            if metadata.get('truncated'):
+                return {'preview': text, 'truncated': True}
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {'preview': text}
+
+        @classmethod
+        def _event_input(cls, name, arguments):
+            visible = dict(arguments)
+            if name == 'set_session_env' and 'value' in visible:
+                visible['value'] = '[redacted]'
+            if isinstance(visible.get('env'), dict):
+                visible['env'] = {str(key): '[redacted]' for key in visible['env']}
+            return cls._event_value(visible)
+
+        @staticmethod
+        def _emit_tool_event(thread_id, kind, payload):
+            try:
+                state.emit_event(thread_id, kind, payload)
+            except Exception:
+                logging.getLogger(__name__).exception('Failed to persist T3 tool event %s', kind)
+
         async def call_tool(self, name, arguments):
             try:
                 ids = {str(arguments[k]) for k in ('thread_id', 'session_id') if arguments.get(k)}
@@ -171,9 +199,30 @@ def build(core, state: ThreadState, control_token: str):
                 state.begin(binding['thread_id'], operation, 'tool:' + name)
             except ValueError as exc:
                 return core.mcp_types.CallToolResult(isError=True, content=[core.mcp_types.TextContent(type='text', text=f'Error: {exc}')])
+            self._emit_tool_event(binding['thread_id'], 'tool_started', {
+                'operationId': operation,
+                'toolName': 'fedora_t3code.' + name,
+                'input': self._event_input(name, arguments),
+            })
             token = CURRENT_OPERATION.set(operation)
             try:
-                return await super().call_tool(name, arguments)
+                result = await super().call_tool(name, arguments)
+            except BaseException as exc:
+                self._emit_tool_event(binding['thread_id'], 'tool_completed', {
+                    'operationId': operation,
+                    'toolName': 'fedora_t3code.' + name,
+                    'status': 'cancelled' if isinstance(exc, asyncio.CancelledError) else 'failed',
+                    'output': self._event_value({'error': str(exc)}),
+                })
+                raise
+            else:
+                self._emit_tool_event(binding['thread_id'], 'tool_completed', {
+                    'operationId': operation,
+                    'toolName': 'fedora_t3code.' + name,
+                    'status': 'failed' if getattr(result, 'isError', False) else 'completed',
+                    'output': self._event_value(result),
+                })
+                return result
             finally:
                 CURRENT_OPERATION.reset(token)
                 state.finish(operation, 'tool_returned')
@@ -189,9 +238,8 @@ def build(core, state: ThreadState, control_token: str):
                 owners = [r[0] for r in db.execute('SELECT thread_id FROM bindings')]
             # A lost MCP response may precede the operation insert. Discover
             # committed reservations without relaunching their commands.
-            for owner in owners:
-                for job in durable_jobs.discover(owner=owner):
-                    track_durable(owner, job, detached=True)
+            for owner, job in durable_jobs.discover_owners(set(owners)):
+                track_durable(owner, job, detached=True)
             for row in rows:
                 if row['durable']:
                     state.mark_detached(row['thread_id'], row['process_id'])
@@ -626,8 +674,12 @@ def build(core, state: ThreadState, control_token: str):
         return process, unit_name
     core._spawn_workload = spawn
 
+    manifest = Path(__file__).resolve().with_name('RELEASE.json')
+    release_commit = json.loads(manifest.read_text())['commit'] if manifest.exists() else None
+
     async def health(_):
-        return JSONResponse({'service': 't3-terminal-mcp', 'ready': True, 'projectScanning': False})
+        return JSONResponse({'service': 't3-terminal-mcp', 'ready': True, 'projectScanning': False,
+                             'releaseCommit': release_commit, 'capabilities': ['tool-events-v1']})
     mcp.custom_route('/healthz', methods=['GET'])(health)
 
     async def control(request):
@@ -720,9 +772,33 @@ async def serve(public_port: int, control_port: int):
     state = ThreadState(Path(os.environ['T3_TERMINAL_DB']), float(os.environ.get('T3_TERMINAL_IDLE_SECONDS', '300')))
     token = Path(os.environ['T3_TERMINAL_CONTROL_TOKEN_FILE']).read_text().strip()
     mcp, private = build(core, state, token)
-    public_server = uvicorn.Server(uvicorn.Config(build_public_app(core, mcp), host='127.0.0.1', port=public_port, log_level='info'))
-    private_server = uvicorn.Server(uvicorn.Config(private, host='127.0.0.1', port=control_port, log_level='info'))
-    await asyncio.gather(public_server.serve(), private_server.serve())
+    class CoordinatedServer(uvicorn.Server):
+        @contextmanager
+        def capture_signals(self):
+            # Both servers share one process; Uvicorn's second signal handler
+            # would otherwise replace the first and strand it on shutdown.
+            yield
+
+    public_server = CoordinatedServer(uvicorn.Config(
+        build_public_app(core, mcp), host='127.0.0.1', port=public_port,
+        log_level='info', timeout_graceful_shutdown=10))
+    private_server = CoordinatedServer(uvicorn.Config(
+        private, host='127.0.0.1', port=control_port,
+        log_level='info', timeout_graceful_shutdown=10))
+    servers = (public_server, private_server)
+    loop = asyncio.get_running_loop()
+
+    def stop_servers():
+        for server in servers:
+            server.should_exit = True
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_servers)
+    try:
+        await asyncio.gather(*(server.serve() for server in servers))
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
 
 
 if __name__ == '__main__':
