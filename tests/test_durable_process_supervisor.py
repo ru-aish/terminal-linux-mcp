@@ -106,6 +106,25 @@ def test_boot_identity_mismatch_is_not_a_live_job(tmp_path):
     assert registry.status(job_id, owner="thread-one")["status"] == "outcome_unknown"
 
 
+def test_discover_owners_scans_jobs_once_and_filters_owners(tmp_path, monkeypatch):
+    registry = DurableProcessSupervisor(tmp_path / "registry")
+    for index, owner in enumerate(("thread-one", "thread-two", "unregistered")):
+        folder = registry.jobs / f"{index:064x}"
+        folder.mkdir()
+        _atomic_json(folder / "request.json", {"owner": owner, "created_at": time.time() - 20})
+    calls = []
+    original_status = registry.status
+
+    def status(job_id, *, owner):
+        calls.append(owner)
+        return original_status(job_id, owner=owner)
+
+    monkeypatch.setattr(registry, "status", status)
+    found = registry.discover_owners({"thread-one", "thread-two"})
+    assert [owner for owner, _ in found] == ["thread-one", "thread-two"]
+    assert calls == ["thread-one", "thread-two"]
+
+
 def test_atomic_receipt_not_partially_replaced(tmp_path, monkeypatch):
     import durable_process_supervisor as module
     target = tmp_path / "result.json"

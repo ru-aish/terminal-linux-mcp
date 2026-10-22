@@ -190,9 +190,8 @@ def build(core, state: ThreadState, control_token: str):
                 owners = [r[0] for r in db.execute('SELECT thread_id FROM bindings')]
             # A lost MCP response may precede the operation insert. Discover
             # committed reservations without relaunching their commands.
-            for owner in owners:
-                for job in durable_jobs.discover(owner=owner):
-                    track_durable(owner, job, detached=True)
+            for owner, job in durable_jobs.discover_owners(set(owners)):
+                track_durable(owner, job, detached=True)
             for row in rows:
                 if row['durable']:
                     state.mark_detached(row['thread_id'], row['process_id'])
