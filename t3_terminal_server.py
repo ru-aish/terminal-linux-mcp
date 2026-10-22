@@ -9,8 +9,9 @@ import math
 import time
 import os
 import secrets
+import signal
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -720,9 +721,33 @@ async def serve(public_port: int, control_port: int):
     state = ThreadState(Path(os.environ['T3_TERMINAL_DB']), float(os.environ.get('T3_TERMINAL_IDLE_SECONDS', '300')))
     token = Path(os.environ['T3_TERMINAL_CONTROL_TOKEN_FILE']).read_text().strip()
     mcp, private = build(core, state, token)
-    public_server = uvicorn.Server(uvicorn.Config(build_public_app(core, mcp), host='127.0.0.1', port=public_port, log_level='info'))
-    private_server = uvicorn.Server(uvicorn.Config(private, host='127.0.0.1', port=control_port, log_level='info'))
-    await asyncio.gather(public_server.serve(), private_server.serve())
+    class CoordinatedServer(uvicorn.Server):
+        @contextmanager
+        def capture_signals(self):
+            # Both servers share one process; Uvicorn's second signal handler
+            # would otherwise replace the first and strand it on shutdown.
+            yield
+
+    public_server = CoordinatedServer(uvicorn.Config(
+        build_public_app(core, mcp), host='127.0.0.1', port=public_port,
+        log_level='info', timeout_graceful_shutdown=10))
+    private_server = CoordinatedServer(uvicorn.Config(
+        private, host='127.0.0.1', port=control_port,
+        log_level='info', timeout_graceful_shutdown=10))
+    servers = (public_server, private_server)
+    loop = asyncio.get_running_loop()
+
+    def stop_servers():
+        for server in servers:
+            server.should_exit = True
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop_servers)
+    try:
+        await asyncio.gather(*(server.serve() for server in servers))
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
 
 
 if __name__ == '__main__':
