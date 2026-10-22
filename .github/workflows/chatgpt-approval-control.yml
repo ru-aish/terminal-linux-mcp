@@ -1,0 +1,23 @@
+name: ChatGPT approval API control
+on:
+  pull_request:
+    paths:
+      - 'scripts/chatgpt_approval_control.mjs'
+      - 'tests/chatgpt_approval_control.test.mjs'
+      - '.github/workflows/chatgpt-approval-control.yml'
+  push:
+    paths:
+      - 'scripts/chatgpt_approval_control.mjs'
+      - 'tests/chatgpt_approval_control.test.mjs'
+      - '.github/workflows/chatgpt-approval-control.yml'
+permissions:
+  contents: read
+jobs:
+  approval-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node --test tests/chatgpt_approval_control.test.mjs
