@@ -150,6 +150,9 @@ node scripts/chatgpt_approval_control.mjs respond --thread-id T3_THREAD_ID \
   --level conversation
 node scripts/chatgpt_approval_control.mjs status --thread-id T3_THREAD_ID \
   --message-id PENDING_MESSAGE_ID
+node scripts/chatgpt_approval_control.mjs watch --thread-id T3_THREAD_ID
+node scripts/chatgpt_approval_control.mjs status --thread-id T3_THREAD_ID
+node scripts/chatgpt_approval_control.mjs unwatch --thread-id T3_THREAD_ID
 ```
 
 `respond` accepts `once`, `conversation`, `always`, or `deny`. Use `inspect` without
@@ -175,3 +178,12 @@ endpoint. No general account-wide permission-level setting is assumed. An
 verify subsequent calls rather than assuming it applies to other connectors,
 accounts, or future API versions. Contract tests check the currently observed
 format without making live approvals in CI.
+
+`watch` keeps a watcher in the existing ChatGPT renderer for that one
+conversation. It checks the conversation every three seconds and submits the
+offered `always_allow` choice when a pending MCP tool approval appears. Set
+`--interval-ms` between 1000 and 60000 to tune the check rate. The watcher
+continues after the CLI exits while the ChatGPT renderer stays open; use
+`unwatch` to stop it. `status` reports the watcher and approved requests. It
+does not approve authentication prompts, non-MCP prompts, or approvals in other
+conversations. Restarting ChatGPT clears its watchers, so start `watch` again.

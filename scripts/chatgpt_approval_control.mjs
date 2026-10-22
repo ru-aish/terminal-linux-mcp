@@ -76,28 +76,8 @@ export function buildApprovalRequest(conversation, choice, messageId, now = Date
   return request;
 }
 
-// These three functions run in the same authenticated renderer as T3's API client.
-export async function nativeOperation(operation, args) {
-  const client = window[Symbol.for('terminal-mcp.chat-runtime.client.v5')];
-  if (typeof client?.get !== 'function' || typeof client?.startCompletionStream !== 'function') {
-    throw new Error('Existing ChatGPT API client is unavailable; initialize the normal connection first');
-  }
-  const key = Symbol.for('terminal-mcp.chatgpt-approval-control.v1');
-  const jobs = window[key] ?? new Map();
-  const raw = await client.get(args.conversationId);
-  const conversation = raw.data ?? raw;
-  if (conversation.conversation_id !== args.conversationId) throw new Error('Conversation identity mismatch');
-  if (operation === 'inspect') return { pending: pendingApproval(conversation) };
+async function submitApproval(client, conversation, args, jobs) {
   const jobKey = `${args.conversationId}:${args.messageId}`;
-  if (operation === 'status') {
-    const responses = Object.values(conversation.mapping ?? {}).flatMap(node => {
-      const message = node.message;
-      const response = message?.metadata?.jit_plugin_data?.from_client;
-      return response?.target_message_id === args.messageId ? [{ messageId: message.id, decision: response }] : [];
-    });
-    return { job: jobs.get(jobKey) ?? null, pending: pendingApproval(conversation), recordedResponses: responses };
-  }
-  if (operation !== 'respond') throw new Error('Unsupported operation');
   const prior = jobs.get(jobKey);
   if (prior) {
     if (prior.level !== args.level || prior.connectorId !== args.connectorId || prior.linkId !== args.linkId) {
@@ -105,11 +85,10 @@ export async function nativeOperation(operation, args) {
     }
     return { alreadyAttempted: true, job: prior };
   }
+  if (jobs.size >= 200) throw new Error('Approval audit limit reached; inspect existing decisions first');
   const request = buildApprovalRequest(conversation, args, args.responseMessageId);
   request.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   request.timezone_offset_min = -new Date().getTimezoneOffset();
-  if (jobs.size >= 200) throw new Error('Approval audit limit reached; inspect existing decisions first');
-  window[key] = jobs;
   const job = {
     conversationId: args.conversationId, messageId: args.messageId,
     responseMessageId: args.responseMessageId, connectorId: args.connectorId,
@@ -130,6 +109,93 @@ export async function nativeOperation(operation, args) {
     job.state = 'submission_error';
     throw error;
   }
+}
+
+// These three functions run in the same authenticated renderer as T3's API client.
+export async function nativeOperation(operation, args) {
+  const client = window[Symbol.for('terminal-mcp.chat-runtime.client.v5')];
+  if (typeof client?.get !== 'function' || typeof client?.startCompletionStream !== 'function') {
+    throw new Error('Existing ChatGPT API client is unavailable; initialize the normal connection first');
+  }
+  const key = Symbol.for('terminal-mcp.chatgpt-approval-control.v1');
+  const jobs = window[key] ?? new Map();
+  window[key] = jobs;
+  const raw = await client.get(args.conversationId);
+  const conversation = raw.data ?? raw;
+  if (conversation.conversation_id !== args.conversationId) throw new Error('Conversation identity mismatch');
+  if (operation === 'inspect') return { pending: pendingApproval(conversation) };
+  const watcherKey = Symbol.for('terminal-mcp.chatgpt-approval-watchers.v1');
+  const watchers = window[watcherKey] ?? new Map();
+  if (operation === 'watch') {
+    const previous = watchers.get(args.conversationId);
+    if (previous) return { alreadyWatching: true, watcher: previous };
+    if (!Number.isInteger(args.intervalMs) || args.intervalMs < 1000 || args.intervalMs > 60000) {
+      throw new Error('Watch interval must be between 1000 and 60000 milliseconds');
+    }
+    const watcher = {
+      conversationId: args.conversationId, level: 'always', intervalMs: args.intervalMs,
+      state: 'watching', startedAt: Date.now(), approvals: 0,
+    };
+    watchers.set(args.conversationId, watcher);
+    window[watcherKey] = watchers;
+    const poll = async currentConversation => {
+      if (watcher.state !== 'watching' || watcher.inFlight) return;
+      watcher.inFlight = true;
+      try {
+        const current = currentConversation ?? (await client.get(args.conversationId));
+        const latest = current.data ?? current;
+        if (latest.conversation_id !== args.conversationId) throw new Error('Conversation identity mismatch');
+        const pending = pendingApproval(latest);
+        if (pending && pending.messageId !== watcher.lastMessageId) {
+          const result = await submitApproval(client, latest, {
+            ...pending, level: 'always', responseMessageId: crypto.randomUUID(),
+          }, jobs);
+          watcher.lastMessageId = pending.messageId;
+          if (!result.alreadyAttempted) {
+            watcher.approvals++;
+            watcher.lastApprovalAt = Date.now();
+            watcher.lastApproval = { messageId: pending.messageId, connectorId: pending.connectorId, linkId: pending.linkId };
+          }
+        }
+        watcher.lastCheckedAt = Date.now();
+        watcher.lastError = null;
+      } catch (error) {
+        watcher.lastCheckedAt = Date.now();
+        watcher.lastError = String(error?.message ?? error);
+      } finally {
+        watcher.inFlight = false;
+        if (watcher.state === 'watching') watcher.timer = setTimeout(() => { void poll(); }, watcher.intervalMs);
+      }
+    };
+    void poll(conversation);
+    return { alreadyWatching: false, watcher };
+  }
+  if (operation === 'unwatch') {
+    const watcher = watchers.get(args.conversationId);
+    if (watcher) {
+      watcher.state = 'stopped';
+      clearTimeout(watcher.timer);
+      watchers.delete(args.conversationId);
+    }
+    window[watcherKey] = watchers;
+    return { stopped: !!watcher, watcher: watcher ?? null };
+  }
+  const jobKey = `${args.conversationId}:${args.messageId}`;
+  if (operation === 'status') {
+    const responses = Object.values(conversation.mapping ?? {}).flatMap(node => {
+      const message = node.message;
+      const response = message?.metadata?.jit_plugin_data?.from_client;
+      return response?.target_message_id === args.messageId ? [{ messageId: message.id, decision: response }] : [];
+    });
+    return {
+      job: args.messageId ? jobs.get(jobKey) ?? null : null,
+      watcher: watchers.get(args.conversationId) ?? null,
+      pending: pendingApproval(conversation), recordedResponses: responses,
+    };
+  }
+  if (operation !== 'respond') throw new Error('Unsupported operation');
+  window[key] = jobs;
+  return submitApproval(client, conversation, args, jobs);
 }
 
 export async function control(operation, args, endpoint = 'http://127.0.0.1:9234') {
@@ -162,6 +228,7 @@ export async function control(operation, args, endpoint = 'http://127.0.0.1:9234
       const expression = `(async()=>{
         const pendingApproval=${pendingApproval.toString()};
         const buildApprovalRequest=${buildApprovalRequest.toString()};
+        const submitApproval=${submitApproval.toString()};
         return (${nativeOperation.toString()})(${JSON.stringify(operation)},${JSON.stringify({ ...args, responseMessageId: args.responseMessageId ?? randomUUID() })});
       })()`;
       socket.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
@@ -182,14 +249,15 @@ async function main() {
     'cache-dir': { type: 'string', default: join(homedir(), '.t3/userdata/chatgpt/chatgpt') },
     'cdp-endpoint': { type: 'string', default: 'http://127.0.0.1:9234' },
     'message-id': { type: 'string' }, 'connector-id': { type: 'string' },
-    'link-id': { type: 'string' }, level: { type: 'string' }, help: { type: 'boolean' },
+    'link-id': { type: 'string' }, level: { type: 'string' },
+    'interval-ms': { type: 'string', default: '3000' }, help: { type: 'boolean' },
   } });
   if (values.help) {
-    console.log('Usage: node scripts/chatgpt_approval_control.mjs inspect|respond|status --thread-id T3_ID [--message-id ID --connector-id ID --link-id ID --level once|conversation|always|deny]');
+    console.log('Usage: node scripts/chatgpt_approval_control.mjs inspect|respond|status|watch|unwatch --thread-id T3_ID [--message-id ID --connector-id ID --link-id ID --level once|conversation|always|deny]');
     return;
   }
   const operation = positionals[0];
-  if (!['inspect', 'respond', 'status'].includes(operation)) throw new Error('Choose inspect, respond, or status');
+  if (!['inspect', 'respond', 'status', 'watch', 'unwatch'].includes(operation)) throw new Error('Choose inspect, respond, status, watch, or unwatch');
   if (!!values['thread-id'] === !!values['conversation-id']) throw new Error('Provide exactly one thread-id or conversation-id');
   let conversationId = values['conversation-id'];
   if (values['thread-id']) {
@@ -198,13 +266,17 @@ async function main() {
     conversationId = cache.conversationId;
   }
   if (!conversationId) throw new Error('The thread has no native conversation');
-  if (operation !== 'inspect' && !values['message-id']) throw new Error('Provide message-id from inspect');
+  if (operation === 'respond' && !values['message-id']) throw new Error('Provide message-id from inspect');
   if (operation === 'respond' && (!values['connector-id'] || !values['link-id'] || !values.level)) {
     throw new Error('Respond requires connector-id, link-id, and level from inspect');
   }
+  const intervalMs = Number(values['interval-ms']);
+  if (operation === 'watch' && (!Number.isInteger(intervalMs) || intervalMs < 1000 || intervalMs > 60000)) {
+    throw new Error('--interval-ms must be between 1000 and 60000');
+  }
   console.log(JSON.stringify(await control(operation, {
     conversationId, messageId: values['message-id'], connectorId: values['connector-id'],
-    linkId: values['link-id'], level: values.level,
+    linkId: values['link-id'], level: values.level, intervalMs,
   }, values['cdp-endpoint']), null, 2));
 }
 
