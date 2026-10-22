@@ -88,3 +88,45 @@ reusing a new key to resolve an uncertain outcome. Workspace checkpoint rollback
 must still be coordinated externally with any running job modifying that tree.
 The T3 control-plane consumer must separately render/handle the
 `process.completed` event if it wants an in-app notification.
+
+
+## Versioned runtime releases
+
+Commit every runtime change before deploying. The `T3 runtime contract and
+release` GitHub workflow checks tool-event persistence, failures, cancellation,
+durable execution, and release integrity before uploading a commit-named archive
+and its SHA-256 checksum. The archive contains `RELEASE.json` with the Git commit,
+tree, and every source file's hash and executable mode. A successful workflow
+builds an artifact; it does not restart a production service.
+
+From a clean checkout, stage a release and generate its systemd drop-in:
+
+```sh
+python scripts/t3_release.py stage --repo . --ref HEAD --root /absolute/runtime/releases
+python scripts/t3_release.py systemd-unit --repo /absolute/git/repository \
+  --release /absolute/runtime/releases/FULL_COMMIT_SHA \
+  --python /absolute/runtime/python > /tmp/40-versioned-runtime.conf
+```
+
+The staging command rejects tracked or untracked edits and takes files only from
+Git objects. Generated files and directories are read-only. The drop-in sets
+`PYTHONDONTWRITEBYTECODE=1` and verifies the release against the recorded Git commit
+before every start. Verification rejects overlays, missing files, symlinks,
+writable source files, changed content, and incorrect provenance. Do not edit a
+release or copy local patches into it: commit, test, and stage a new revision.
+Keep the Git repository and its referenced commit available for startup checks.
+The Python environment must have the dependencies from `requirements.txt`.
+
+After checking that no foreground tools are running, back up the installed
+`terminal-mcp-t3.service.d/40-versioned-runtime.conf`, atomically install the
+generated drop-in, run `systemctl --user daemon-reload`, and restart only
+`terminal-mcp-t3.service`. This interrupts MCP connections; do not restart the
+T3 app or the tunnel. Confirm `/healthz` reports the expected `releaseCommit` and
+`tool-events-v1` capability, then test a registered thread's tool call and private
+event stream. If readiness fails, restore the previous drop-in, reload systemd,
+and restart the same service. Keep previous release directories for rollback.
+
+Tool calls persist correlated `tool_started` and `tool_completed` events through
+the same private control stream as task state. Tool input and result previews
+use the accounting sanitizer and size cap; environment overrides are redacted.
+Persistence errors are logged rather than silently discarded.

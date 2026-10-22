@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextvars
 import json
+import logging
 import math
 import time
 import os
@@ -162,6 +163,32 @@ def build(core, state: ThreadState, control_token: str):
         return '\n'.join(lines)[:max_chars]
 
     class T3FastMCP(core.AccountingFastMCP):
+        @staticmethod
+        def _event_value(value):
+            text, metadata = core.AccountingFastMCP._text_for_token_accounting(value)
+            if metadata.get('truncated'):
+                return {'preview': text, 'truncated': True}
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {'preview': text}
+
+        @classmethod
+        def _event_input(cls, name, arguments):
+            visible = dict(arguments)
+            if name == 'set_session_env' and 'value' in visible:
+                visible['value'] = '[redacted]'
+            if isinstance(visible.get('env'), dict):
+                visible['env'] = {str(key): '[redacted]' for key in visible['env']}
+            return cls._event_value(visible)
+
+        @staticmethod
+        def _emit_tool_event(thread_id, kind, payload):
+            try:
+                state.emit_event(thread_id, kind, payload)
+            except Exception:
+                logging.getLogger(__name__).exception('Failed to persist T3 tool event %s', kind)
+
         async def call_tool(self, name, arguments):
             try:
                 ids = {str(arguments[k]) for k in ('thread_id', 'session_id') if arguments.get(k)}
@@ -172,9 +199,30 @@ def build(core, state: ThreadState, control_token: str):
                 state.begin(binding['thread_id'], operation, 'tool:' + name)
             except ValueError as exc:
                 return core.mcp_types.CallToolResult(isError=True, content=[core.mcp_types.TextContent(type='text', text=f'Error: {exc}')])
+            self._emit_tool_event(binding['thread_id'], 'tool_started', {
+                'operationId': operation,
+                'toolName': 'fedora_t3code.' + name,
+                'input': self._event_input(name, arguments),
+            })
             token = CURRENT_OPERATION.set(operation)
             try:
-                return await super().call_tool(name, arguments)
+                result = await super().call_tool(name, arguments)
+            except BaseException as exc:
+                self._emit_tool_event(binding['thread_id'], 'tool_completed', {
+                    'operationId': operation,
+                    'toolName': 'fedora_t3code.' + name,
+                    'status': 'cancelled' if isinstance(exc, asyncio.CancelledError) else 'failed',
+                    'output': self._event_value({'error': str(exc)}),
+                })
+                raise
+            else:
+                self._emit_tool_event(binding['thread_id'], 'tool_completed', {
+                    'operationId': operation,
+                    'toolName': 'fedora_t3code.' + name,
+                    'status': 'failed' if getattr(result, 'isError', False) else 'completed',
+                    'output': self._event_value(result),
+                })
+                return result
             finally:
                 CURRENT_OPERATION.reset(token)
                 state.finish(operation, 'tool_returned')
@@ -626,8 +674,12 @@ def build(core, state: ThreadState, control_token: str):
         return process, unit_name
     core._spawn_workload = spawn
 
+    manifest = Path(__file__).resolve().with_name('RELEASE.json')
+    release_commit = json.loads(manifest.read_text())['commit'] if manifest.exists() else None
+
     async def health(_):
-        return JSONResponse({'service': 't3-terminal-mcp', 'ready': True, 'projectScanning': False})
+        return JSONResponse({'service': 't3-terminal-mcp', 'ready': True, 'projectScanning': False,
+                             'releaseCommit': release_commit, 'capabilities': ['tool-events-v1']})
     mcp.custom_route('/healthz', methods=['GET'])(health)
 
     async def control(request):

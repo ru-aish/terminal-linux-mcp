@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import socket
@@ -39,6 +40,9 @@ def test_sigterm_stops_both_http_servers(tmp_path):
                 try:
                     with urlopen(f'http://127.0.0.1:{public_port}/healthz', timeout=.2) as response:
                         if response.status == 200:
+                            health = json.load(response)
+                            assert health['capabilities'] == ['tool-events-v1']
+                            assert health['releaseCommit'] is None
                             break
                 except OSError:
                     time.sleep(.1)

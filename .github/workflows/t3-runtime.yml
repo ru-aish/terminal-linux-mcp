@@ -1,0 +1,45 @@
+name: T3 runtime contract and release
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Verify tool-event protocol, durable execution, and release safeguards
+        env:
+          MCP_WORKLOAD_ISOLATION: 'off'
+        run: >-
+          python -m pytest -q tests/test_t3_tool_events.py tests/test_t3_release.py
+          tests/test_t3_thread_state.py tests/test_t3_shutdown.py
+          tests/test_t3_durable_run_command.py tests/test_t3_explicit_durable_process.py
+      - name: Stage only committed source and verify every file
+        env:
+          RELEASE_ROOT: ${{ runner.temp }}/t3-releases
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          python scripts/t3_release.py stage --repo . --ref "$RELEASE_COMMIT" --root "$RELEASE_ROOT"
+          python scripts/t3_release.py verify --repo . --release "$RELEASE_ROOT/$RELEASE_COMMIT"
+          tar -czf "$RUNNER_TEMP/t3-terminal-$RELEASE_COMMIT.tar.gz" -C "$RELEASE_ROOT" "$RELEASE_COMMIT"
+          cd "$RUNNER_TEMP"
+          sha256sum "t3-terminal-$RELEASE_COMMIT.tar.gz" > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: t3-terminal-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/t3-terminal-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
